@@ -1,8 +1,15 @@
 #include <cuda_runtime.h>
+#ifndef USE_ROCM
 #include <cuda_profiler_api.h>
 #include <nvtx3/nvToolsExt.h>
 #include <nvml.h>
+#endif
+
+#ifdef USE_ROCM
+#include <amd_smi/amdsmi.h>
+#endif
 #include <nccl.h>
+#include <cstdio>
 #include <vector>
 
 #include <time.h>
@@ -45,6 +52,193 @@ typedef struct {
     cudaEvent_t events[NUM_TRAIN_EVENTS];
     float accum[NUM_PROF];
 } ProfileT;
+
+struct GpuUtil {
+    float gpu_percent;
+    float gpu_mem;
+    float vram_used_gb;
+    float vram_total_gb;
+};
+
+#ifndef USE_ROCM
+using PufferGpuDevice = nvmlDevice_t;
+
+inline void gpu_monitor_init(int gpu_id, PufferGpuDevice* device) {
+    nvmlInit();
+    nvmlDeviceGetHandleByIndex(gpu_id, device);
+}
+
+inline void gpu_monitor_shutdown() {
+    nvmlShutdown();
+}
+
+inline GpuUtil gpu_get_utilization(PufferGpuDevice device) {
+    GpuUtil out = {};
+    nvmlUtilization_t util;
+    if (nvmlDeviceGetUtilizationRates(device, &util) == NVML_SUCCESS) {
+        out.gpu_percent = (float)util.gpu;
+    }
+
+    nvmlMemory_t mem;
+    if (nvmlDeviceGetMemoryInfo(device, &mem) == NVML_SUCCESS && mem.total > 0) {
+        out.gpu_mem = 100.0f * (float)mem.used / (float)mem.total;
+    }
+
+    size_t free_bytes = 0, total_bytes = 0;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (total_bytes > 0) {
+        out.vram_used_gb = (float)(total_bytes - free_bytes) / (1024.0f * 1024.0f * 1024.0f);
+        out.vram_total_gb = (float)total_bytes / (1024.0f * 1024.0f * 1024.0f);
+    }
+    return out;
+}
+
+inline void profile_begin(const char* tag, bool enable) {
+    if (enable) nvtxRangePushA(tag);
+}
+
+inline void profile_end(bool enable) {
+    if (enable) nvtxRangePop();
+}
+
+inline void gpu_profiler_start(bool enable) {
+    if (enable) cudaProfilerStart();
+}
+
+inline void gpu_profiler_stop(bool enable) {
+    if (enable) cudaProfilerStop();
+}
+#else
+using PufferGpuDevice = amdsmi_processor_handle;
+
+inline bool gpu_bdf_from_hip(int gpu_id, amdsmi_bdf_t* bdf) {
+    char pci_bus_id[32] = {};
+    if (cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), gpu_id) != cudaSuccess) {
+        return false;
+    }
+
+    unsigned int domain = 0, bus = 0, device = 0, function = 0;
+    if (std::sscanf(pci_bus_id, "%x:%x:%x.%x", &domain, &bus, &device, &function) != 4) {
+        return false;
+    }
+
+    *bdf = {};
+    bdf->domain_number = domain;
+    bdf->bus_number = bus;
+    bdf->device_number = device;
+    bdf->function_number = function;
+    return true;
+}
+
+inline void gpu_monitor_init(int gpu_id, PufferGpuDevice* device) {
+    *device = nullptr;
+    if (amdsmi_init(AMDSMI_INIT_AMD_GPUS) != AMDSMI_STATUS_SUCCESS) {
+        return;
+    }
+
+    amdsmi_bdf_t bdf = {};
+    if (gpu_bdf_from_hip(gpu_id, &bdf) &&
+            amdsmi_get_processor_handle_from_bdf(bdf, device) == AMDSMI_STATUS_SUCCESS) {
+        return;
+    }
+
+    uint32_t socket_count = 0;
+    if (amdsmi_get_socket_handles(&socket_count, nullptr) != AMDSMI_STATUS_SUCCESS) {
+        return;
+    }
+
+    std::vector<amdsmi_socket_handle> sockets(socket_count);
+    if (socket_count > 0 &&
+            amdsmi_get_socket_handles(&socket_count, sockets.data()) != AMDSMI_STATUS_SUCCESS) {
+        return;
+    }
+
+    uint32_t gpu_count = 0;
+    for (uint32_t i = 0; i < socket_count; i++) {
+        uint32_t processor_count = 0;
+        if (amdsmi_get_processor_handles(sockets[i], &processor_count, nullptr) != AMDSMI_STATUS_SUCCESS) {
+            continue;
+        }
+
+        std::vector<amdsmi_processor_handle> processors(processor_count);
+        if (processor_count > 0 &&
+                amdsmi_get_processor_handles(sockets[i], &processor_count, processors.data()) != AMDSMI_STATUS_SUCCESS) {
+            continue;
+        }
+
+        for (uint32_t j = 0; j < processor_count; j++) {
+            processor_type_t processor_type;
+            if (amdsmi_get_processor_type(processors[j], &processor_type) != AMDSMI_STATUS_SUCCESS ||
+                    processor_type != AMDSMI_PROCESSOR_TYPE_AMD_GPU) {
+                continue;
+            }
+
+            if ((int)gpu_count == gpu_id) {
+                *device = processors[j];
+                return;
+            }
+            gpu_count++;
+        }
+    }
+}
+
+inline void gpu_monitor_shutdown() {
+    amdsmi_shut_down();
+}
+
+inline GpuUtil gpu_get_utilization(PufferGpuDevice device) {
+    static GpuUtil cached_out = {};
+    static double last_query_time = 0.0;
+
+    double now = wall_clock();
+    if (device == nullptr) {
+        size_t free_bytes = 0, total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        if (total_bytes > 0) {
+            cached_out.vram_used_gb = (float)(total_bytes - free_bytes) / (1024.0f * 1024.0f * 1024.0f);
+            cached_out.vram_total_gb = (float)total_bytes / (1024.0f * 1024.0f * 1024.0f);
+        }
+        return cached_out;
+    }
+
+    if (now - last_query_time < 1.0) {
+        return cached_out;
+    }
+    last_query_time = now;
+
+    uint32_t busy = 0;
+    if (amdsmi_get_gpu_busy_percent(device, &busy) == AMDSMI_STATUS_SUCCESS) {
+        cached_out.gpu_percent = (float)busy;
+    }
+
+    amdsmi_vram_usage_t vram = {};
+    if (amdsmi_get_gpu_vram_usage(device, &vram) == AMDSMI_STATUS_SUCCESS &&
+            vram.vram_total > 0) {
+        cached_out.gpu_mem = 100.0f * (float)vram.vram_used / (float)vram.vram_total;
+    }
+
+    size_t free_bytes = 0, total_bytes = 0;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (total_bytes > 0) {
+        cached_out.vram_used_gb = (float)(total_bytes - free_bytes) / (1024.0f * 1024.0f * 1024.0f);
+        cached_out.vram_total_gb = (float)total_bytes / (1024.0f * 1024.0f * 1024.0f);
+    }
+    return cached_out;
+}
+
+inline void profile_begin(const char*, bool) {}
+inline void profile_end(bool) {}
+inline void gpu_profiler_start(bool) {}
+inline void gpu_profiler_stop(bool) {}
+#endif
+
+inline cudaError_t puf_graph_instantiate(cudaGraphExec_t* exec, cudaGraph_t graph) {
+#ifdef USE_ROCM
+    return cudaGraphInstantiate(exec, graph, nullptr, nullptr, 0);
+#else
+    return cudaGraphInstantiate(exec, graph, 0);
+#endif
+}
 
 // Data collected by parallel environment workers. Each worker handles
 // a constant subset of agents 
@@ -361,7 +555,7 @@ typedef struct {
     PrecisionTensor grad_puf;
     LongTensor rng_offset_puf;   // (num_buffers+1,) int64 CUDA device counters
     ProfileT profile;
-    nvmlDevice_t nvml_device;
+    PufferGpuDevice gpu_device;
     long epoch;
     long global_step;
     double start_time;
@@ -390,14 +584,6 @@ Dict* log_environments_impl(PuffeRL& pufferl) {
     Dict* out = create_dict(64);
     static_vec_log(pufferl.vec, out);
     return out;
-}
-
-inline void profile_begin(const char* tag, bool enable) {
-    if (enable) nvtxRangePushA(tag);
-}
-
-inline void profile_end(bool enable) {
-    if (enable) nvtxRangePop();
 }
 
 // Thread-local stream for per-buffer threads (set once by thread_init_wrapper)
@@ -440,7 +626,8 @@ __device__ __forceinline__ float masked_logit(const precision_t* logits,
 }
 
 // Expects action logits and values to be in the same contiguous buffer. See default decoder
-__global__ void sample_logits(
+template<int MAX_LOGITS>
+__global__ void sample_logits_kernel(
         PrecisionTensor dec_out,              // (B, logits_dim + 1 for values)
         PrecisionTensor logstd_puf,           // (1, od) - continuous actions only
         IntTensor act_sizes_puf,              // (num_atns,) action head sizes
@@ -495,66 +682,137 @@ __global__ void sample_logits(
             total_log_prob += log_prob;
         }
     } else {
-        // Discrete action sampling (original multinomial logic)
-        int logits_offset = 0;  // offset within row for current action head
+        // Discrete action sampling (original multinomial logic with caching)
         int mask_base = (action_mask != nullptr) ? idx * mask_stride : 0;
-
-        for (int h = 0; h < num_atns; ++h) {
-            int A = act_sizes[h];  // size of this action head
-
-            // Step 1: Find max and sum for numerical stability (with nan_to_num)
-            float max_val = -INFINITY;
-            float sum_exp = 0.0f;
-            for (int a = 0; a < A; ++a) {
-                float l = masked_logit(logits, logits_base, logits_offset, a, action_mask, mask_base);
-                if (l > max_val) {
-                    sum_exp *= expf(max_val - l);
-                    max_val = l;
-                }
-                sum_exp += expf(l - max_val);
-            }
-            float logsumexp = max_val + logf(sum_exp);
-
-            // Step 3: Generate random value for this action head
-            float rand_val = curand_uniform(&state);
-
-            // Step 4: Multinomial sampling using inverse CDF
-            float cumsum = 0.0f;
-            int sampled_action = -1;  // sentinel: no action chosen yet
-
-            for (int a = 0; a < A; ++a) {
-                float l = masked_logit(logits, logits_base, logits_offset, a, action_mask, mask_base);
-                float prob = expf(l - logsumexp);
-                cumsum += prob;
-                if (rand_val < cumsum) {
-                    sampled_action = a;
-                    break;
+        if (fused_cols <= 256) {
+            float local_logits[MAX_LOGITS];
+            #pragma unroll
+            for (int j = 0; j < MAX_LOGITS; ++j) {
+                if (j < fused_cols - 1) {
+                    local_logits[j] = masked_logit(logits, logits_base, 0, j, action_mask, mask_base);
                 }
             }
 
-            // Float rounding can leave cumsum < 1.0; fall back to the last legal action.
-            if (sampled_action < 0) {
-                sampled_action = A - 1;
-                if (action_mask != nullptr) {
-                    for (int a = A - 1; a >= 0; --a) {
-                        if (to_float(action_mask[mask_base + logits_offset + a]) != 0.0f) {
+            int logits_offset = 0;  // offset within row for current action head
+            for (int h = 0; h < num_atns; ++h) {
+                int A = act_sizes[h];  // size of this action head
+
+                // Step 1: Find max and sum for numerical stability
+                float max_val = -INFINITY;
+                float sum_exp = 0.0f;
+                #pragma unroll
+                for (int a = 0; a < MAX_LOGITS; ++a) {
+                    if (a < A) {
+                        float l = local_logits[logits_offset + a];
+                        if (l > max_val) {
+                            sum_exp *= expf(max_val - l);
+                            max_val = l;
+                        }
+                        sum_exp += expf(l - max_val);
+                    }
+                }
+                float logsumexp = max_val + logf(sum_exp);
+
+                // Step 3: Generate random value for this action head
+                float rand_val = curand_uniform(&state);
+
+                // Step 4: Multinomial sampling using inverse CDF
+                float cumsum = 0.0f;
+                int sampled_action = -1;
+
+                #pragma unroll
+                for (int a = 0; a < MAX_LOGITS; ++a) {
+                    if (a < A) {
+                        float l = local_logits[logits_offset + a];
+                        float prob = expf(l - logsumexp);
+                        cumsum += prob;
+                        if (rand_val < cumsum && sampled_action < 0) {
                             sampled_action = a;
-                            break;
                         }
                     }
                 }
+
+                if (sampled_action < 0) {
+                    sampled_action = A - 1;
+                    if (action_mask != nullptr) {
+                        for (int a = A - 1; a >= 0; --a) {
+                            if (to_float(action_mask[mask_base + logits_offset + a]) != 0.0f) {
+                                sampled_action = a;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Step 5: Gather log probability of sampled action
+                float sampled_logit = local_logits[logits_offset + sampled_action];
+                float log_prob = sampled_logit - logsumexp;
+
+                // Write action for this head
+                actions[idx * num_atns + h] = from_float(sampled_action);
+                total_log_prob += log_prob;
+
+                // Advance to next action head
+                logits_offset += A;
             }
+        } else {
+            int logits_offset = 0;  // offset within row for current action head
+            for (int h = 0; h < num_atns; ++h) {
+                int A = act_sizes[h];  // size of this action head
 
-            // Step 5: Gather log probability of sampled action
-            float sampled_logit = masked_logit(logits, logits_base, logits_offset, sampled_action, action_mask, mask_base);
-            float log_prob = sampled_logit - logsumexp;
+                // Step 1: Find max and sum for numerical stability
+                float max_val = -INFINITY;
+                float sum_exp = 0.0f;
+                for (int a = 0; a < A; ++a) {
+                    float l = masked_logit(logits, logits_base, logits_offset, a, action_mask, mask_base);
+                    if (l > max_val) {
+                        sum_exp *= expf(max_val - l);
+                        max_val = l;
+                    }
+                    sum_exp += expf(l - max_val);
+                }
+                float logsumexp = max_val + logf(sum_exp);
 
-            // Write action for this head
-            actions[idx * num_atns + h] = from_float(sampled_action);
-            total_log_prob += log_prob;
+                // Step 3: Generate random value
+                float rand_val = curand_uniform(&state);
 
-            // Advance to next action head
-            logits_offset += A;
+                // Step 4: Multinomial sampling using inverse CDF
+                float cumsum = 0.0f;
+                int sampled_action = -1;
+
+                for (int a = 0; a < A; ++a) {
+                    float l = masked_logit(logits, logits_base, logits_offset, a, action_mask, mask_base);
+                    float prob = expf(l - logsumexp);
+                    cumsum += prob;
+                    if (rand_val < cumsum) {
+                        sampled_action = a;
+                        break;
+                    }
+                }
+
+                if (sampled_action < 0) {
+                    sampled_action = A - 1;
+                    if (action_mask != nullptr) {
+                        for (int a = A - 1; a >= 0; --a) {
+                            if (to_float(action_mask[mask_base + logits_offset + a]) != 0.0f) {
+                                sampled_action = a;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Step 5: Gather log probability of sampled action
+                float sampled_logit = masked_logit(logits, logits_base, logits_offset, sampled_action, action_mask, mask_base);
+                float log_prob = sampled_logit - logsumexp;
+
+                // Write action for this head
+                actions[idx * num_atns + h] = from_float(sampled_action);
+                total_log_prob += log_prob;
+
+                // Advance to next action head
+                logits_offset += A;
+            }
         }
     }
 
@@ -567,6 +825,50 @@ __global__ void sample_logits(
     // Save RNG state back for next call
     rng_states[idx] = state;
 }
+
+void sample_logits_dispatch(
+        int grid, int block, int shared, cudaStream_t stream,
+        PrecisionTensor dec_out,              // (B, logits_dim + 1 for values)
+        PrecisionTensor logstd_puf,           // (1, od) - continuous actions only
+        IntTensor act_sizes_puf,              // (num_atns,) action head sizes
+        precision_t* __restrict__ actions,    // (B, num_atns)
+        precision_t* __restrict__ logprobs,   // (B,)
+        precision_t* __restrict__ value_out,  // (B,)
+        curandStatePhilox4_32_10_t* __restrict__ rng_states,
+        const precision_t* __restrict__ action_mask, // (B, A_total) or nullptr
+        int mask_stride) {
+    int fused_cols = dec_out.shape[1];
+    if (fused_cols <= 5) {
+        sample_logits_kernel<4><<<grid, block, shared, stream>>>(
+            dec_out, logstd_puf, act_sizes_puf, actions, logprobs, value_out,
+            rng_states, action_mask, mask_stride);
+    } else if (fused_cols <= 9) {
+        sample_logits_kernel<8><<<grid, block, shared, stream>>>(
+            dec_out, logstd_puf, act_sizes_puf, actions, logprobs, value_out,
+            rng_states, action_mask, mask_stride);
+    } else if (fused_cols <= 17) {
+        sample_logits_kernel<16><<<grid, block, shared, stream>>>(
+            dec_out, logstd_puf, act_sizes_puf, actions, logprobs, value_out,
+            rng_states, action_mask, mask_stride);
+    } else if (fused_cols <= 33) {
+        sample_logits_kernel<32><<<grid, block, shared, stream>>>(
+            dec_out, logstd_puf, act_sizes_puf, actions, logprobs, value_out,
+            rng_states, action_mask, mask_stride);
+    } else if (fused_cols <= 65) {
+        sample_logits_kernel<64><<<grid, block, shared, stream>>>(
+            dec_out, logstd_puf, act_sizes_puf, actions, logprobs, value_out,
+            rng_states, action_mask, mask_stride);
+    } else if (fused_cols <= 129) {
+        sample_logits_kernel<128><<<grid, block, shared, stream>>>(
+            dec_out, logstd_puf, act_sizes_puf, actions, logprobs, value_out,
+            rng_states, action_mask, mask_stride);
+    } else {
+        sample_logits_kernel<256><<<grid, block, shared, stream>>>(
+            dec_out, logstd_puf, act_sizes_puf, actions, logprobs, value_out,
+            rng_states, action_mask, mask_stride);
+    }
+}
+
 
 // Single step rollout forward pass. Called by each environment worker in their
 // own buffer thread. This operation is cudagraphed.
@@ -675,7 +977,8 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         }
 
         // Offset RNG by bank_off so banks don't collide on per-buffer rng slots.
-        sample_logits<<<grid_size(bank_size), BLOCK_SIZE, 0, stream>>>(
+        sample_logits_dispatch(
+            grid_size(bank_size), BLOCK_SIZE, 0, stream,
             dec_puf, p_logstd, pufferl->act_sizes_puf,
             act_b.data, lp_b.data, val_b.data,
             pufferl->rng_states[buf] + bank_off,
@@ -690,7 +993,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         cudaGraph_t _graph;
         assert(cudaStreamEndCapture(current_stream, &_graph) == cudaSuccess
                 && "cudaStreamEndCapture failed");
-        assert(cudaGraphInstantiate(&pufferl->fused_rollout_cudagraphs[graph], _graph, 0) == cudaSuccess
+        assert(puf_graph_instantiate(&pufferl->fused_rollout_cudagraphs[graph], _graph) == cudaSuccess
                 && "cudaGraphInstantiate failed");
         assert(cudaGraphDestroy(_graph) == cudaSuccess && "cudaGraphDestroy failed");
         cudaDeviceSynchronize();
@@ -760,7 +1063,8 @@ __device__ __forceinline__ void ppo_continuous_head(
     *out_entropy = HALF_1_PLUS_LOG_2PI + log_std;
 }
 
-__global__ void ppo_loss_compute(
+template<int MAX_LOGITS>
+__global__ void ppo_loss_compute_kernel(
         float* __restrict__ ppo_partials,
         PPOKernelArgs a, PPOGraphArgs g) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -781,6 +1085,9 @@ __global__ void ppo_loss_compute(
     int n = idx / a.T_seq;
     int t = idx % a.T_seq;
     int nt = n * a.T_seq + t;
+
+    bool cache_logits = false;
+    float local_logits[MAX_LOGITS];
 
     int logits_base = n * a.logits_stride_n + t * a.logits_stride_t;
     int values_idx = n * a.values_stride_n + t * a.values_stride_t;
@@ -840,20 +1147,80 @@ __global__ void ppo_loss_compute(
 
     if (!a.is_continuous) {
         int logits_offset = 0;
-        for (int h = 0; h < a.num_atns; ++h) {
-            int A = a.act_sizes[h];
-            int act = static_cast<int>(g.actions[nt * a.num_atns + h]);
-            head_act[h] = act;
-            float lse, ent, lp;
-            ppo_discrete_head(a.logits, logits_base, a.logits_stride_a, logits_offset, A, act,
-                              a.action_mask, mask_base, &lse, &ent, &lp);
-            head_logsumexp[h] = lse;
-            head_entropy[h] = ent;
-            total_log_prob += lp;
-            total_entropy += ent;
-            logits_offset += A;
+        int mask_base = (a.action_mask != nullptr)
+            ? n * a.mask_stride_n + t * a.mask_stride_t : 0;
+
+        cache_logits = (a.A_total <= MAX_LOGITS);
+        if (cache_logits) {
+            #pragma unroll
+            for (int j = 0; j < MAX_LOGITS; ++j) {
+                if (j < a.A_total) {
+                    local_logits[j] = load_logit_masked(a.logits, logits_base, a.logits_stride_a, 0, j, a.action_mask, mask_base);
+                }
+            }
+        }
+
+        if (cache_logits) {
+            for (int h = 0; h < a.num_atns; ++h) {
+                int A = a.act_sizes[h];
+                int act = static_cast<int>(g.actions[nt * a.num_atns + h]);
+                head_act[h] = act;
+
+                float max_logit = -INFINITY;
+                float sum = 0.0f;
+                float act_logit = 0.0f;
+
+                #pragma unroll
+                for (int j = 0; j < MAX_LOGITS; ++j) {
+                    if (j < A) {
+                        float l = local_logits[logits_offset + j];
+                        if (j == act) {
+                            act_logit = l;
+                        }
+                        if (l > max_logit) {
+                            sum *= __expf(max_logit - l);
+                            max_logit = l;
+                        }
+                        sum += __expf(l - max_logit);
+                    }
+                }
+                float logsumexp = max_logit + __logf(sum);
+
+                float ent = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < MAX_LOGITS; ++j) {
+                    if (j < A) {
+                        float l = local_logits[logits_offset + j];
+                        float logp = l - logsumexp;
+                        float p = __expf(logp);
+                        ent -= p * logp;
+                    }
+                }
+
+                head_logsumexp[h] = logsumexp;
+                head_entropy[h] = ent;
+                total_log_prob += act_logit - logsumexp;
+                total_entropy += ent;
+                logits_offset += A;
+            }
+        } else {
+            for (int h = 0; h < a.num_atns; ++h) {
+                int A = a.act_sizes[h];
+                int act = static_cast<int>(g.actions[nt * a.num_atns + h]);
+                head_act[h] = act;
+                float lse, ent, lp;
+                ppo_discrete_head(a.logits, logits_base, a.logits_stride_a, logits_offset, A, act,
+                                  a.action_mask, mask_base, &lse, &ent, &lp);
+                head_logsumexp[h] = lse;
+                head_entropy[h] = ent;
+                total_log_prob += lp;
+                total_entropy += ent;
+                logits_offset += A;
+            }
         }
     } else {
+        int mask_base = (a.action_mask != nullptr)
+            ? n * a.mask_stride_n + t * a.mask_stride_t : 0;
         for (int h = 0; h < a.num_atns; ++h) {
             float mean = to_float(a.logits[logits_base + h * a.logits_stride_a]);
             float log_std = to_float(a.logstd[h]);
@@ -885,23 +1252,49 @@ __global__ void ppo_loss_compute(
 
     if (!a.is_continuous) {
         int logits_offset = 0;
-        for (int h = 0; h < a.num_atns; ++h) {
-            int A = a.act_sizes[h];
-            int act = head_act[h];
-            float logsumexp = head_logsumexp[h];
-            float ent = head_entropy[h];
+        int mask_base = (a.action_mask != nullptr)
+            ? n * a.mask_stride_n + t * a.mask_stride_t : 0;
 
-            for (int j = 0; j < A; ++j) {
-                float l = load_logit_masked(a.logits, logits_base, a.logits_stride_a,
-                                            logits_offset, j, a.action_mask, mask_base);
-                float logp = l - logsumexp;
-                float p = __expf(logp);
-                float d_logit = (j == act) ? d_new_logp : 0.0f;
-                d_logit -= p * d_new_logp;
-                d_logit += d_entropy_term * p * (-ent - logp);
-                a.grad_logits[grad_logits_base + logits_offset + j] = d_logit;
+        if (cache_logits) {
+            for (int h = 0; h < a.num_atns; ++h) {
+                int A = a.act_sizes[h];
+                int act = head_act[h];
+                float logsumexp = head_logsumexp[h];
+                float ent = head_entropy[h];
+
+                #pragma unroll
+                for (int j = 0; j < MAX_LOGITS; ++j) {
+                    if (j < A) {
+                        float l = local_logits[logits_offset + j];
+                        float logp = l - logsumexp;
+                        float p = __expf(logp);
+                        float d_logit = (j == act) ? d_new_logp : 0.0f;
+                        d_logit -= p * d_new_logp;
+                        d_logit += d_entropy_term * p * (-ent - logp);
+                        a.grad_logits[grad_logits_base + logits_offset + j] = d_logit;
+                    }
+                }
+                logits_offset += A;
             }
-            logits_offset += A;
+        } else {
+            for (int h = 0; h < a.num_atns; ++h) {
+                int A = a.act_sizes[h];
+                int act = head_act[h];
+                float logsumexp = head_logsumexp[h];
+                float ent = head_entropy[h];
+
+                for (int j = 0; j < A; ++j) {
+                    float l = load_logit_masked(a.logits, logits_base, a.logits_stride_a,
+                                                logits_offset, j, a.action_mask, mask_base);
+                    float logp = l - logsumexp;
+                    float p = __expf(logp);
+                    float d_logit = (j == act) ? d_new_logp : 0.0f;
+                    d_logit -= p * d_new_logp;
+                    d_logit += d_entropy_term * p * (-ent - logp);
+                    a.grad_logits[grad_logits_base + logits_offset + j] = d_logit;
+                }
+                logits_offset += A;
+            }
         }
     } else {
         for (int h = 0; h < a.num_atns; ++h) {
@@ -949,6 +1342,28 @@ reduce:
         }
     }
 }
+
+void ppo_loss_compute_dispatch(
+        int grid, int block, int shared, cudaStream_t stream,
+        float* ppo_partials, PPOKernelArgs a, PPOGraphArgs g) {
+    int A_total = a.A_total;
+    if (A_total <= 4) {
+        ppo_loss_compute_kernel<4><<<grid, block, shared, stream>>>(ppo_partials, a, g);
+    } else if (A_total <= 8) {
+        ppo_loss_compute_kernel<8><<<grid, block, shared, stream>>>(ppo_partials, a, g);
+    } else if (A_total <= 16) {
+        ppo_loss_compute_kernel<16><<<grid, block, shared, stream>>>(ppo_partials, a, g);
+    } else if (A_total <= 32) {
+        ppo_loss_compute_kernel<32><<<grid, block, shared, stream>>>(ppo_partials, a, g);
+    } else if (A_total <= 64) {
+        ppo_loss_compute_kernel<64><<<grid, block, shared, stream>>>(ppo_partials, a, g);
+    } else if (A_total <= 128) {
+        ppo_loss_compute_kernel<128><<<grid, block, shared, stream>>>(ppo_partials, a, g);
+    } else {
+        ppo_loss_compute_kernel<256><<<grid, block, shared, stream>>>(ppo_partials, a, g);
+    }
+}
+
 
 // Deterministic reduction of per-block PPO loss partials + count increment
 __global__ void ppo_loss_reduce(
@@ -1087,14 +1502,20 @@ void ppo_loss_fwd_bwd(
         .is_continuous = is_continuous,
     };
 
-    ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(ppo_partials_buf, args, graph_args);
+    ppo_loss_compute_dispatch(
+        ppo_grid, PPO_THREADS, 0, stream,
+        ppo_partials_buf, args, graph_args);
 
     ppo_loss_reduce<<<1, LOSS_N + 1, 0, stream>>>(
         bufs.loss_output.data, losses_acc.data, ppo_partials_buf, ppo_grid);
 }
 
 #define PRIO_WARP_SIZE 32
+#ifdef USE_ROCM
+#define PRIO_FULL_MASK 0xffffffffffffffffULL
+#else
 #define PRIO_FULL_MASK 0xffffffff
+#endif
 #define PRIO_BLOCK_SIZE 256
 #define PRIO_NUM_WARPS (PRIO_BLOCK_SIZE / PRIO_WARP_SIZE)
 __global__ void compute_prio_adv_reduction(
@@ -1110,7 +1531,7 @@ __global__ void compute_prio_adv_reduction(
     }
 
     for (int s = PRIO_WARP_SIZE / 2; s >= 1; s /= 2) {
-        local_sum += __shfl_down_sync(PRIO_FULL_MASK, local_sum, s);
+        local_sum += __shfl_down_sync(PRIO_FULL_MASK, local_sum, s, PRIO_WARP_SIZE);
     }
     if (tx == 0) {
         float pw = __powf(local_sum, prio_alpha);
@@ -1135,7 +1556,7 @@ __global__ void compute_prio_normalize(float* prio_weights, int length) {
         local_sum += prio_weights[t];
     }
     for (int s = PRIO_WARP_SIZE / 2; s >= 1; s /= 2) {
-        local_sum += __shfl_down_sync(PRIO_FULL_MASK, local_sum, s);
+        local_sum += __shfl_down_sync(PRIO_FULL_MASK, local_sum, s, PRIO_WARP_SIZE);
     }
     if (lane == 0) {
         shmem[warp_id] = local_sum;
@@ -1145,7 +1566,7 @@ __global__ void compute_prio_normalize(float* prio_weights, int length) {
     if (warp_id == 0) {
         float val = (lane < PRIO_NUM_WARPS) ? shmem[lane] : 0.0f;
         for (int s = PRIO_NUM_WARPS / 2; s >= 1; s /= 2) {
-            val += __shfl_down_sync(PRIO_FULL_MASK, val, s);
+            val += __shfl_down_sync(PRIO_FULL_MASK, val, s, PRIO_WARP_SIZE);
         }
         if (tx == 0) {
             block_sum = val + eps;
@@ -1626,7 +2047,7 @@ void train_impl(PuffeRL& pufferl) {
                 cudaGraph_t _graph;
                 assert(cudaStreamEndCapture(train_stream, &_graph) == cudaSuccess
                         && "cudaStreamEndCapture failed");
-                assert(cudaGraphInstantiate(&pufferl.train_cudagraph, _graph, 0) == cudaSuccess
+                assert(puf_graph_instantiate(&pufferl.train_cudagraph, _graph) == cudaSuccess
                         && "cudaGraphInstantiate failed");
                 assert(cudaGraphDestroy(_graph) == cudaSuccess && "cudaGraphDestroy failed");
                 cudaDeviceSynchronize();
@@ -1961,8 +2382,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         cudaEventCreate(&pufferl->profile.events[i]);
     }
     memset(pufferl->profile.accum, 0, sizeof(pufferl->profile.accum));
-    nvmlInit();
-    nvmlDeviceGetHandleByIndex(hypers.gpu_id, &pufferl->nvml_device);
+    gpu_monitor_init(hypers.gpu_id, &pufferl->gpu_device);
 
     // Create policy
     int input_size = pufferl->env.obs.shape[1];
@@ -2182,10 +2602,8 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         net_callback_wrapper, thread_init_wrapper);
     static_vec_reset(vec);
 
-    if (hypers.profile) {
-        cudaDeviceSynchronize();
-        cudaProfilerStart();
-    }
+    if (hypers.profile) cudaDeviceSynchronize();
+    gpu_profiler_start(hypers.profile);
 
     double now = wall_clock();
     pufferl->start_time = now;
@@ -2197,9 +2615,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
 
 void close_impl(PuffeRL& pufferl) {
     cudaDeviceSynchronize();
-    if (pufferl.hypers.profile) {
-        cudaProfilerStop();
-    }
+    gpu_profiler_stop(pufferl.hypers.profile);
 
     cudaGraphExecDestroy(pufferl.train_cudagraph);
     for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
@@ -2231,7 +2647,7 @@ void close_impl(PuffeRL& pufferl) {
     for (int i = 0; i < NUM_TRAIN_EVENTS; i++) {
         cudaEventDestroy(pufferl.profile.events[i]);
     }
-    nvmlShutdown();
+    gpu_monitor_shutdown();
 
     static_vec_close(pufferl.vec);
 

@@ -9,6 +9,10 @@
 #include <stdio.h>
 #include <assert.h>
 
+#ifdef USE_ROCM
+#include <hip/hip_runtime_api.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -64,7 +68,9 @@ static inline void dict_set(Dict* dict, const char* key, double value) {
 }
 
 // Forward declare CUDA stream type
+#ifndef USE_ROCM
 typedef struct CUstream_st* cudaStream_t;
+#endif
 
 // Threading state
 typedef struct StaticThreading StaticThreading;
@@ -174,12 +180,20 @@ static inline size_t obs_element_size(void) {
 const char dtype_symbol[] = STRINGIFY(OBS_TENSOR_T);
 
 #include <omp.h>
-#include <stdatomic.h>
+typedef int atomic_int;
+static inline int atomic_load(const atomic_int* ptr) {
+    return __atomic_load_n(ptr, __ATOMIC_SEQ_CST);
+}
+static inline void atomic_store(atomic_int* ptr, int value) {
+    __atomic_store_n(ptr, value, __ATOMIC_SEQ_CST);
+}
 #include <pthread.h>
 #include <stdbool.h>
 #include <time.h>
 
-// Forward declare CUDA types and functions to avoid conflicts with raylib's float3
+// Forward declare CUDA types and functions to avoid conflicts with raylib's float3.
+// HIP builds include the real HIP runtime API through the hipified training unit.
+#ifndef USE_ROCM
 typedef int cudaError_t;
 typedef int cudaMemcpyKind;
 #define cudaSuccess 0
@@ -201,6 +215,7 @@ extern cudaError_t cudaStreamSynchronize(cudaStream_t);
 extern cudaError_t cudaStreamCreateWithFlags(cudaStream_t*, unsigned int);
 extern cudaError_t cudaStreamQuery(cudaStream_t);
 extern const char* cudaGetErrorString(cudaError_t);
+#endif
 
 #define OMP_WAITING 5
 #define OMP_RUNNING 6
@@ -474,7 +489,11 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
         for (int e = 0; e < env_count; e++) {
             Env* env = &envs[env_start + e];
             int slot = buf_start + buf_agent;
+#ifdef __cplusplus
+            env->observations = (decltype(env->observations))((char*)vec->observations + slot * OBS_SIZE * obs_elem_size);
+#else
             env->observations = (void*)((char*)vec->observations + slot * OBS_SIZE * obs_elem_size);
+#endif
             env->actions = vec->actions + slot * NUM_ATNS;
             env->rewards = vec->rewards + slot;
             env->terminals = vec->terminals + slot;
