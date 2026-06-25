@@ -445,7 +445,7 @@ PY
     if [ -n "$DEBUG" ]; then
         HIPCC_OPT=(-O0 -g)
     else
-        HIPCC_OPT=(-O2)
+        HIPCC_OPT=(-O2 -w)
     fi
 
     echo "Compiling ROCm/HIP training backend with $ENV binding..."
@@ -475,7 +475,7 @@ PY
         "${EXTRA_LDFLAGS[@]}"
         "${ROCM_LFLAGS[@]}"
         "${ROCM_RPATH_FLAGS[@]}"
-        -lamdhip64 -lhipblas -lhiprand -lrccl -lamd_smi
+        -lamdhip64 -lhipblas -lhiprand -lrccl
         $ROCM_OMP_LIB
         $LINK_OPT
         "${SHARED_LDFLAGS[@]}"

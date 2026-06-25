@@ -6,7 +6,9 @@
 #endif
 
 #ifdef USE_ROCM
-#include <amd_smi/amdsmi.h>
+// amdsmi library initialization currently segfaults on this ROCm install,
+// so GPU monitoring is disabled for ROCm builds.
+// #include <amd_smi/amdsmi.h>
 #endif
 #include <nccl.h>
 #include <cstdio>
@@ -16,6 +18,7 @@
 #include "models.cu"
 #include "ocean.cu"
 #include "muon.cu"
+#include "lion.cu"
 #include "vecenv.h"
 
 static double wall_clock() {
@@ -109,113 +112,19 @@ inline void gpu_profiler_stop(bool enable) {
     if (enable) cudaProfilerStop();
 }
 #else
-using PufferGpuDevice = amdsmi_processor_handle;
-
-inline bool gpu_bdf_from_hip(int gpu_id, amdsmi_bdf_t* bdf) {
-    char pci_bus_id[32] = {};
-    if (cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), gpu_id) != cudaSuccess) {
-        return false;
-    }
-
-    unsigned int domain = 0, bus = 0, device = 0, function = 0;
-    if (std::sscanf(pci_bus_id, "%x:%x:%x.%x", &domain, &bus, &device, &function) != 4) {
-        return false;
-    }
-
-    *bdf = {};
-    bdf->domain_number = domain;
-    bdf->bus_number = bus;
-    bdf->device_number = device;
-    bdf->function_number = function;
-    return true;
-}
+// amdsmi/rocm_smi64 library initialization currently crashes on import for
+// this ROCm install, so ROCm GPU monitoring is disabled.
+using PufferGpuDevice = void*;
 
 inline void gpu_monitor_init(int gpu_id, PufferGpuDevice* device) {
     *device = nullptr;
-    if (amdsmi_init(AMDSMI_INIT_AMD_GPUS) != AMDSMI_STATUS_SUCCESS) {
-        return;
-    }
-
-    amdsmi_bdf_t bdf = {};
-    if (gpu_bdf_from_hip(gpu_id, &bdf) &&
-            amdsmi_get_processor_handle_from_bdf(bdf, device) == AMDSMI_STATUS_SUCCESS) {
-        return;
-    }
-
-    uint32_t socket_count = 0;
-    if (amdsmi_get_socket_handles(&socket_count, nullptr) != AMDSMI_STATUS_SUCCESS) {
-        return;
-    }
-
-    std::vector<amdsmi_socket_handle> sockets(socket_count);
-    if (socket_count > 0 &&
-            amdsmi_get_socket_handles(&socket_count, sockets.data()) != AMDSMI_STATUS_SUCCESS) {
-        return;
-    }
-
-    uint32_t gpu_count = 0;
-    for (uint32_t i = 0; i < socket_count; i++) {
-        uint32_t processor_count = 0;
-        if (amdsmi_get_processor_handles(sockets[i], &processor_count, nullptr) != AMDSMI_STATUS_SUCCESS) {
-            continue;
-        }
-
-        std::vector<amdsmi_processor_handle> processors(processor_count);
-        if (processor_count > 0 &&
-                amdsmi_get_processor_handles(sockets[i], &processor_count, processors.data()) != AMDSMI_STATUS_SUCCESS) {
-            continue;
-        }
-
-        for (uint32_t j = 0; j < processor_count; j++) {
-            processor_type_t processor_type;
-            if (amdsmi_get_processor_type(processors[j], &processor_type) != AMDSMI_STATUS_SUCCESS ||
-                    processor_type != AMDSMI_PROCESSOR_TYPE_AMD_GPU) {
-                continue;
-            }
-
-            if ((int)gpu_count == gpu_id) {
-                *device = processors[j];
-                return;
-            }
-            gpu_count++;
-        }
-    }
 }
 
 inline void gpu_monitor_shutdown() {
-    amdsmi_shut_down();
 }
 
 inline GpuUtil gpu_get_utilization(PufferGpuDevice device) {
     static GpuUtil cached_out = {};
-    static double last_query_time = 0.0;
-
-    double now = wall_clock();
-    if (device == nullptr) {
-        size_t free_bytes = 0, total_bytes = 0;
-        cudaMemGetInfo(&free_bytes, &total_bytes);
-        if (total_bytes > 0) {
-            cached_out.vram_used_gb = (float)(total_bytes - free_bytes) / (1024.0f * 1024.0f * 1024.0f);
-            cached_out.vram_total_gb = (float)total_bytes / (1024.0f * 1024.0f * 1024.0f);
-        }
-        return cached_out;
-    }
-
-    if (now - last_query_time < 1.0) {
-        return cached_out;
-    }
-    last_query_time = now;
-
-    uint32_t busy = 0;
-    if (amdsmi_get_gpu_busy_percent(device, &busy) == AMDSMI_STATUS_SUCCESS) {
-        cached_out.gpu_percent = (float)busy;
-    }
-
-    amdsmi_vram_usage_t vram = {};
-    if (amdsmi_get_gpu_vram_usage(device, &vram) == AMDSMI_STATUS_SUCCESS &&
-            vram.vram_total > 0) {
-        cached_out.gpu_mem = 100.0f * (float)vram.vram_used / (float)vram.vram_total;
-    }
 
     size_t free_bytes = 0, total_bytes = 0;
     cudaMemGetInfo(&free_bytes, &total_bytes);
@@ -357,7 +266,8 @@ struct PPOKernelArgs {
     const precision_t* action_mask; // (N, T, A_total) or nullptr
     int mask_stride_n, mask_stride_t;
     int num_atns;
-    float clip_coef, vf_clip_coef, vf_coef, ent_coef;
+    float clip_coef, vf_clip_coef, vf_coef, ent_coef, vtrace_rho_clip;
+    int actor_loss;
     int T_seq, A_total, N;
     int logits_stride_n, logits_stride_t, logits_stride_a;
     int values_stride_n, values_stride_t;
@@ -465,6 +375,7 @@ typedef struct {
     float min_lr_ratio;
     bool anneal_lr;
     // Optimizer
+    int optimizer_type; // 0=Muon, 1=Lion
     float beta1;
     float beta2;
     float eps;
@@ -474,6 +385,7 @@ typedef struct {
     long total_timesteps;
     float max_grad_norm;
     // PPO
+    int actor_loss;
     float clip_coef;
     float vf_clip_coef;
     float vf_coef;
@@ -532,6 +444,7 @@ typedef struct {
     Allocator activations_alloc;
     StaticVec* vec;
     Muon muon;
+    Lion lion;
     ncclComm_t nccl_comm;  // NCCL communicator for multi-GPU
     HypersT hypers;
     bool is_continuous;  // True if all action dimensions are continuous (size==1)
@@ -586,7 +499,24 @@ Dict* log_environments_impl(PuffeRL& pufferl) {
     return out;
 }
 
-// Thread-local stream for per-buffer threads (set once by thread_init_wrapper)
+void train_impl(PuffeRL& pufferl);
+inline float current_learning_rate(const HypersT& hypers, long epoch, long total_epochs);
+void ppo_loss_fwd_bwd(
+        PrecisionTensor& dec_out, PrecisionTensor& logstd, TrainGraph& graph,
+        IntTensor& act_sizes, FloatTensor& losses_acc,
+        int actor_loss, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
+        float vtrace_rho_clip, PPOBuffersPuf& bufs, bool is_continuous,
+        cudaStream_t stream);
+void sample_logits_dispatch(
+        int grid, int block, int shared, cudaStream_t stream,
+        PrecisionTensor dec_out, PrecisionTensor logstd_puf, IntTensor act_sizes_puf,
+        precision_t* actions, precision_t* logprobs, precision_t* value_out,
+        curandStatePhilox4_32_10_t* rng_states,
+        const precision_t* action_mask, int mask_stride);
+static Policy build_policy(const char* env_name, int input_size, int hidden_size,
+                           int num_layers, int decoder_output_size, int act_n,
+                           bool is_continuous, int horizon);
+extern "C" void net_callback_wrapper(void* ctx, int buf, int t);
 static thread_local cudaStream_t tl_stream = 0;
 
 // Thread initialization callback - sets thread-local stream once per thread
@@ -1236,19 +1166,26 @@ __global__ void ppo_loss_compute_kernel(
     logratio = total_log_prob - old_logp;
     ratio = __expf(logratio);
     g.out_ratio[nt] = from_float(ratio);
-    float ratio_clipped = fmaxf(1.0f - a.clip_coef, fminf(1.0f + a.clip_coef, ratio));
-    float wa = -w * adv_normalized;
-    float pg_loss1 = wa * ratio;
-    float pg_loss2 = wa * ratio_clipped;
-    pg_loss = fmaxf(pg_loss1, pg_loss2);
+    float d_new_logp;
+    if (a.actor_loss == 1) {
+        float rho = fminf(ratio, a.vtrace_rho_clip);
+        pg_loss = -w * adv_normalized * rho * total_log_prob;
+        d_new_logp = -w * adv_normalized * rho * d_pg_loss;
+    } else {
+        float ratio_clipped = fmaxf(1.0f - a.clip_coef, fminf(1.0f + a.clip_coef, ratio));
+        float wa = -w * adv_normalized;
+        float pg_loss1 = wa * ratio;
+        float pg_loss2 = wa * ratio_clipped;
+        pg_loss = fmaxf(pg_loss1, pg_loss2);
 
-    float d_ratio = wa * d_pg_loss;
-    if (pg_loss2 > pg_loss1) {
-        if (ratio <= (1.0f - a.clip_coef) || ratio >= (1.0f + a.clip_coef)) {
-            d_ratio = 0.0f;
+        float d_ratio = wa * d_pg_loss;
+        if (pg_loss2 > pg_loss1) {
+            if (ratio <= (1.0f - a.clip_coef) || ratio >= (1.0f + a.clip_coef)) {
+                d_ratio = 0.0f;
+            }
         }
+        d_new_logp = d_ratio * ratio;
     }
-    float d_new_logp = d_ratio * ratio;
 
     if (!a.is_continuous) {
         int logits_offset = 0;
@@ -1440,7 +1377,8 @@ void ppo_loss_fwd_bwd(
         PrecisionTensor& logstd,     // continuous logstd or empty
         TrainGraph& graph,
         IntTensor& act_sizes, FloatTensor& losses_acc,
-        float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
+        int actor_loss, float clip_coef, float vf_clip_coef, float vf_coef, float ent_coef,
+        float vtrace_rho_clip,
         PPOBuffersPuf& bufs, bool is_continuous,
         cudaStream_t stream) {
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
@@ -1495,7 +1433,8 @@ void ppo_loss_fwd_bwd(
         .mask_stride_t = has_mask ? A_total : 0,
         .num_atns = (int)numel(act_sizes.shape),
         .clip_coef = clip_coef, .vf_clip_coef = vf_clip_coef,
-        .vf_coef = vf_coef, .ent_coef = ent_coef,
+        .vf_coef = vf_coef, .ent_coef = ent_coef, .vtrace_rho_clip = vtrace_rho_clip,
+        .actor_loss = actor_loss,
         .T_seq = T, .A_total = A_total, .N = N,
         .logits_stride_n = T * fused_cols, .logits_stride_t = fused_cols, .logits_stride_a = 1,
         .values_stride_n = T * fused_cols, .values_stride_t = fused_cols,
@@ -1887,8 +1826,14 @@ __global__ void select_copy(RolloutBuf rollouts, TrainGraph graph,
 inline float cosine_annealing(float lr_base, float lr_min, long t, long T) {
     if (T == 0) return lr_base;
     float ratio = (double )t / (double) T;
-    ratio = std::max(0.0f, std::min(1.0f, ratio));
+	ratio = ratio < 0.0f ? 0.0f : (ratio > 1.0f ? 1.0f : ratio);
     return lr_min + 0.5f*(lr_base - lr_min)*(1.0f + std::cos(M_PI * ratio));
+}
+
+inline float current_learning_rate(const HypersT& hypers, long epoch, long total_epochs) {
+    if (!hypers.anneal_lr) return hypers.lr;
+    float lr_min = hypers.min_lr_ratio * hypers.lr;
+    return cosine_annealing(hypers.lr, lr_min, epoch, total_epochs);
 }
 
 void train_impl(PuffeRL& pufferl) {
@@ -1945,11 +1890,13 @@ void train_impl(PuffeRL& pufferl) {
     int current_epoch = pufferl.epoch;
 
     Muon* muon = &pufferl.muon;
+    Lion* lion = &pufferl.lion;
     int total_epochs = hypers.total_timesteps / batch_size;
-    if (anneal_lr) {
-        float lr_min = hypers.min_lr_ratio * hypers.lr;
-        float lr = cosine_annealing(hypers.lr, lr_min, current_epoch, total_epochs);
+    float lr = current_learning_rate(hypers, current_epoch, total_epochs);
+    if (hypers.optimizer_type == 0) {
         cudaMemcpy(muon->lr_ptr, &lr, sizeof(float), cudaMemcpyHostToDevice);
+    } else {
+        cudaMemcpy(lion->lr_ptr, &lr, sizeof(float), cudaMemcpyHostToDevice);
     }
 
     // Annealed entropy coefficient — same cosine shape as lr. With PG signal
@@ -2028,7 +1975,8 @@ void train_impl(PuffeRL& pufferl) {
 
             ppo_loss_fwd_bwd(dec_puf, p_logstd, graph,
                 pufferl.act_sizes_puf, pufferl.losses_puf,
-                hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, current_ent_coef,
+                hypers.actor_loss, hypers.clip_coef, hypers.vf_clip_coef,
+                hypers.vf_coef, current_ent_coef, hypers.vtrace_rho_clip,
                 pufferl.ppo_bufs_puf, pufferl.is_continuous, stream);
 
             FloatTensor grad_logits_puf = pufferl.ppo_bufs_puf.grad_logits;
@@ -2037,7 +1985,11 @@ void train_impl(PuffeRL& pufferl) {
             policy_backward(&pufferl.policy, pufferl.weights, pufferl.train_activations,
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
 
-            muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
+            if (hypers.optimizer_type == 0) {
+                muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
+            } else {
+                lion_step(&pufferl.lion, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
+            }
             if (USE_BF16) {
                 int n = numel(pufferl.param_puf.shape);
                 cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
@@ -2371,11 +2323,11 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     assert((num_continuous == 0 || num_discrete == 0) &&
         "Mixed continuous/discrete action spaces not supported");
     pufferl->is_continuous = (num_continuous > 0);
-    if (pufferl->is_continuous) {
-        printf("Detected continuous action space with %d dimensions\n", num_action_heads);
-    } else {
-        printf("Detected discrete action space with %d heads\n", num_action_heads);
-    }
+    // if (pufferl->is_continuous) {
+    //     printf("Detected continuous action space with %d dimensions\n", num_action_heads);
+    // } else {
+    //     printf("Detected discrete action space with %d heads\n", num_action_heads);
+    // }
 
     // Create profiling events
     for (int i = 0; i < NUM_TRAIN_EVENTS; i++) {
@@ -2445,9 +2397,15 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->advantages_puf = {.shape = {total_agents, horizon}};
     alloc_register(acts, &pufferl->advantages_puf);
 
-    muon_init(&pufferl->muon, params, hypers.lr, hypers.beta1, hypers.eps, 0.0, acts);
+    if (hypers.optimizer_type == 0) {
+        muon_init(&pufferl->muon, params, hypers.lr, hypers.beta1, hypers.eps, 0.0, acts);
+    } else {
+        lion_init(&pufferl->lion, params, hypers.lr, hypers.beta1, hypers.beta2, hypers.eps, 0.0, acts);
+    }
     pufferl->muon.nccl_comm = pufferl->nccl_comm;
     pufferl->muon.world_size = hypers.world_size;
+    pufferl->lion.nccl_comm = pufferl->nccl_comm;
+    pufferl->lion.world_size = hypers.world_size;
 
     // All buffers allocated here
     if (alloc_create(params) != cudaSuccess) {
@@ -2488,7 +2446,11 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     cudaMemset(pufferl->losses_puf.data, 0, NUM_LOSSES * sizeof(float));
     float one = 1.0f;
     cudaMemcpy(pufferl->ppo_bufs_puf.grad_loss.data, &one, sizeof(float), cudaMemcpyHostToDevice);
-    muon_post_create(&pufferl->muon);
+    if (hypers.optimizer_type == 0) {
+        muon_post_create(&pufferl->muon);
+    } else {
+        lion_post_create(&pufferl->lion);
+    }
 
     // Set up frozen banks declared in vec_kwargs (num_frozen_banks +
     // frozen_bank_pct: each bank gets floor(agents_per_buffer * pct) agents).
@@ -2531,6 +2493,13 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         void* saved_momentum;
         cudaMalloc(&saved_momentum, wb_bytes);
         cudaMemcpy(saved_momentum, pufferl->muon.mb_puf.data, wb_bytes, cudaMemcpyDeviceToDevice);
+        void* saved_lion_momentum = nullptr;
+        float saved_lion_lr = 0.0f;
+        if (hypers.optimizer_type == 1) {
+            cudaMalloc(&saved_lion_momentum, wb_bytes);
+            cudaMemcpy(saved_lion_momentum, pufferl->lion.mb_puf.data, wb_bytes, cudaMemcpyDeviceToDevice);
+            cudaMemcpy(&saved_lion_lr, pufferl->lion.lr_ptr, sizeof(float), cudaMemcpyDeviceToHost);
+        }
 
         // Create per-buffer streams before capture so graphs are
         // captured and replayed on the same streams.
@@ -2572,6 +2541,11 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         cudaFree(saved_weights);
         cudaMemcpy(pufferl->muon.mb_puf.data, saved_momentum, wb_bytes, cudaMemcpyDeviceToDevice);
         cudaFree(saved_momentum);
+        if (hypers.optimizer_type == 1) {
+            cudaMemcpy(pufferl->lion.mb_puf.data, saved_lion_momentum, wb_bytes, cudaMemcpyDeviceToDevice);
+            cudaFree(saved_lion_momentum);
+            cudaMemcpy(pufferl->lion.lr_ptr, &saved_lion_lr, sizeof(float), cudaMemcpyHostToDevice);
+        }
         if (USE_BF16) {
             int n = numel(pufferl->param_puf.shape);
             cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
@@ -2616,10 +2590,15 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
 void close_impl(PuffeRL& pufferl) {
     cudaDeviceSynchronize();
     gpu_profiler_stop(pufferl.hypers.profile);
-
-    cudaGraphExecDestroy(pufferl.train_cudagraph);
-    for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
-        cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
+    if (pufferl.train_cudagraph != NULL) {
+        cudaGraphExecDestroy(pufferl.train_cudagraph);
+    }
+    if (pufferl.fused_rollout_cudagraphs != NULL) {
+        for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
+            if (pufferl.fused_rollout_cudagraphs[i] != NULL) {
+                cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
+            }
+        }
     }
 
     policy_weights_free(&pufferl.policy, &pufferl.weights);

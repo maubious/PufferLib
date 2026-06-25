@@ -181,21 +181,28 @@ def _train_worker(args):
     backend = _resolve_backend(args)
     pufferl = backend.create_pufferl(args)
     args.pop('nccl_id', None)
-    while pufferl.global_step < args['train']['total_timesteps']:
+    batch_size = args['vec']['total_agents'] * args['train']['horizon']
+    while pufferl.global_step + batch_size <= args['train']['total_timesteps']:
         backend.rollouts(pufferl)
         backend.train(pufferl)
 
     backend.close(pufferl)
 
-def _train(env_name, args, sweep_early_stop=None, result_queue=None, verbose=False):
+def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     '''Single-GPU training worker. Process target for both DDP ranks and sweep trials.'''
     backend = _resolve_backend(args)
     rank = args['rank']
-    is_sweep = sweep_early_stop is not None
-    run_id = str(int(1000*time.time()))
-    if args['wandb']:
+    artifact_owner = rank == 0
+    run_id = args.get('run_id') or str(int(1000*time.time()))
+    if not bool(args.get('selfplay', {}).get('enabled', 0)):
+        # Stale frozen-bank config from selfplay/match experiments should not
+        # affect ordinary training. Otherwise uninitialized frozen policies own
+        # part of the rollout rows and their episodes leak into env/* metrics.
+        args['vec']['num_frozen_banks'] = 0
+        args['vec']['frozen_bank_pct'] = 0.0
+
+    if args['wandb'] and artifact_owner:
         import wandb
-        run_id = wandb.util.generate_id()
         wandb.init(id=run_id, config=args,
             project=args['wandb_project'], group=args['wandb_group'],
             tags=[args['tag']] if args['tag'] is not None else [],
@@ -206,22 +213,28 @@ def _train(env_name, args, sweep_early_stop=None, result_queue=None, verbose=Fal
     total_timesteps = args['train']['total_timesteps']
     all_logs = []
 
-    # When sweeping, optionally score each trial by winrate vs a fixed enemy
-    # checkpoint (match mode) instead of the training-time self-play metric.
-    match_mode = (is_sweep
-        and bool(args.get('sweep', {}).get('match_enemy_model_path')))
+    # When sweeping, optionally score each trial with a final evaluator instead
+    # of the training-time metric. Scripted-bot eval supersedes the older
+    # fixed-checkpoint match mode so trials do not pay for both.
+    bot_eval_mode = bool(args.get('sweep', {}).get('bot_eval', False))
+    match_mode = (sweep_obj is not None
+        and bool(args.get('sweep', {}).get('match_enemy_model_path'))
+        and not bot_eval_mode)
+    final_eval_mode = bot_eval_mode or match_mode
 
     checkpoint_dir = os.path.join(args['checkpoint_dir'], args['env_name'], run_id)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    if artifact_owner:
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
     log_dir = os.path.join(args['log_dir'], args['env_name'])
-    os.makedirs(log_dir, exist_ok=True)
+    if artifact_owner:
+        os.makedirs(log_dir, exist_ok=True)
 
     try:
         pufferl = backend.create_pufferl(args)
     except RuntimeError as e:
         print(f'WARNING: {e}, skipping')
-        if result_queue is not None:
+        if artifact_owner and result_queue is not None:
             result_queue.put((args['gpu_id'], [], [], []))
         return
 
@@ -235,19 +248,26 @@ def _train(env_name, args, sweep_early_stop=None, result_queue=None, verbose=Fal
     # under match-mode sweeps since match() owns its own perm/frozen bank.
     pool_state = None
     try:
-        pool_state = selfplay.setup(pufferl, backend, args, run_id)
+        pool_state = selfplay.setup(
+            pufferl, backend, args, run_id, artifact_owner=artifact_owner)
     except RuntimeError as e:
         print(f'WARNING: {e}, skipping')
         backend.close(pufferl)
-        if result_queue is not None:
+        if artifact_owner and result_queue is not None:
             result_queue.put((args['gpu_id'], [], [], []))
         return
 
     model_path = ''
     flat_logs = {}
-    train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
+    batch_size = args['vec']['total_agents'] * args['train']['horizon']
+    train_epochs = int(total_timesteps // batch_size)
     eval_epochs = train_epochs // 2
     for epoch in range(train_epochs + eval_epochs):
+        if epoch < train_epochs:
+            if pufferl.global_step + batch_size > total_timesteps:
+                train_epochs = epoch
+                continue
+            selfplay.sync(pufferl, backend, pool_state)
         backend.rollouts(pufferl)
 
         if epoch < train_epochs:
@@ -255,10 +275,12 @@ def _train(env_name, args, sweep_early_stop=None, result_queue=None, verbose=Fal
 
         # In match-sweep mode we need the final checkpoint to feed into match().
         is_final = epoch == train_epochs - 1
-        regular_checkpoint = not is_sweep and (
-            epoch % args['checkpoint_interval'] == 0 or is_final)
-        match_checkpoint = match_mode and is_final
-        if regular_checkpoint or match_checkpoint:
+        should_save = (epoch < train_epochs) and (
+            (sweep_obj is None
+                and (epoch % args['checkpoint_interval'] == 0 or is_final))
+            or (final_eval_mode and is_final)
+        )
+        if should_save and artifact_owner:
             model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
             backend.save_weights(pufferl, model_path)
 
@@ -267,19 +289,6 @@ def _train(env_name, args, sweep_early_stop=None, result_queue=None, verbose=Fal
             continue
 
         logs = backend.eval_log(pufferl) if epoch >= train_epochs else backend.log(pufferl)
-
-        should_early_stop = False
-        logs.setdefault('early_stop_threshold', -0.5)
-        logs.setdefault('is_loss_nan', False)
-
-        # NaN loss is a failed training run for both sweeps and regular train.
-        if any(np.isnan(v) for v in logs.get('loss', {}).values()):
-            logs['is_loss_nan'] = True
-            should_early_stop = True
-        elif (is_sweep and epoch < train_epochs and pufferl.global_step > min(0.20*total_timesteps, 100_000_000)):
-            # side effect: writes `early_stop_threshold` to logs
-            should_early_stop = sweep_early_stop.early_stop(logs, target_key)
-
         flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
 
         if epoch < train_epochs:
@@ -288,32 +297,39 @@ def _train(env_name, args, sweep_early_stop=None, result_queue=None, verbose=Fal
         if verbose:
             print_dashboard(args, model_size, flat_logs)
 
-        if target_key not in flat_logs:
+        if target_key not in flat_logs and not final_eval_mode:
             continue
 
-        if args['wandb']:
+        if args['wandb'] and artifact_owner:
             wandb.log(flat_logs, step=flat_logs['agent_steps'])
 
         if epoch < train_epochs:
             all_logs.append(flat_logs)
 
-            if should_early_stop:
+            if (sweep_obj is not None
+                    and not final_eval_mode
+                    and pufferl.global_step > min(0.20*total_timesteps, 100_000_000) and
+                    sweep_obj.early_stop(flat_logs, target_key)):
                 break
         elif flat_logs['env/n'] > args['eval_episodes']:
             break
 
 
-    print_dashboard(args, model_size, flat_logs)
-    # Match-mode trials may have early-stopped before the in-loop save fired;
-    # ensure we always have a checkpoint to feed match().
-    if match_mode and not model_path:
+    if artifact_owner:
+        print_dashboard(args, model_size, flat_logs)
+    # Final-score trials may have early-stopped before the in-loop save fired;
+    # ensure we always have a checkpoint to feed the post-training evaluator.
+    if final_eval_mode and artifact_owner and not model_path:
         model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
         backend.save_weights(pufferl, model_path)
     backend.close(pufferl)
 
-    if target_key not in flat_logs:
-        if result_queue is not None:
+    if target_key not in flat_logs and not final_eval_mode:
+        if artifact_owner and result_queue is not None:
             result_queue.put((args['gpu_id'], None, None, None))
+        return
+
+    if not artifact_owner:
         return
 
     # Match-mode scoring: primary = trained policy (model_path); frozen bank =
@@ -321,7 +337,9 @@ def _train(env_name, args, sweep_early_stop=None, result_queue=None, verbose=Fal
     # so must run after the training instance is closed. Single observation per
     # trial (mid-training curve doesn't predict final match score).
     match_score = None
-    if match_mode:
+    bot_eval_logs = None
+    bot_perf = None
+    if match_mode and artifact_owner:
         sweep_cfg = args['sweep']
         match_args = deepcopy(args)
         match_args['enemy_hidden_size'] = int(sweep_cfg['match_enemy_hidden_size'])
@@ -332,34 +350,75 @@ def _train(env_name, args, sweep_early_stop=None, result_queue=None, verbose=Fal
             num_games=int(sweep_cfg['match_num_games']),
             args=match_args, verbose=verbose)
         match_score = float(match_logs['env/slot_0_score'])
-        if args['wandb']:
+        if args['wandb'] and artifact_owner:
             wandb.log({'env/match_score': match_score}, step=flat_logs['agent_steps'])
+
+    if bot_eval_mode and artifact_owner:
+        sweep_cfg = args['sweep']
+        bot_eval_logs = eval_bot(env_name,
+            policy_path=model_path,
+            num_games=int(sweep_cfg['bot_eval_episodes']),
+            eval_agents=int(sweep_cfg.get('bot_eval_envs', 0)),
+            burnin_games=int(sweep_cfg.get('bot_eval_burnin_episodes', 0)),
+            bot_policy=int(sweep_cfg['bot_eval_policy']),
+            max_ticks=int(sweep_cfg['bot_eval_max_ticks']),
+            args=deepcopy(args), verbose=verbose)
+        bot_perf = float(bot_eval_logs['env/perf'])
+        if args['wandb'] and artifact_owner:
+            wandb.log({
+                'env/bot_perf': bot_perf,
+                'env/bot_score': float(bot_eval_logs.get('env/score', 0.0)),
+                'env/bot_damage_received': float(bot_eval_logs.get('env/damage_received', 0.0)),
+                'env/bot_slot_0_score': float(bot_eval_logs.get('env/slot_0_score', 0.0)),
+                'env/bot_draw_rate': float(bot_eval_logs.get('env/draw_rate', 0.0)),
+            }, step=flat_logs['agent_steps'])
 
     # This version has the training perf logs and eval env logs
     all_logs.append(flat_logs)
 
-    # Downsample results
-    metrics = {k: [[]] for k in all_logs[0] if k != 'is_loss_nan'}
+    # Downsample results. Log keys can appear late, e.g. env/perf only after
+    # eval epochs. For downsample=1, keep exactly the final point.
     n = args['sweep']['downsample']
-    logged_timesteps = all_logs[-1]['agent_steps']
-    next_bin = logged_timesteps / (n - 1) if n > 1 else np.inf
-    for log in all_logs:
-        for k, v in log.items():
-            if k != 'is_loss_nan':
+    if n <= 1:
+        metrics = {k: [v] for k, v in all_logs[-1].items()}
+    else:
+        def _reduce(values):
+            if not values:
+                return None
+            try:
+                return float(np.mean(values))
+            except (TypeError, ValueError):
+                return values[-1]
+
+        metrics = {k: [[]] for k in all_logs[0]}
+        logged_timesteps = all_logs[-1]['agent_steps']
+        next_bin = logged_timesteps / (n - 1)
+        for log in all_logs:
+            for k, v in log.items():
+                if k not in metrics:
+                    prior_bins = max(len(metrics['agent_steps']) - 1, 0)
+                    metrics[k] = [v] * prior_bins + [[]]
                 metrics[k][-1].append(v)
 
-        if log['agent_steps'] < next_bin:
-            continue
+            if log['agent_steps'] < next_bin:
+                continue
 
-        next_bin += logged_timesteps / (n - 1)
-        for k in metrics:
-            metrics[k][-1] = np.mean(metrics[k][-1])
-            metrics[k].append([])
+            next_bin += logged_timesteps / (n - 1)
+            for k in list(metrics):
+                reduced = _reduce(metrics[k][-1])
+                if reduced is None and len(metrics[k]) > 1:
+                    reduced = metrics[k][-2]
+                metrics[k][-1] = reduced
+                metrics[k].append([])
 
-    for k in metrics:
-        metrics[k][-1] = all_logs[-1][k]
-
-    is_loss_nan = any(log.get('is_loss_nan', False) for log in all_logs)
+        for k in list(metrics):
+            if k in all_logs[-1]:
+                metrics[k][-1] = all_logs[-1][k]
+            else:
+                reduced = _reduce(metrics[k][-1])
+                if reduced is None and len(metrics[k]) > 1:
+                    reduced = metrics[k][-2]
+                metrics[k][-1] = reduced
 
     # Match-mode: single observation at final-training cost. Protein's curve
     # fit collapses to one point — we only trust the match winrate, not any
@@ -368,40 +427,61 @@ def _train(env_name, args, sweep_early_stop=None, result_queue=None, verbose=Fal
     # length-mismatched metrics as "bad data").
     if match_mode:
         metrics['env/match_score'] = [match_score] * len(metrics['agent_steps'])
+    if bot_eval_mode and bot_eval_logs is not None:
+        metrics['env/bot_perf'] = [bot_perf] * len(metrics['agent_steps'])
+        for src_key, dst_key in (
+                ('env/score', 'env/bot_score'),
+                ('env/damage_received', 'env/bot_damage_received'),
+                ('env/episode_length', 'env/bot_episode_length'),
+                ('env/slot_0_score', 'env/bot_slot_0_score'),
+                ('env/slot_1_score', 'env/bot_slot_1_score'),
+                ('env/draw_rate', 'env/bot_draw_rate'),
+                ('env/n', 'env/bot_n')):
+            if src_key in bot_eval_logs:
+                metrics[dst_key] = [float(bot_eval_logs[src_key])] * len(metrics['agent_steps'])
 
     # Save own log: config + downsampled results
-    log_dir = os.path.join(args['log_dir'], args['env_name'])
-    os.makedirs(log_dir, exist_ok=True)
-    with open(os.path.join(log_dir, run_id + '.json'), 'w') as f:
-        json.dump({**args, 'is_loss_nan': is_loss_nan, 'metrics': metrics}, f)
+    if artifact_owner:
+        log_dir = os.path.join(args['log_dir'], args['env_name'])
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, run_id + '.json'), 'w') as f:
+            json.dump({**args, 'metrics': metrics}, f)
 
-    if args['wandb']:
-        if not is_sweep and model_path: # Don't spam uploads during sweeps
+    if args['wandb'] and artifact_owner:
+        if sweep_obj is None and model_path: # Don't spam uploads during sweeps
             artifact = wandb.Artifact(run_id, type='model')
             artifact.add_file(model_path)
             wandb.run.log_artifact(artifact)
 
         wandb.run.finish()
 
-    if result_queue is not None:
-        if match_mode:
+    if artifact_owner and result_queue is not None:
+        if bot_eval_mode and bot_perf is not None:
+            # One observation: final hypers -> scripted-bot perf, at total training cost.
+            result_queue.put((args['gpu_id'], [bot_perf],
+                [metrics['uptime'][-1]], [metrics['agent_steps'][-1]]))
+        elif match_mode:
             # One observation: final hypers -> match winrate, at total training cost.
             result_queue.put((args['gpu_id'], [match_score],
                 [metrics['uptime'][-1]], [metrics['agent_steps'][-1]]))
         else:
-            result_queue.put((args['gpu_id'], metrics['env/score'], metrics['uptime'], metrics['agent_steps']))
+            result_queue.put((args['gpu_id'], metrics[target_key], metrics['uptime'], metrics['agent_steps']))
+
 
 def train(env_name, args=None, gpus=None, **kwargs):
     args = args or load_config(env_name)
     validate_config(args)
-    sweep_obj = kwargs.pop('sweep_obj', None)
-    if sweep_obj is not None and 'sweep_early_stop' not in kwargs:
-        kwargs['sweep_early_stop'] = sweep_obj.early_stop_state()
 
     subprocess = gpus is not None
     gpus = list(gpus or range(args['train']['gpus']))
     args['train']['total_timesteps'] //= len(gpus)
     args['world_size'] = len(gpus)
+    if not args.get('run_id'):
+        if args.get('wandb'):
+            import wandb
+            args['run_id'] = wandb.util.generate_id()
+        else:
+            args['run_id'] = str(int(1000*time.time()))
     args['nccl_id'] = _C.get_nccl_id() if len(gpus) > 1 else b''
 
     if not subprocess:
@@ -413,8 +493,11 @@ def train(env_name, args=None, gpus=None, **kwargs):
         worker_args['rank'] = rank
         worker_args['gpu_id'] = gpu_id
         if rank == 0 and not subprocess:
-            _train(env_name, worker_args, verbose=True, **kwargs)
+            _train(env_name, worker_args, verbose=True)
         else:
+            # Protein's GP models live on cuda:0 on non-WSL setups; spawn-pickling
+            # them works fine via CUDA IPC. On WSL, sweep.py forces device='cpu'
+            # at construction so there's nothing to move.
             ctx.Process(target=_train, args=(env_name, worker_args),
                 kwargs=kwargs).start()
 
@@ -422,7 +505,7 @@ def sweep(env_name, args=None, pareto=False):
     '''Train entry point. Handles single-GPU, multi-GPU DDP, and sweeps.'''
     args = args or load_config(env_name)
     exp_gpus = args['train']['gpus']
-    sweep_gpus = args['sweep']['gpus'] or torch.cuda.device_count()
+    sweep_gpus = args['sweep']['gpus'] or len(os.listdir('/proc/driver/nvidia/gpus'))
     args['vec']['num_threads'] //= (sweep_gpus // exp_gpus)
     args['no_model_upload'] = True
 
@@ -478,13 +561,111 @@ def sweep(env_name, args=None, pareto=False):
         exp_args = deepcopy(args)
         active[gpu_id] = exp_args
         train(env_name, exp_args, range(gpu_id, gpu_id + exp_gpus),
-            sweep_early_stop=sweep_obj.early_stop_state(), result_queue=result_queue)
+            sweep_obj=sweep_obj, result_queue=result_queue)
+
+
+def eval_bot(env_name, policy_path, num_games=4096, eval_agents=0, burnin_games=0,
+        bot_policy=-1, max_ticks=0, args=None, verbose=True):
+    '''Evaluate a trained policy against the env's scripted bot.'''
+    args = args or load_config(env_name)
+    args['reset_state'] = False
+    args['train']['horizon'] = 1
+    args['world_size'] = 1
+    args['rank'] = 0
+    args.setdefault('nccl_id', b'')
+
+    num_games = int(num_games)
+    burnin_games = int(burnin_games)
+    eval_agents = int(eval_agents)
+    if num_games <= 0:
+        raise ValueError('num_games must be positive')
+    if burnin_games < 0:
+        raise ValueError('burnin_games must be non-negative')
+
+    args['vec']['num_buffers'] = 2
+    if eval_agents <= 0:
+        # Avoid scoring only the first wave of completed episodes. If env count
+        # ~= game count, quick wins finish first and slow losses are censored.
+        eval_agents = min(4096, max(1024, num_games // 8))
+    eval_agents = min(eval_agents, max(1024, num_games))
+    eval_agents += (-eval_agents) % args['vec']['num_buffers']
+    args['vec']['total_agents'] = eval_agents
+    args['vec']['num_frozen_banks'] = 0
+    args['vec']['frozen_bank_pct'] = 0.0
+    args.setdefault('selfplay', {})['enabled'] = 0
+    args.setdefault('env', {})['dr'] = 0.0
+    args['env']['action_block_p'] = 0.0
+    args['env']['num_agents'] = 1
+    args['env']['num_bots'] = 1
+    if bot_policy >= 0:
+        args['env']['bot_policy'] = bot_policy
+    if max_ticks > 0:
+        args['env']['max_ticks'] = max_ticks
+
+    backend = _resolve_backend(args)
+    if backend is not _C:
+        raise RuntimeError('eval_bot() requires the native CUDA backend')
+
+    pufferl = backend.create_pufferl(args)
+    backend.load_weights(pufferl, policy_path)
+
+    def _delta_logs(current, baseline):
+        if not baseline:
+            return current
+        n = float(current.get('env/n', 0.0))
+        base_n = float(baseline.get('env/n', 0.0))
+        delta_n = max(n - base_n, 0.0)
+        if delta_n <= 0:
+            return {'env/n': 0.0}
+        out = {}
+        for key, value in current.items():
+            if key == 'env/n':
+                out[key] = delta_n
+            elif key.startswith('env/') and key in baseline:
+                out[key] = (float(value) * n - float(baseline[key]) * base_n) / delta_n
+            else:
+                out[key] = value
+        return out
+
+    logs = {}
+    baseline_logs = {}
+    baseline_n = 0
+    while True:
+        backend.rollouts(pufferl)
+        logs = dict(unroll_nested_dict(backend.eval_log(pufferl)))
+        n = int(logs.get('env/n', 0))
+        if burnin_games and not baseline_logs and n >= burnin_games:
+            baseline_logs = logs.copy()
+            baseline_n = n
+
+        scored_logs = _delta_logs(logs, baseline_logs)
+        scored_n = int(scored_logs.get('env/n', n))
+        if verbose:
+            perf = scored_logs.get('env/perf', 0.0)
+            score = scored_logs.get('env/score', 0.0)
+            if burnin_games and not baseline_logs:
+                print(f'\rbot_eval_burnin={n}/{burnin_games}', end='')
+            else:
+                print(f'\rbot_eval={scored_n}/{num_games}  perf={perf:.4f}  score={score:.3f}', end='')
+        if (n - baseline_n) >= num_games and (not burnin_games or baseline_logs):
+            logs = scored_logs
+            break
+
+    if verbose:
+        print()
+
+    backend.close(pufferl)
+    return logs
 
 def eval(env_name, args=None, load_path=None):
     '''Evaluate a trained policy. Supports both native and --slowly torch backends.'''
     args = args or load_config(env_name)
     args['reset_state'] = False
     args['train']['horizon'] = 1
+    if 'env' in args and 'dr' in args['env']:
+        args['env']['dr'] = 0.0
+    if 'env' in args:
+        args['env']['action_block_p'] = 0.0
 
     backend = _resolve_backend(args)
     pufferl = backend.create_pufferl(args)
@@ -503,10 +684,13 @@ def eval(env_name, args=None, load_path=None):
         backend.load_weights(pufferl, load_path)
         print(f'Loaded weights from {load_path}')
 
-    while True:
-        backend.render(pufferl, 0)
+    #while True:
+    for i in range(10000):
+        #backend.render(pufferl, 0)
         backend.rollouts(pufferl)
 
+    logs = dict(unroll_nested_dict(backend.eval_log(pufferl)))
+    print('Perf: ', logs['env/perf'])
     backend.close(pufferl)
 
 def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, verbose=True):
@@ -523,6 +707,8 @@ def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, ver
     # clean slot-0/slot-1 split; ignores trial's vec tuning (eval, not train).
     args['vec']['num_buffers'] = 2
     args['vec']['total_agents'] = 8192
+    args.setdefault('env', {})['dr'] = 0.0
+    args['env']['action_block_p'] = 0.0
     backend = _resolve_backend(args)
     if backend is not _C:
         raise RuntimeError('match() requires the native CUDA backend')
