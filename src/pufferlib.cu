@@ -18,7 +18,6 @@
 #include "models.cu"
 #include "ocean.cu"
 #include "muon.cu"
-#include "lion.cu"
 #include "vecenv.h"
 
 static double wall_clock() {
@@ -375,7 +374,6 @@ typedef struct {
     float min_lr_ratio;
     bool anneal_lr;
     // Optimizer
-    int optimizer_type; // 0=Muon, 1=Lion
     float beta1;
     float beta2;
     float eps;
@@ -444,7 +442,6 @@ typedef struct {
     Allocator activations_alloc;
     StaticVec* vec;
     Muon muon;
-    Lion lion;
     ncclComm_t nccl_comm;  // NCCL communicator for multi-GPU
     HypersT hypers;
     bool is_continuous;  // True if all action dimensions are continuous (size==1)
@@ -1890,14 +1887,9 @@ void train_impl(PuffeRL& pufferl) {
     int current_epoch = pufferl.epoch;
 
     Muon* muon = &pufferl.muon;
-    Lion* lion = &pufferl.lion;
     int total_epochs = hypers.total_timesteps / batch_size;
     float lr = current_learning_rate(hypers, current_epoch, total_epochs);
-    if (hypers.optimizer_type == 0) {
-        cudaMemcpy(muon->lr_ptr, &lr, sizeof(float), cudaMemcpyHostToDevice);
-    } else {
-        cudaMemcpy(lion->lr_ptr, &lr, sizeof(float), cudaMemcpyHostToDevice);
-    }
+	cudaMemcpy(muon->lr_ptr, &lr, sizeof(float), cudaMemcpyHostToDevice);
 
     // Annealed entropy coefficient — same cosine shape as lr. With PG signal
     // alive, the entropy bonus that kept early-training exploratory becomes
@@ -1985,11 +1977,7 @@ void train_impl(PuffeRL& pufferl) {
             policy_backward(&pufferl.policy, pufferl.weights, pufferl.train_activations,
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
 
-            if (hypers.optimizer_type == 0) {
-                muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
-            } else {
-                lion_step(&pufferl.lion, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
-            }
+			muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
             if (USE_BF16) {
                 int n = numel(pufferl.param_puf.shape);
                 cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
@@ -2397,15 +2385,9 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->advantages_puf = {.shape = {total_agents, horizon}};
     alloc_register(acts, &pufferl->advantages_puf);
 
-    if (hypers.optimizer_type == 0) {
-        muon_init(&pufferl->muon, params, hypers.lr, hypers.beta1, hypers.eps, 0.0, acts);
-    } else {
-        lion_init(&pufferl->lion, params, hypers.lr, hypers.beta1, hypers.beta2, hypers.eps, 0.0, acts);
-    }
+	muon_init(&pufferl->muon, params, hypers.lr, hypers.beta1, hypers.eps, 0.0, acts);
     pufferl->muon.nccl_comm = pufferl->nccl_comm;
     pufferl->muon.world_size = hypers.world_size;
-    pufferl->lion.nccl_comm = pufferl->nccl_comm;
-    pufferl->lion.world_size = hypers.world_size;
 
     // All buffers allocated here
     if (alloc_create(params) != cudaSuccess) {
@@ -2446,11 +2428,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     cudaMemset(pufferl->losses_puf.data, 0, NUM_LOSSES * sizeof(float));
     float one = 1.0f;
     cudaMemcpy(pufferl->ppo_bufs_puf.grad_loss.data, &one, sizeof(float), cudaMemcpyHostToDevice);
-    if (hypers.optimizer_type == 0) {
-        muon_post_create(&pufferl->muon);
-    } else {
-        lion_post_create(&pufferl->lion);
-    }
+	muon_post_create(&pufferl->muon);
 
     // Set up frozen banks declared in vec_kwargs (num_frozen_banks +
     // frozen_bank_pct: each bank gets floor(agents_per_buffer * pct) agents).
@@ -2493,13 +2471,6 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         void* saved_momentum;
         cudaMalloc(&saved_momentum, wb_bytes);
         cudaMemcpy(saved_momentum, pufferl->muon.mb_puf.data, wb_bytes, cudaMemcpyDeviceToDevice);
-        void* saved_lion_momentum = nullptr;
-        float saved_lion_lr = 0.0f;
-        if (hypers.optimizer_type == 1) {
-            cudaMalloc(&saved_lion_momentum, wb_bytes);
-            cudaMemcpy(saved_lion_momentum, pufferl->lion.mb_puf.data, wb_bytes, cudaMemcpyDeviceToDevice);
-            cudaMemcpy(&saved_lion_lr, pufferl->lion.lr_ptr, sizeof(float), cudaMemcpyDeviceToHost);
-        }
 
         // Create per-buffer streams before capture so graphs are
         // captured and replayed on the same streams.
@@ -2541,11 +2512,6 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         cudaFree(saved_weights);
         cudaMemcpy(pufferl->muon.mb_puf.data, saved_momentum, wb_bytes, cudaMemcpyDeviceToDevice);
         cudaFree(saved_momentum);
-        if (hypers.optimizer_type == 1) {
-            cudaMemcpy(pufferl->lion.mb_puf.data, saved_lion_momentum, wb_bytes, cudaMemcpyDeviceToDevice);
-            cudaFree(saved_lion_momentum);
-            cudaMemcpy(pufferl->lion.lr_ptr, &saved_lion_lr, sizeof(float), cudaMemcpyHostToDevice);
-        }
         if (USE_BF16) {
             int n = numel(pufferl->param_puf.shape);
             cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(

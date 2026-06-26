@@ -404,8 +404,6 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     hypers.min_lr_ratio = get_config(train_kwargs, "min_lr_ratio");
     hypers.anneal_lr = get_config(train_kwargs, "anneal_lr");
     // Optimizer
-    std::string optimizer_name = train_kwargs.contains("optimizer") ? train_kwargs["optimizer"].cast<std::string>() : "muon";
-    hypers.optimizer_type = (optimizer_name == "lion") ? 1 : 0;
     hypers.beta1 = get_config(train_kwargs, "beta1");
     hypers.beta2 = get_config(train_kwargs, "beta2");
     hypers.eps = get_config(train_kwargs, "eps");
@@ -520,7 +518,6 @@ PYBIND11_MODULE(_C, m) {
     m.def("python_vec_send", &python_vec_send);
     py::class_<Policy>(m, "Policy");
     py::class_<Muon>(m, "Muon");
-    py::class_<Lion>(m, "Lion");
     py::class_<Allocator>(m, "Allocator")
         .def(py::init<>());
 
@@ -536,7 +533,6 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("lr", &HypersT::lr)
         .def_readwrite("min_lr_ratio", &HypersT::min_lr_ratio)
         .def_readwrite("anneal_lr", &HypersT::anneal_lr)
-        .def_readwrite("optimizer_type", &HypersT::optimizer_type)
         .def_readwrite("beta1", &HypersT::beta1)
         .def_readwrite("beta2", &HypersT::beta2)
         .def_readwrite("eps", &HypersT::eps)
@@ -615,7 +611,6 @@ PYBIND11_MODULE(_C, m) {
     py::class_<PuffeRL, std::unique_ptr<PuffeRL>>(m, "PuffeRL")
         .def_readwrite("policy", &PuffeRL::policy)
         .def_readwrite("muon", &PuffeRL::muon)
-        .def_readwrite("lion", &PuffeRL::lion)
         .def_readwrite("hypers", &PuffeRL::hypers)
         .def_readwrite("rollouts", &PuffeRL::rollouts)
         .def_readonly("epoch", &PuffeRL::epoch)
@@ -629,17 +624,5 @@ PYBIND11_MODULE(_C, m) {
         })
         .def("get_grads_ptr", [](PuffeRL& self) -> int64_t {
             return (int64_t)self.grad_puf.data;
-        })
-        .def("get_lion_lr", [](PuffeRL& self) -> float {
-            float lr;
-            cudaMemcpy(&lr, self.lion.lr_ptr, sizeof(float), cudaMemcpyDeviceToHost);
-            return lr;
-        })
-        .def("test_lion_step", [](PuffeRL& self, int64_t grads_ptr, float max_grad_norm) {
-            PrecisionTensor grads;
-            grads.data = (precision_t*)grads_ptr;
-            memcpy(grads.shape, self.grad_puf.shape, sizeof(grads.shape));
-            lion_step(&self.lion, self.master_weights, grads, max_grad_norm, self.default_stream);
-            cudaStreamSynchronize(self.default_stream);
         });
 }
