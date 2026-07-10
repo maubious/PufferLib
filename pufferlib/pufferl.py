@@ -26,6 +26,7 @@ except ImportError:
     raise ImportError('Failed to import PufferLib C++ backend. If you have non-default PyTorch, try installing with --no-build-isolation')
 
 from pufferlib import selfplay
+from pufferlib import league
 
 import rich
 import rich.traceback
@@ -94,8 +95,10 @@ def print_dashboard(args, model_size, flat_logs, clear=False, idx=[0],
     s = Table(box=None, expand=True)
     remaining = f'{b2}A hair past a freckle{c2}'
     agent_steps = g('agent_steps')
+    target_steps = args['train'].get(
+        'global_total_timesteps', args['train']['total_timesteps'])
     if g('SPS') != 0:
-        remaining = duration((args['train']['total_timesteps']*args['train'].get('gpus', 1) - agent_steps)/g('SPS'), b2, c2)
+        remaining = duration((target_steps - agent_steps)/g('SPS'), b2, c2)
 
     s.add_column(f"{c1}Summary", justify='left', vertical='top', width=10)
     s.add_column(f"{c1}Value", justify='right', vertical='top', width=14)
@@ -177,12 +180,25 @@ def _resolve_backend(args):
         return PuffeRL
     return _C
 
+def _local_total_timesteps(args):
+    return args['train'].get(
+        'local_total_timesteps', args['train']['total_timesteps'])
+
+def _train_worker_args(args, rank, gpu_id):
+    worker_args = deepcopy(args)
+    world_size = max(1, int(worker_args.get('world_size', 1)))
+    global_total_timesteps = worker_args['train']['total_timesteps']
+    worker_args['train']['global_total_timesteps'] = global_total_timesteps
+    worker_args['train']['local_total_timesteps'] = global_total_timesteps / world_size
+    worker_args['rank'] = rank
+    worker_args['gpu_id'] = gpu_id
+    return worker_args
+
 def _train_worker(args):
     backend = _resolve_backend(args)
     pufferl = backend.create_pufferl(args)
     args.pop('nccl_id', None)
-    batch_size = args['vec']['total_agents'] * args['train']['horizon']
-    while pufferl.global_step + batch_size <= args['train']['total_timesteps']:
+    while pufferl.global_step < _local_total_timesteps(args):
         backend.rollouts(pufferl)
         backend.train(pufferl)
 
@@ -210,17 +226,12 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         )
 
     target_key = f'env/{args["sweep"]["metric"]}'
-    total_timesteps = args['train']['total_timesteps']
+    total_timesteps = _local_total_timesteps(args)
     all_logs = []
 
-    # When sweeping, optionally score each trial with a final evaluator instead
-    # of the training-time metric. Scripted-bot eval supersedes the older
-    # fixed-checkpoint match mode so trials do not pay for both.
-    bot_eval_mode = bool(args.get('sweep', {}).get('bot_eval', False))
-    match_mode = (sweep_obj is not None
-        and bool(args.get('sweep', {}).get('match_enemy_model_path'))
-        and not bot_eval_mode)
-    final_eval_mode = bot_eval_mode or match_mode
+    # League sweeps are scored asynchronously by the shared match worker, so
+    # each trial only needs to train and return its final checkpoint.
+    league_mode = bool(args.get('sweep', {}).get('league', False))
 
     checkpoint_dir = os.path.join(args['checkpoint_dir'], args['env_name'], run_id)
     if artifact_owner:
@@ -244,8 +255,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         flat_logs = dict(unroll_nested_dict(backend.log(pufferl)))
         print_dashboard(args, model_size, flat_logs, clear=True)
 
-    # Selfplay-pool curriculum (no-op unless selfplay.enabled). Disabled
-    # under match-mode sweeps since match() owns its own perm/frozen bank.
+    # Selfplay-pool curriculum (no-op unless selfplay.enabled).
     pool_state = None
     try:
         pool_state = selfplay.setup(
@@ -259,45 +269,39 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
     model_path = ''
     flat_logs = {}
-    batch_size = args['vec']['total_agents'] * args['train']['horizon']
-    train_epochs = int(total_timesteps // batch_size)
-    eval_epochs = train_epochs // 2
+    train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
+    eval_epochs = 0 if league_mode else train_epochs // 2
     for epoch in range(train_epochs + eval_epochs):
         if epoch < train_epochs:
-            if pufferl.global_step + batch_size > total_timesteps:
-                train_epochs = epoch
-                continue
             selfplay.sync(pufferl, backend, pool_state)
         backend.rollouts(pufferl)
 
         if epoch < train_epochs:
             backend.train(pufferl)
 
-        # In match-sweep mode we need the final checkpoint to feed into match().
         is_final = epoch == train_epochs - 1
         should_save = (epoch < train_epochs) and (
             (sweep_obj is None
                 and (epoch % args['checkpoint_interval'] == 0 or is_final))
-            or (final_eval_mode and is_final)
+            or (league_mode and is_final)
         )
         if should_save and artifact_owner:
             model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
             backend.save_weights(pufferl, model_path)
 
-        # Rate limit, but always log for eval to maintain determinism
-        if time.time() < pufferl.last_log_time + 0.6 and epoch < train_epochs - 1:
+        if (time.time() < pufferl.last_log_time + 0.6
+                and epoch < train_epochs - 1):
             continue
 
         logs = backend.eval_log(pufferl) if epoch >= train_epochs else backend.log(pufferl)
         flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
-
         if epoch < train_epochs:
             selfplay.step(pufferl, backend, pool_state, flat_logs, epoch)
 
         if verbose:
             print_dashboard(args, model_size, flat_logs)
 
-        if target_key not in flat_logs and not final_eval_mode:
+        if target_key not in flat_logs and not league_mode:
             continue
 
         if args['wandb'] and artifact_owner:
@@ -307,7 +311,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             all_logs.append(flat_logs)
 
             if (sweep_obj is not None
-                    and not final_eval_mode
+                    and not league_mode
                     and pufferl.global_step > min(0.20*total_timesteps, 100_000_000) and
                     sweep_obj.early_stop(flat_logs, target_key)):
                 break
@@ -317,61 +321,25 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
     if artifact_owner:
         print_dashboard(args, model_size, flat_logs)
-    # Final-score trials may have early-stopped before the in-loop save fired;
-    # ensure we always have a checkpoint to feed the post-training evaluator.
-    if final_eval_mode and artifact_owner and not model_path:
+    if league_mode and artifact_owner and not model_path:
         model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
         backend.save_weights(pufferl, model_path)
+
+    if league_mode and artifact_owner:
+        league.finish_trial(args, run_id, model_path, all_logs, flat_logs, result_queue)
+        if result_queue is None:
+            backend.close(pufferl)
+        return
+
     backend.close(pufferl)
 
-    if target_key not in flat_logs and not final_eval_mode:
+    if target_key not in flat_logs and not league_mode:
         if artifact_owner and result_queue is not None:
             result_queue.put((args['gpu_id'], None, None, None))
         return
 
     if not artifact_owner:
         return
-
-    # Match-mode scoring: primary = trained policy (model_path); frozen bank =
-    # fixed enemy. Score is slot 0's average winrate. Creates its own pufferl
-    # so must run after the training instance is closed. Single observation per
-    # trial (mid-training curve doesn't predict final match score).
-    match_score = None
-    bot_eval_logs = None
-    bot_perf = None
-    if match_mode and artifact_owner:
-        sweep_cfg = args['sweep']
-        match_args = deepcopy(args)
-        match_args['enemy_hidden_size'] = int(sweep_cfg['match_enemy_hidden_size'])
-        match_args['enemy_num_layers'] = int(sweep_cfg['match_enemy_num_layers'])
-        match_logs = match(env_name,
-            policy_a_path=model_path,
-            policy_b_path=sweep_cfg['match_enemy_model_path'],
-            num_games=int(sweep_cfg['match_num_games']),
-            args=match_args, verbose=verbose)
-        match_score = float(match_logs['env/slot_0_score'])
-        if args['wandb'] and artifact_owner:
-            wandb.log({'env/match_score': match_score}, step=flat_logs['agent_steps'])
-
-    if bot_eval_mode and artifact_owner:
-        sweep_cfg = args['sweep']
-        bot_eval_logs = eval_bot(env_name,
-            policy_path=model_path,
-            num_games=int(sweep_cfg['bot_eval_episodes']),
-            eval_agents=int(sweep_cfg.get('bot_eval_envs', 0)),
-            burnin_games=int(sweep_cfg.get('bot_eval_burnin_episodes', 0)),
-            bot_policy=int(sweep_cfg['bot_eval_policy']),
-            max_ticks=int(sweep_cfg['bot_eval_max_ticks']),
-            args=deepcopy(args), verbose=verbose)
-        bot_perf = float(bot_eval_logs['env/perf'])
-        if args['wandb'] and artifact_owner:
-            wandb.log({
-                'env/bot_perf': bot_perf,
-                'env/bot_score': float(bot_eval_logs.get('env/score', 0.0)),
-                'env/bot_damage_received': float(bot_eval_logs.get('env/damage_received', 0.0)),
-                'env/bot_slot_0_score': float(bot_eval_logs.get('env/slot_0_score', 0.0)),
-                'env/bot_draw_rate': float(bot_eval_logs.get('env/draw_rate', 0.0)),
-            }, step=flat_logs['agent_steps'])
 
     # This version has the training perf logs and eval env logs
     all_logs.append(flat_logs)
@@ -420,26 +388,6 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
                     reduced = metrics[k][-2]
                 metrics[k][-1] = reduced
 
-    # Match-mode: single observation at final-training cost. Protein's curve
-    # fit collapses to one point — we only trust the match winrate, not any
-    # training-time proxy. Replicate the scalar across all downsample bins so
-    # the JSON log shape matches every other metric (cache_data.py rejects
-    # length-mismatched metrics as "bad data").
-    if match_mode:
-        metrics['env/match_score'] = [match_score] * len(metrics['agent_steps'])
-    if bot_eval_mode and bot_eval_logs is not None:
-        metrics['env/bot_perf'] = [bot_perf] * len(metrics['agent_steps'])
-        for src_key, dst_key in (
-                ('env/score', 'env/bot_score'),
-                ('env/damage_received', 'env/bot_damage_received'),
-                ('env/episode_length', 'env/bot_episode_length'),
-                ('env/slot_0_score', 'env/bot_slot_0_score'),
-                ('env/slot_1_score', 'env/bot_slot_1_score'),
-                ('env/draw_rate', 'env/bot_draw_rate'),
-                ('env/n', 'env/bot_n')):
-            if src_key in bot_eval_logs:
-                metrics[dst_key] = [float(bot_eval_logs[src_key])] * len(metrics['agent_steps'])
-
     # Save own log: config + downsampled results
     if artifact_owner:
         log_dir = os.path.join(args['log_dir'], args['env_name'])
@@ -456,16 +404,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         wandb.run.finish()
 
     if artifact_owner and result_queue is not None:
-        if bot_eval_mode and bot_perf is not None:
-            # One observation: final hypers -> scripted-bot perf, at total training cost.
-            result_queue.put((args['gpu_id'], [bot_perf],
-                [metrics['uptime'][-1]], [metrics['agent_steps'][-1]]))
-        elif match_mode:
-            # One observation: final hypers -> match winrate, at total training cost.
-            result_queue.put((args['gpu_id'], [match_score],
-                [metrics['uptime'][-1]], [metrics['agent_steps'][-1]]))
-        else:
-            result_queue.put((args['gpu_id'], metrics[target_key], metrics['uptime'], metrics['agent_steps']))
+        result_queue.put((args['gpu_id'], metrics[target_key], metrics['uptime'], metrics['agent_steps']))
 
 
 def train(env_name, args=None, gpus=None, **kwargs):
@@ -474,7 +413,6 @@ def train(env_name, args=None, gpus=None, **kwargs):
 
     subprocess = gpus is not None
     gpus = list(gpus or range(args['train']['gpus']))
-    args['train']['total_timesteps'] //= len(gpus)
     args['world_size'] = len(gpus)
     if not args.get('run_id'):
         if args.get('wandb'):
@@ -489,9 +427,7 @@ def train(env_name, args=None, gpus=None, **kwargs):
 
     ctx = mp.get_context('spawn')
     for rank, gpu_id in reversed(list(enumerate(gpus))):
-        worker_args = deepcopy(args)
-        worker_args['rank'] = rank
-        worker_args['gpu_id'] = gpu_id
+        worker_args = _train_worker_args(args, rank, gpu_id)
         if rank == 0 and not subprocess:
             _train(env_name, worker_args, verbose=True)
         else:
@@ -501,12 +437,19 @@ def train(env_name, args=None, gpus=None, **kwargs):
             ctx.Process(target=_train, args=(env_name, worker_args),
                 kwargs=kwargs).start()
 
+
+
 def sweep(env_name, args=None, pareto=False):
     '''Train entry point. Handles single-GPU, multi-GPU DDP, and sweeps.'''
     args = args or load_config(env_name)
+    if bool(args.get('sweep', {}).get('league', False)):
+        return league.sweep(env_name, args=args, pareto=pareto,
+            load_config=load_config, validate_config=validate_config,
+            train=train, match=match, resolve_backend=_resolve_backend,
+            native_backend=_C)
+
     exp_gpus = args['train']['gpus']
     sweep_gpus = args['sweep']['gpus'] or len(os.listdir('/proc/driver/nvidia/gpus'))
-    args['vec']['num_threads'] //= (sweep_gpus // exp_gpus)
     args['no_model_upload'] = True
 
     sweep_config = args['sweep']
@@ -564,8 +507,8 @@ def sweep(env_name, args=None, pareto=False):
             sweep_obj=sweep_obj, result_queue=result_queue)
 
 
-def eval_bot(env_name, policy_path, num_games=4096, eval_agents=0, burnin_games=0,
-        bot_policy=-1, max_ticks=0, args=None, verbose=True):
+def eval_bot(env_name, policy_path=None, num_games=16384, eval_agents=0, burnin_games=0,
+        bot_policy=1, max_ticks=0, args=None, verbose=True):
     '''Evaluate a trained policy against the env's scripted bot.'''
     args = args or load_config(env_name)
     args['reset_state'] = False
@@ -573,6 +516,7 @@ def eval_bot(env_name, policy_path, num_games=4096, eval_agents=0, burnin_games=
     args['world_size'] = 1
     args['rank'] = 0
     args.setdefault('nccl_id', b'')
+
 
     num_games = int(num_games)
     burnin_games = int(burnin_games)
@@ -587,14 +531,17 @@ def eval_bot(env_name, policy_path, num_games=4096, eval_agents=0, burnin_games=
         # Avoid scoring only the first wave of completed episodes. If env count
         # ~= game count, quick wins finish first and slow losses are censored.
         eval_agents = min(4096, max(1024, num_games // 8))
-    eval_agents = min(eval_agents, max(1024, num_games))
+        eval_agents = min(eval_agents, max(1024, num_games))
+    else:
+        # Explicit eval_agents means the caller is choosing the noise/runtime
+        # tradeoff, e.g. tiny validation evals during sweeps.
+        eval_agents = min(eval_agents, num_games)
     eval_agents += (-eval_agents) % args['vec']['num_buffers']
     args['vec']['total_agents'] = eval_agents
     args['vec']['num_frozen_banks'] = 0
     args['vec']['frozen_bank_pct'] = 0.0
     args.setdefault('selfplay', {})['enabled'] = 0
     args.setdefault('env', {})['dr'] = 0.0
-    args['env']['action_block_p'] = 0.0
     args['env']['num_agents'] = 1
     args['env']['num_bots'] = 1
     if bot_policy >= 0:
@@ -607,7 +554,19 @@ def eval_bot(env_name, policy_path, num_games=4096, eval_agents=0, burnin_games=
         raise RuntimeError('eval_bot() requires the native CUDA backend')
 
     pufferl = backend.create_pufferl(args)
-    backend.load_weights(pufferl, policy_path)
+
+    load_path = policy_path or args.get('load_model_path')
+    if load_path == 'latest':
+        checkpoint_dir = args['checkpoint_dir']
+        pattern = os.path.join(checkpoint_dir, args['env_name'], '**', '*.bin')
+        candidates = glob.glob(pattern, recursive=True)
+        if not candidates:
+            raise FileNotFoundError(f'No .bin checkpoints found in {checkpoint_dir}/{args["env_name"]}/')
+        load_path = max(candidates, key=os.path.getctime)
+
+    if load_path is not None:
+        backend.load_weights(pufferl, load_path)
+        print(f'Loaded weights from {load_path}')
 
     def _delta_logs(current, baseline):
         if not baseline:
@@ -654,7 +613,8 @@ def eval_bot(env_name, policy_path, num_games=4096, eval_agents=0, burnin_games=
     if verbose:
         print()
 
-    backend.close(pufferl)
+    if not args.get('skip_match_close', False):
+        backend.close(pufferl)
     return logs
 
 def eval(env_name, args=None, load_path=None):
@@ -662,10 +622,6 @@ def eval(env_name, args=None, load_path=None):
     args = args or load_config(env_name)
     args['reset_state'] = False
     args['train']['horizon'] = 1
-    if 'env' in args and 'dr' in args['env']:
-        args['env']['dr'] = 0.0
-    if 'env' in args:
-        args['env']['action_block_p'] = 0.0
 
     backend = _resolve_backend(args)
     pufferl = backend.create_pufferl(args)
@@ -684,13 +640,10 @@ def eval(env_name, args=None, load_path=None):
         backend.load_weights(pufferl, load_path)
         print(f'Loaded weights from {load_path}')
 
-    #while True:
-    for i in range(10000):
-        #backend.render(pufferl, 0)
+    while True:
+        backend.render(pufferl, 0)
         backend.rollouts(pufferl)
 
-    logs = dict(unroll_nested_dict(backend.eval_log(pufferl)))
-    print('Perf: ', logs['env/perf'])
     backend.close(pufferl)
 
 def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, verbose=True):
@@ -706,9 +659,14 @@ def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, ver
     # total_agents=4096 -> 819). Pin to a stable eval config that guarantees
     # clean slot-0/slot-1 split; ignores trial's vec tuning (eval, not train).
     args['vec']['num_buffers'] = 2
-    args['vec']['total_agents'] = 8192
+    eval_agents = int(args.get('match_eval_agents')
+        or args.get('sweep', {}).get('league_match_eval_agents', 8192)
+        or 8192)
+    args['vec']['total_agents'] = eval_agents
+    args.setdefault('selfplay', {})['enabled'] = 0
     args.setdefault('env', {})['dr'] = 0.0
-    args['env']['action_block_p'] = 0.0
+    args['env']['num_agents'] = 2
+    args['env']['num_bots'] = 0
     backend = _resolve_backend(args)
     if backend is not _C:
         raise RuntimeError('match() requires the native CUDA backend')
@@ -726,6 +684,8 @@ def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, ver
 
     total_agents = int(args['vec']['total_agents'])
     num_buffers = int(args['vec']['num_buffers'])
+    if total_agents % num_buffers != 0:
+        raise RuntimeError(f'total_agents ({total_agents}) must be divisible by num_buffers ({num_buffers})')
     agents_per_buffer = total_agents // num_buffers
     half = agents_per_buffer // 2
     if 2 * half != agents_per_buffer:
@@ -737,11 +697,8 @@ def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, ver
     # later only update data.
     args['vec']['num_frozen_banks'] = 1
     args['vec']['frozen_bank_pct'] = 0.5
-    # CLI flags take precedence; fall back to [sweep].match_enemy_* so the same
-    # config drives sweep-time and CLI-time matches. 0 / None means "use primary".
-    sweep_cfg = args.get('sweep', {})
-    enemy_hidden = args.get('enemy_hidden_size') or sweep_cfg.get('match_enemy_hidden_size')
-    enemy_layers = args.get('enemy_num_layers')  or sweep_cfg.get('match_enemy_num_layers')
+    enemy_hidden = args.get('enemy_hidden_size')
+    enemy_layers = args.get('enemy_num_layers')
     if enemy_hidden:
         args['vec']['frozen_bank_hidden_size'] = int(enemy_hidden)
     if enemy_layers:
@@ -780,84 +737,13 @@ def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, ver
     if verbose:
         print()
 
-    backend.close(pufferl)
+    if not args.get('skip_match_close', False):
+        backend.close(pufferl)
     return logs
 
-def load_config(env_name):
-    parser = argparse.ArgumentParser(formatter_class=RichHelpFormatter, add_help=False)
-    parser.add_argument('--load-model-path', type=str, default=None,
-        help='Path to a pretrained checkpoint')
-    parser.add_argument('--load-enemy-model-path', type=str, default=None,
-        help='Path to opponent checkpoint for `puffer match` (slot 1 / black in chess)')
-    parser.add_argument('--num-games', type=int, default=4096,
-        help='Number of games to play in `puffer match`')
-    parser.add_argument('--enemy-hidden-size', type=int, default=None,
-        help='hidden_size of the enemy checkpoint (defaults to primary)')
-    parser.add_argument('--enemy-num-layers', type=int, default=None,
-        help='num_layers of the enemy checkpoint (defaults to primary)')
-    parser.add_argument('--load-id', type=str,
-        default=None, help='Kickstart/eval from from a finished Wandbrun')
-    parser.add_argument('--render-mode', type=str, default='auto',
-        choices=['auto', 'human', 'ansi', 'rgb_array', 'raylib', 'None'])
-    parser.add_argument('--wandb', action='store_true', help='Use wandb for logging')
-    parser.add_argument('--wandb-project', type=str, default='puffer4')
-    parser.add_argument('--wandb-group', type=str, default='debug')
-    parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
-    parser.add_argument('--slowly', action='store_true', help='Use PyTorch training backend')
-    parser.add_argument('--save-frames', type=int, default=0)
-    parser.add_argument('--gif-path', type=str, default='eval.gif')
-    parser.add_argument('--fps', type=float, default=15)
-    parser.description = f':blowfish: PufferLib [bright_cyan]{pufferlib.__version__}[/]' \
-        ' demo options. Shows valid args for your env and policy'
-
+def load_config(env_name, argv=None, **kwargs):
     repo_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    puffer_config_dir = os.path.join(repo_dir, 'config/**/*.ini')
-    puffer_default_config = os.path.join(repo_dir, 'config/default.ini')
-    #CC: Remove the default. Just raise an error on "puffer train" etc with no env (think we already do)
-    if env_name == 'default':
-        p = configparser.ConfigParser()
-        p.read(puffer_default_config)
-    else:
-        for path in glob.glob(puffer_config_dir, recursive=True):
-            p = configparser.ConfigParser()
-            p.read([puffer_default_config, path])
-            if env_name in p['base']['env_name'].split(): break
-        else:
-            raise ValueError('No config for env_name {}'.format(env_name))
-
-    for section in p.sections():
-        for key in p[section]:
-            try:
-                value = ast.literal_eval(p[section][key])
-            except:
-                value = p[section][key]
-
-            #TODO: Can clean up with default sections in 3.13+
-            fmt = f'--{key}' if section == 'base' else f'--{section}.{key}'
-            dtype = type(value)
-            parser.add_argument(
-                fmt.replace('_', '-'), default=value,
-                type=lambda v, t=dtype: v if v == 'auto' else t(v),
-            )
-
-    parser.add_argument('-h', '--help', default=argparse.SUPPRESS,
-        action='help', help='Show this help message and exit')
-
-    # Unpack to nested dict
-    parsed = vars(parser.parse_args())
-    args = defaultdict(dict)
-    for key, value in parsed.items():
-        nxt = args
-        for subkey in key.split('.'):
-            prev = nxt
-            nxt = nxt.setdefault(subkey, {})
-
-        prev[subkey] = value
-
-    args['env_name'] = env_name
-    for section in p.sections():
-        args.setdefault(section, {})
-    return dict(args)
+    return _C.load_config(env_name, list(argv or []), repo_dir)
 
 def main():
     err = 'Usage: puffer [train, eval, sweep, paretosweep, match] [env_name] [optional args]. --help for more info'
@@ -866,10 +752,12 @@ def main():
 
     mode = sys.argv.pop(1)
     env_name = sys.argv.pop(1)
-    args = load_config(env_name)
+    args = load_config(env_name, sys.argv[1:])
 
     if 'train' in mode:
         train(env_name=env_name, args=args)
+    elif 'eval_bot' in mode:
+        eval_bot(env_name=env_name, args=args)
     elif 'eval' in mode:
         eval(env_name=env_name, args=args)
     elif 'sweep' in mode:

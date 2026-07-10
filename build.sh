@@ -2,20 +2,20 @@
 set -e
 
 # Usage:
-#   ./build.sh breakout              # Build _C.so with breakout statically linked
+#   ./build.sh breakout              # Full native train/eval binary
 #   ./build.sh breakout --float      # float32 precision (required for --slowly)
-#   ./build.sh breakout --cpu        # CPU fallback, torch only
+#   ./build.sh breakout --cpu        # Tiny standalone CPU eval executable
 #   ./build.sh breakout --debug      # Debug build
 #   ./build.sh breakout --local      # Standalone executable (debug, sanitizers)
 #   ./build.sh breakout --fast       # Standalone executable (optimized)
 #   ./build.sh breakout --web        # Emscripten web build
 #   ./build.sh breakout --profile    # Kernel profiling binary
-#   ./build.sh breakout --rocm       # HIP/ROCm training backend
-#   ./build.sh breakout --cuda       # CUDA training backend
-#   ./build.sh all                   # Build all envs with default and --float
+#   ./build.sh breakout --rocm       # HIP/ROCm native train/eval binary
+#   ./build.sh breakout --cuda       # CUDA native train/eval binary (default)
+#   ./build.sh all                   # Build all envs native and native float32
 
 if [ -z "$1" ]; then
-    echo "Usage: ./build.sh ENV_NAME [--float] [--debug] [--cuda|--rocm] [--local|--fast|--web|--profile|--cpu|--all]"
+    echo "Usage: ./build.sh ENV_NAME [--float] [--debug] [--cuda|--rocm] [--local|--fast|--web|--profile|--cpu]"
     exit 1
 fi
 ENV=$1
@@ -29,7 +29,7 @@ for arg in "$@"; do
         --fast)  MODE=fast ;;
         --web)   MODE=web ;;
         --profile) MODE=profile ;;
-        --cpu)   MODE=cpu; PRECISION="-DPRECISION_FLOAT" ;;
+        --cpu)   MODE=cpu ;;
         --cuda)  BACKEND=cuda ;;
         --rocm)  BACKEND=rocm ;;
         *) echo "Error: unknown argument '$arg'" && exit 1 ;;
@@ -54,15 +54,11 @@ if [ "$ENV" = "all" ]; then
     exit 0
 fi
 
-PYTHON_BIN="${PYTHON:-}"
-if [ -z "$PYTHON_BIN" ]; then
-    if command -v python >/dev/null 2>&1; then
-        PYTHON_BIN=python
-    elif command -v python3 >/dev/null 2>&1; then
-        PYTHON_BIN=python3
-    else
-        echo "Error: python or python3 not found" && exit 1
-    fi
+if [ -z "$MODE" ]; then
+    BACKEND=${BACKEND:-cuda}
+elif [ -n "$BACKEND" ]; then
+    echo "Error: --cuda/--rocm only apply to the native training backend"
+    exit 1
 fi
 
 # Linux/mac
@@ -72,13 +68,11 @@ if [ "$PLATFORM" = "Linux" ]; then
     OMP_LIB=-lomp5
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
-    SHARED_LDFLAGS=(-Bsymbolic-functions)
 else
     RAYLIB_NAME='raylib-5.5_macos'
     OMP_LIB=-lomp
     SANITIZE_FLAGS=()
     STANDALONE_LDFLAGS=(-framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL)
-    SHARED_LDFLAGS=(-framework Cocoa -framework OpenGL -framework IOKit -undefined dynamic_lookup)
 fi
 
 CLANG_WARN=(
@@ -114,11 +108,21 @@ INCLUDES=(-I./$RAYLIB_NAME/include -I./src -I./vendor)
 LINK_ARCHIVES=("$RAYLIB_A")
 EXTRA_SRC=""
 EXTRA_LDFLAGS=()
+EXTRA_CFLAGS=()
+SRC_FILE=""
 
 if [ "$ENV" = "constellation" ]; then
-    SRC_DIR="constellation"
-    EXTRA_SRC="vendor/cJSON.c"
+    SRC_DIR="src"
     OUTPUT_NAME="seethestars"
+    MODE=${MODE:-fast}
+    CLANG_WARN+=(-Wno-unused-function)
+elif [ "$ENV" = "cache_data" ]; then
+    SRC_DIR="src"
+    OUTPUT_NAME="cache_data"
+    SRC_FILE="src/constellation.c"
+    EXTRA_CFLAGS+=(-DPUFFER_CACHE_DATA)
+    MODE=${MODE:-fast}
+    CLANG_WARN+=(-Wno-unused-function)
 elif [ "$ENV" = "trailer" ]; then
     SRC_DIR="trailer"
     OUTPUT_NAME="trailer/trailer"
@@ -154,10 +158,11 @@ else
 fi
 
 OUTPUT_NAME=${OUTPUT_NAME:-$ENV}
+SRC_FILE=${SRC_FILE:-$SRC_DIR/$ENV.c}
 
 # Standalone environment build
 # -mavx2 enables AVX2 intrinsics (__m256, _mm256_*) which drive.h and
-# src/bf16.h use directly. x86_64 only — strip if porting to ARM/Apple Silicon.
+# src/pufferenv.h use directly. x86_64 only — strip if porting to ARM/Apple Silicon.
 SIMD_FLAGS=(-mavx2 -mfma)
 if [ -n "$DEBUG" ] || [ "$MODE" = "local" ]; then
     CLANG_OPT=(-g -O0 "${CLANG_WARN[@]}" "${SANITIZE_FLAGS[@]}" "${SIMD_FLAGS[@]}")
@@ -171,12 +176,13 @@ fi
 if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
     FLAGS=(
         "${INCLUDES[@]}"
-        "$SRC_DIR/$ENV.c" $EXTRA_SRC -o "$OUTPUT_NAME"
+        "$SRC_FILE" $EXTRA_SRC -o "$OUTPUT_NAME"
         "${LINK_ARCHIVES[@]}"
         "${EXTRA_LDFLAGS[@]}"
         "${STANDALONE_LDFLAGS[@]}"
         -lm -lpthread -fopenmp
         -DPLATFORM_DESKTOP
+        "${EXTRA_CFLAGS[@]}"
     )
     echo "Compiling $ENV..."
     ${CC:-clang} "${CLANG_OPT[@]}" "${FLAGS[@]}"
@@ -187,7 +193,7 @@ elif [ "$MODE" = "web" ]; then
     echo "Compiling $ENV for web..."
     emcc \
         -o "build/web/$ENV/game.html" \
-        "$SRC_DIR/$ENV.c" $EXTRA_SRC \
+        "$SRC_FILE" $EXTRA_SRC \
         -O3 -Wall \
         "${LINK_ARCHIVES[@]}" \
         "${INCLUDES[@]}" \
@@ -198,48 +204,71 @@ elif [ "$MODE" = "web" ]; then
         -sINITIAL_MEMORY=512MB -sALLOW_MEMORY_GROWTH -sSTACK_SIZE=512KB \
         -DNDEBUG -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES3 \
         --preload-file resources/$ENV@resources/$ENV \
-        --preload-file resources/shared@resources/shared
+        --preload-file resources/shared@resources/shared \
+        "${EXTRA_CFLAGS[@]}"
     echo "Built: build/web/$ENV/game.html"
+    exit 0
+elif [ "$MODE" = "cpu" ]; then
+    ENV_HEADER="$SRC_DIR/$ENV.h"
+    if ! grep -q 'typedef[[:space:]].*obs_t' "$ENV_HEADER" 2>/dev/null; then
+        echo "Error: $ENV_HEADER must typedef obs_t for standalone eval"
+        exit 1
+    fi
+
+    echo "Compiling standalone CPU eval for $ENV..."
+    ${CC:-clang} "${CLANG_OPT[@]}" \
+        -I. -Isrc -I$SRC_DIR -Ivendor "${INCLUDES[@]}" \
+        -DPLATFORM_DESKTOP \
+        -DPUFFERCPU_EVAL_MAIN \
+        -DENV_HEADER=\"$ENV_HEADER\" \
+        -x c src/puffercpu.h -x none $EXTRA_SRC \
+        "${LINK_ARCHIVES[@]}" \
+        "${EXTRA_LDFLAGS[@]}" \
+        "${STANDALONE_LDFLAGS[@]}" \
+        -lm -lpthread -fopenmp \
+        -o build_cpu
+    echo "Built: ./build_cpu"
     exit 0
 fi
 
-if [ -z "$MODE" ]; then
-    BACKEND=${BACKEND:-cuda}
-elif [ -n "$BACKEND" ]; then
-    echo "Error: --cuda/--rocm only apply to the training backend"
-    exit 1
-fi
+if [ "$BACKEND" = "rocm" ]; then
+    ROCM_HOME=${ROCM_HOME:-/opt/rocm}
+    HIPCC=${HIPCC:-$ROCM_HOME/bin/hipcc}
+    if [ ! -x "$HIPCC" ]; then
+        HIPCC=$(command -v hipcc || true)
+    fi
+    if [ -z "$HIPCC" ] || [ ! -x "$HIPCC" ]; then
+        echo "Error: hipcc not found (set ROCM_HOME or HIPCC)"
+        exit 1
+    fi
 
-if [ "$BACKEND" = "rocm" ] && [ "$ENV" = "nmmo3" ]; then
-    echo "Error: NMMO3 native encoder is CUDA-only in build.sh --rocm"
-    exit 1
+    HIPIFY_DIR=build/hip/src
+    rm -rf "$HIPIFY_DIR"
+    echo "Hipifying CUDA sources for ROCm..."
+    python - <<PY
+from torch.utils.hipify import hipify_python
+hipify_python.hipify(
+    project_directory="$(pwd)/src",
+    output_directory="$(pwd)/$HIPIFY_DIR",
+    includes=["*"],
+    show_progress=False,
+    show_detailed=False,
+    is_pytorch_extension=True,
+)
+PY
+
+    ROCM_ARCH_FLAGS=()
+    if [ -n "$PYTORCH_ROCM_ARCH" ]; then
+        IFS=';' read -ra ROCM_ARCHES <<< "$PYTORCH_ROCM_ARCH"
+        for arch in "${ROCM_ARCHES[@]}"; do
+            [ -n "$arch" ] && ROCM_ARCH_FLAGS+=("--offload-arch=$arch")
+        done
+    fi
 fi
 
 if [ "$BACKEND" != "rocm" ]; then
-# Find cuDNN path
 CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-$(dirname "$(dirname "$(which nvcc)")")}}
-CUDNN_IFLAG=""
-CUDNN_LFLAG=""
-for dir in /usr/local/cuda/include /usr/include; do
-    if [ -f "$dir/cudnn.h" ]; then
-        CUDNN_IFLAG="-I$dir"
-        break
-    fi
-done
-for dir in /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu; do
-    if [ -f "$dir/libcudnn.so" ]; then
-        CUDNN_LFLAG="-L$dir"
-        break
-    fi
-done
-if [ -z "$CUDNN_IFLAG" ]; then
-    CUDNN_IFLAG=$(python -c "import nvidia.cudnn, os; print('-I' + os.path.join(nvidia.cudnn.__path__[0], 'include'))" 2>/dev/null || echo "")
-fi
-if [ -z "$CUDNN_LFLAG" ]; then
-    CUDNN_LFLAG=$(python -c "import nvidia.cudnn, os; print('-L' + os.path.join(nvidia.cudnn.__path__[0], 'lib'))" 2>/dev/null || echo "")
-fi
-
-# NCCL include/lib fallback (mirrors the cuDNN fallback above).
+# NCCL include/lib fallback.
 # Needed when NCCL is provided by the nvidia-nccl-cu12 wheel in the active venv.
 NCCL_IFLAG=""
 NCCL_LFLAG=""
@@ -255,13 +284,6 @@ fi
 if [ -z "$NCCL_LFLAG" ]; then
     NCCL_LFLAG=$(python -c "import nvidia.nccl, os; print('-L' + os.path.join(nvidia.nccl.__path__[0], 'lib'))" 2>/dev/null || echo "")
 fi
-
-WHEEL_RPATH_FLAGS=()
-for lib_flag in "$CUDNN_LFLAG" "$NCCL_LFLAG"; do
-    if [[ "$lib_flag" == -L* ]]; then
-        WHEEL_RPATH_FLAGS+=("-Wl,-rpath,${lib_flag#-L}")
-    fi
-done
 fi
 
 export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
@@ -271,255 +293,66 @@ NVCC="ccache $CUDA_HOME/bin/nvcc"
 CC="${CC:-$(command -v ccache >/dev/null && echo 'ccache clang' || echo 'clang')}"
 ARCH=${NVCC_ARCH:-native}
 
-PYTHON_INCLUDE=$("$PYTHON_BIN" -c "import sysconfig; print(sysconfig.get_path('include'))")
-PYBIND_INCLUDE=$("$PYTHON_BIN" -c "import pybind11; print(pybind11.get_include())")
-NUMPY_INCLUDE=$("$PYTHON_BIN" -c "import numpy; print(numpy.get_include())")
-EXT_SUFFIX=$("$PYTHON_BIN" -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-OUTPUT="pufferlib/_C${EXT_SUFFIX}"
-
-BINDING_SRC="$SRC_DIR/binding.c"
+ENV_HEADER="$SRC_DIR/$ENV.h"
 mkdir -p build
-STATIC_OBJ="build/libstatic_${ENV}.o"
-STATIC_LIB="build/libstatic_${ENV}.a"
-
-if [ ! -f "$BINDING_SRC" ]; then
-    echo "Error: $BINDING_SRC not found"
+if ! grep -q 'typedef[[:space:]].*obs_t' "$ENV_HEADER" 2>/dev/null; then
+    echo "Error: $ENV_HEADER must typedef obs_t"
     exit 1
 fi
 
-if [ "$BACKEND" != "rocm" ]; then
-    echo "Compiling static library for $ENV..."
-    ${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
+ENV_COMPILE_FLAGS=(-DENV_HEADER=\"$ENV_HEADER\")
+
+MODE=${MODE:-native}
+
+if [ "$MODE" = "native" ]; then
+    if [ "$BACKEND" = "rocm" ]; then
+        echo "Compiling native ROCm train/eval binary..."
+        "$HIPCC" "${ROCM_ARCH_FLAGS[@]}" -std=c++17 \
+            -I. -I"$HIPIFY_DIR" -I$SRC_DIR -Ivendor -I$RAYLIB_NAME/include \
+            "${ENV_COMPILE_FLAGS[@]}" \
+            -DENV_NAME=$ENV -DPUFFERLIB_BUILD_MAIN -DPLATFORM_DESKTOP -DUSE_ROCM \
+            -fopenmp -Wno-c++11-narrowing $PRECISION \
+            "$HIPIFY_DIR/pufferl.hip" \
+            -x none \
+            "$RAYLIB_A" "${EXTRA_LDFLAGS[@]}" \
+            -lrccl -lhipblas -lhipsolver -lhiprand \
+            -lm -lpthread -lomp "${STANDALONE_LDFLAGS[@]}" \
+            -o puffer
+        echo "Built: ./puffer"
+        exit 0
+    fi
+    echo "Compiling native train/eval binary ($ARCH)..."
+    $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
         -I. -Isrc -I$SRC_DIR -Ivendor \
-        "${INCLUDES[@]}" \
-        -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \
-        -DPLATFORM_DESKTOP \
-        -fno-semantic-interposition -fvisibility=hidden \
-        -fPIC -fopenmp \
-        "$BINDING_SRC" -o "$STATIC_OBJ"
-    ar rcs "$STATIC_LIB" "$STATIC_OBJ"
-
-    # Brittle hack: have to extract the tensor type from the static lib to build trainer
-    OBS_TENSOR_T=$(awk '/^#define OBS_TENSOR_T/{print $3}' "$BINDING_SRC")
-    if [ -z "$OBS_TENSOR_T" ]; then
-        echo "Error: Could not find OBS_TENSOR_T in $BINDING_SRC"
-        exit 1
-    fi
-fi
-
-if [ -z "$MODE" ] && [ "$BACKEND" = "cuda" ]; then
-    echo "Compiling CUDA ($ARCH) training backend..."
-    $NVCC -c -arch=$ARCH -Xcompiler -fPIC \
-        -Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1 \
-        -Xcompiler=-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION \
-        -Xcompiler=-DPLATFORM_DESKTOP \
-        -std=c++17 \
-        -I. -Isrc \
-        -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE -I$NUMPY_INCLUDE \
-        -I$CUDA_HOME/include $CUDNN_IFLAG $NCCL_IFLAG -I$RAYLIB_NAME/include \
-        -Xcompiler=-fopenmp \
-        -DOBS_TENSOR_T=$OBS_TENSOR_T \
-        -DENV_NAME=$ENV \
-        $PRECISION $NVCC_OPT \
-        src/bindings.cu -o build/bindings.o
-
-    LINK_CMD=(
-        ${CXX:-g++} -shared -fPIC -fopenmp
-        build/bindings.o "$STATIC_LIB" "$RAYLIB_A"
-        -L$CUDA_HOME/lib64 $CUDNN_LFLAG $NCCL_LFLAG
-        "${WHEEL_RPATH_FLAGS[@]}"
-        "${EXTRA_LDFLAGS[@]}"
-        -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
-        $OMP_LIB $LINK_OPT
-        "${SHARED_LDFLAGS[@]}"
-        -o "$OUTPUT"
-    )
-    "${LINK_CMD[@]}"
-    echo "Built: $OUTPUT"
-
-elif [ -z "$MODE" ] && [ "$BACKEND" = "rocm" ]; then
-    mapfile -t ROCM_INFO < <("$PYTHON_BIN" - <<'PY'
-import os
-from torch.utils.cpp_extension import ROCM_HOME, library_paths, include_paths
-
-rocm_home = os.environ.get("ROCM_HOME") or ROCM_HOME
-if not rocm_home:
-    raise SystemExit("ROCM_HOME not found. Install/use a ROCm-enabled PyTorch environment.")
-print(rocm_home)
-print(os.environ.get("HIPCC") or os.path.join(rocm_home, "bin", "hipcc"))
-print(os.pathsep.join(include_paths("cuda")))
-print(os.pathsep.join(library_paths("cuda")))
-PY
-)
-    ROCM_HOME=${ROCM_INFO[0]}
-    HIPCC=${ROCM_INFO[1]}
-    ROCM_INCLUDE_PATHS=${ROCM_INFO[2]}
-    ROCM_LIBRARY_PATHS=${ROCM_INFO[3]}
-
-    if [ ! -x "$HIPCC" ]; then
-        if command -v hipcc >/dev/null 2>&1; then
-            HIPCC=$(command -v hipcc)
-        else
-            echo "Error: hipcc not found"
-            exit 1
-        fi
-    fi
-
-    if [ -z "$HIP_CLANG_PATH" ] || [ ! -x "$HIP_CLANG_PATH/clang++" ]; then
-        for dir in "$ROCM_HOME/lib/llvm/bin" /usr/lib/llvm/*/bin; do
-            if [ -x "$dir/clang++" ]; then
-                export HIP_CLANG_PATH="$dir"
-                break
-            fi
-        done
-    fi
-
-    HIPIFY_SRC="build/hip/src"
-    HIPIFY_SRC_ABS="$(pwd)/$HIPIFY_SRC"
-    SRC_ABS="$(pwd)/src"
-    echo "Hipifying CUDA sources into $HIPIFY_SRC..."
-    rm -rf "$HIPIFY_SRC"
-    "$PYTHON_BIN" - <<PY
-from torch.utils.hipify import hipify_python
-hipify_python.hipify(
-    project_directory="$SRC_ABS",
-    output_directory="$HIPIFY_SRC_ABS",
-    includes=["*"],
-    show_progress=False,
-    show_detailed=False,
-    is_pytorch_extension=True,
-)
-PY
-    cp "$HIPIFY_SRC/vecenv_hip.h" "$HIPIFY_SRC/vecenv.h"
-    "$PYTHON_BIN" - <<PY
-path = "$HIPIFY_SRC/pufferlib.hip"
-with open(path) as f:
-    src = f.read()
-src = src.replace('#include "vecenv_hip.h"', '#include "vecenv.h"')
-with open(path, 'w') as f:
-    f.write(src)
-PY
-
-    ROCM_IFLAGS=()
-    IFS=':' read -ra ROCM_INC_ARR <<< "$ROCM_INCLUDE_PATHS"
-    for dir in "${ROCM_INC_ARR[@]}"; do
-        [ -n "$dir" ] && ROCM_IFLAGS+=("-I$dir")
-    done
-    ROCM_LFLAGS=()
-    ROCM_RPATH_FLAGS=()
-    if [ -d /usr/lib64 ]; then
-        ROCM_LFLAGS+=("-L/usr/lib64")
-        ROCM_RPATH_FLAGS+=("-Wl,-rpath,/usr/lib64")
-    fi
-    IFS=':' read -ra ROCM_LIB_ARR <<< "$ROCM_LIBRARY_PATHS"
-    for dir in "${ROCM_LIB_ARR[@]}"; do
-        [ -n "$dir" ] || continue
-        [ "$dir" = "/usr/lib" ] && [ -d /usr/lib64 ] && continue
-        ROCM_LFLAGS+=("-L$dir")
-        ROCM_RPATH_FLAGS+=("-Wl,-rpath,$dir")
-    done
-    ROCM_OMP_LIB=""
-    for dir in "$ROCM_HOME/lib/llvm/lib" /usr/lib64 /usr/lib /usr/local/lib; do
-        if [ -f "$dir/libomp.so" ]; then
-            ROCM_LFLAGS+=("-L$dir")
-            ROCM_RPATH_FLAGS+=("-Wl,-rpath,$dir")
-            ROCM_OMP_LIB="-lomp"
-            break
-        elif [ -f "$dir/libomp5.so" ]; then
-            ROCM_LFLAGS+=("-L$dir")
-            ROCM_RPATH_FLAGS+=("-Wl,-rpath,$dir")
-            ROCM_OMP_LIB="-lomp5"
-            break
-        fi
-    done
-
-    ROCM_ARCH_FLAGS=()
-    if [ -n "$PYTORCH_ROCM_ARCH" ]; then
-        IFS=';' read -ra ROCM_ARCH_ARR <<< "$PYTORCH_ROCM_ARCH"
-        for arch in "${ROCM_ARCH_ARR[@]}"; do
-            [ -n "$arch" ] && ROCM_ARCH_FLAGS+=("--offload-arch=$arch")
-        done
-    fi
-
-    HIPCC_OPT=()
-    if [ -n "$DEBUG" ]; then
-        HIPCC_OPT=(-O0 -g)
-    else
-        HIPCC_OPT=(-O2 -w)
-    fi
-
-    echo "Compiling ROCm/HIP training backend with $ENV binding..."
-    "$HIPCC" "${ROCM_ARCH_FLAGS[@]}" -c -fPIC \
-        -D_GLIBCXX_USE_CXX11_ABI=1 \
-        -DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION \
-        -DPLATFORM_DESKTOP \
-        -DUSE_ROCM \
-        -std=c++17 \
-        -I. -I"$HIPIFY_SRC" -I$SRC_DIR -Ivendor -I$RAYLIB_NAME/include \
-        -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE -I$NUMPY_INCLUDE \
-        "${ROCM_IFLAGS[@]}" \
-        -fopenmp \
-        -Wno-c++11-narrowing \
-        -DENV_BINDING_SRC=\"$BINDING_SRC\" \
-        -DENV_NAME=$ENV \
-        $PRECISION "${HIPCC_OPT[@]}" \
-        "$HIPIFY_SRC/bindings.hip" -o build/bindings.o
-
-    "$HIPCC" -c -fPIC -std=c++17 \
-        "${ROCM_IFLAGS[@]}" \
-        src/rocm_cuda_shim.cpp -o build/rocm_cuda_shim.o
-
-    LINK_CMD=(
-        ${CXX:-g++} -shared -fPIC -fopenmp
-        build/bindings.o build/rocm_cuda_shim.o "$RAYLIB_A"
-        "${EXTRA_LDFLAGS[@]}"
-        "${ROCM_LFLAGS[@]}"
-        "${ROCM_RPATH_FLAGS[@]}"
-        -lamdhip64 -lhipblas -lhiprand -lrccl
-        $ROCM_OMP_LIB
-        $LINK_OPT
-        "${SHARED_LDFLAGS[@]}"
-        -o "$OUTPUT"
-    )
-    "${LINK_CMD[@]}"
-    echo "Built: $OUTPUT"
-
-elif [ "$MODE" = "cpu" ]; then
-    echo "Compiling CPU training backend..."
-    ${CXX:-g++} -c -fPIC -fopenmp \
-        -D_GLIBCXX_USE_CXX11_ABI=1 \
-        -DPLATFORM_DESKTOP \
-        -std=c++17 \
-        -I. -Isrc \
-        -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE \
-        -DOBS_TENSOR_T=$OBS_TENSOR_T \
-        -DENV_NAME=$ENV \
-        $PRECISION $LINK_OPT \
-        src/bindings_cpu.cpp -o build/bindings_cpu.o
-    LINK_CMD=(
-        ${CXX:-g++} -shared -fPIC -fopenmp
-        build/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A"
-        "${EXTRA_LDFLAGS[@]}"
-        -lm -lpthread $OMP_LIB $LINK_OPT
-        "${SHARED_LDFLAGS[@]}"
-        -o "$OUTPUT"
-    )
-    "${LINK_CMD[@]}"
-    echo "Built: $OUTPUT"
+        -I$CUDA_HOME/include $NCCL_IFLAG -I$RAYLIB_NAME/include \
+	    "${ENV_COMPILE_FLAGS[@]}" \
+	    -DENV_NAME=$ENV \
+	    -DPUFFERLIB_BUILD_MAIN \
+	    -Xcompiler=-DPLATFORM_DESKTOP \
+	    -Xcompiler=-fopenmp \
+	    $PRECISION \
+	    src/pufferl.cu \
+        "$RAYLIB_A" \
+        -L$CUDA_HOME/lib64 $NCCL_LFLAG \
+        "${EXTRA_LDFLAGS[@]}" \
+        -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand \
+        -lm -lpthread $OMP_LIB "${STANDALONE_LDFLAGS[@]}" \
+        -o puffer
+    echo "Built: ./puffer"
 
 elif [ "$MODE" = "profile" ]; then
     echo "Compiling profile binary ($ARCH)..."
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
         -I. -Isrc -I$SRC_DIR -Ivendor \
-        -I$CUDA_HOME/include $CUDNN_IFLAG $NCCL_IFLAG -I$RAYLIB_NAME/include \
-        -DOBS_TENSOR_T=$OBS_TENSOR_T \
+        -I$CUDA_HOME/include $NCCL_IFLAG -I$RAYLIB_NAME/include \
+        "${ENV_COMPILE_FLAGS[@]}" \
         -DENV_NAME=$ENV \
         -Xcompiler=-DPLATFORM_DESKTOP \
         $PRECISION \
         -Xcompiler=-fopenmp \
-        tests/profile_kernels.cu vendor/ini.c \
-        "$STATIC_LIB" "$RAYLIB_A" \
-        -lnccl -lnvidia-ml -lcublas -lcurand -lcudnn \
+        tests/profile_kernels.cu \
+        "$RAYLIB_A" \
+        -lnccl -lnvidia-ml -lcublas -lcurand \
         -lGL -lm -lpthread $OMP_LIB \
         -o profile
     echo "Built: ./profile"

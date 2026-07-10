@@ -3,7 +3,458 @@
 #include <string.h>
 #include <assert.h>
 
-#include "cJSON.h"
+#include "ini.h"
+
+#define PUF_TABLE_MAX_COLS 256
+
+typedef struct {
+    char name[64];
+    int rows;
+    int cols;
+    char* labels[PUF_TABLE_MAX_COLS];
+    float* values;
+} Table;
+
+static char* table_strdup(const char* s) {
+    size_t n = strlen(s) + 1;
+    char* out = (char*)malloc(n);
+    if (!out) {
+        perror("malloc");
+        exit(1);
+    }
+    memcpy(out, s, n);
+    return out;
+}
+
+static int table_col(Table* table, const char* label) {
+    for (int i = 0; i < table->cols; i++) {
+        if (strcmp(table->labels[i], label) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int table_add_col(Table* table, const char* label) {
+    if (table->cols >= PUF_TABLE_MAX_COLS) {
+        fprintf(stderr, "table %s has too many columns\n", table->name);
+        exit(1);
+    }
+
+    int col = table->cols++;
+    table->labels[col] = table_strdup(label);
+    float* old = table->values;
+    table->values = (float*)calloc((size_t)table->rows * (size_t)table->cols, sizeof(float));
+    if (table->rows > 0 && !table->values) {
+        perror("realloc");
+        exit(1);
+    }
+    for (int r = 0; r < table->rows; r++) {
+        for (int c = 0; c < table->cols - 1; c++) {
+            table->values[r * table->cols + c] = old[r * (table->cols - 1) + c];
+        }
+    }
+    free(old);
+    return col;
+}
+
+static int table_require_col(Table* table, const char* label) {
+    int col = table_col(table, label);
+    if (col >= 0) {
+        return col;
+    }
+    fprintf(stderr, "table %s missing column %s\n", table->name, label);
+    exit(1);
+}
+
+static int table_ensure_col(Table* table, const char* label) {
+    int col = table_col(table, label);
+    if (col >= 0) {
+        return col;
+    }
+    return table_add_col(table, label);
+}
+
+static void table_resize_rows(Table* table, int rows) {
+    if (rows == table->rows) {
+        return;
+    }
+
+    float* old = table->values;
+    int old_rows = table->rows;
+    table->values = (float*)calloc((size_t)rows * (size_t)table->cols, sizeof(float));
+    if (rows > 0 && table->cols > 0 && !table->values) {
+        perror("calloc");
+        exit(1);
+    }
+    for (int r = 0; r < old_rows && r < rows; r++) {
+        for (int c = 0; c < table->cols; c++) {
+            table->values[r * table->cols + c] = old[r * table->cols + c];
+        }
+    }
+    free(old);
+    table->rows = rows;
+}
+
+static void table_set(Table* table, int row, int col, float value) {
+    table->values[row * table->cols + col] = value;
+}
+
+static float table_get(Table* table, int row, int col) {
+    return table->values[row * table->cols + col];
+}
+
+static void table_free(Table* table) {
+    for (int i = 0; i < table->cols; i++) {
+        free(table->labels[i]);
+    }
+    free(table->values);
+    memset(table, 0, sizeof(*table));
+}
+
+#ifdef PUFFER_CACHE_DATA
+
+#include <dirent.h>
+#include <sys/stat.h>
+
+static const char* EXTRA_KEYS[] = {
+    "train/learning_rate",
+    "train/ent_coef",
+    "train/gamma",
+    "train/gae_lambda",
+    "train/vtrace_rho_clip",
+    "train/vtrace_c_clip",
+    "train/clip_coef",
+    "train/vf_clip_coef",
+    "train/vf_coef",
+    "train/max_grad_norm",
+    "train/beta1",
+    "train/beta2",
+    "train/eps",
+    "train/prio_alpha",
+    "train/prio_beta0",
+    "train/horizon",
+    "train/replay_ratio",
+    "train/minibatch_size",
+    "policy/hidden_size",
+    "policy/num_layers",
+    "vec/total_agents",
+    "train/total_timesteps",
+};
+
+static int has_suffix(const char* s, const char* suffix) {
+    size_t n = strlen(s);
+    size_t m = strlen(suffix);
+    return n >= m && strcmp(s + n - m, suffix) == 0;
+}
+
+static int is_dir(const char* path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void key_to_cache(char* out, size_t out_size, const char* section, const char* key) {
+    if (strcmp(section, "config") == 0) {
+        if (strncmp(key, "base.", 5) == 0) {
+            snprintf(out, out_size, "%s", key + 5);
+        } else {
+            snprintf(out, out_size, "%s", key);
+        }
+    } else if (strcmp(section, "base") == 0) {
+        snprintf(out, out_size, "%s", key);
+    } else {
+        snprintf(out, out_size, "%s/%s", section, key);
+    }
+
+    for (char* p = out; *p; p++) {
+        if (*p == '.') {
+            *p = '/';
+        }
+    }
+}
+
+static int parse_list(char* raw, float** out, int* len) {
+    double* parsed = NULL;
+    int n = 0;
+    if (!puf_ini_parse_list(raw, &parsed, &n)) {
+        return 0;
+    }
+
+    float* vals = (float*)calloc((size_t)n, sizeof(float));
+    if (!vals) {
+        perror("calloc");
+        exit(1);
+    }
+    for (int i = 0; i < n; i++) {
+        vals[i] = (float)parsed[i];
+    }
+
+    free(parsed);
+    *out = vals;
+    *len = n;
+    return 1;
+}
+
+static int load_ini_log(const char* path, Dict* scalars, Table* metrics) {
+    FILE* fp = fopen(path, "r");
+    if (!fp) {
+        return 0;
+    }
+
+    char section[256] = "base";
+    char* line = NULL;
+    int cap = 0;
+    while (puf_ini_read_line(fp, &line, &cap)) {
+        puf_ini_strip_comment(line);
+        char* s = puf_ini_trim(line);
+        if (!*s) {
+            continue;
+        }
+
+        size_t len = strlen(s);
+        if (s[0] == '[' && len > 2 && s[len - 1] == ']') {
+            s[len - 1] = 0;
+            snprintf(section, sizeof(section), "%s", puf_ini_trim(s + 1));
+            continue;
+        }
+
+        char* eq = strchr(s, '=');
+        if (!eq) {
+            free(line);
+            fclose(fp);
+            return 0;
+        }
+        *eq = 0;
+        char* key = puf_ini_trim(s);
+        char* val = puf_ini_trim(eq + 1);
+        puf_ini_strip_quotes(val);
+
+        if (strcmp(section, "metrics") == 0) {
+            if (strstr(key, "loss")) {
+                continue;
+            }
+            float* values = NULL;
+            int n = 0;
+            if (!parse_list(val, &values, &n)) {
+                free(line);
+                fclose(fp);
+                return 0;
+            }
+            if (metrics->rows == 0) {
+                table_resize_rows(metrics, n);
+            } else if (metrics->rows != n) {
+                free(values);
+                free(line);
+                fclose(fp);
+                return 0;
+            }
+            int col = table_ensure_col(metrics, key);
+            for (int r = 0; r < n; r++) {
+                table_set(metrics, r, col, values[r]);
+            }
+            free(values);
+        } else {
+            double value = 0;
+            if (!puf_ini_parse_val(val, &value)) {
+                continue;
+            }
+            char full[512];
+            key_to_cache(full, sizeof(full), section, key);
+            dict_set(scalars, full, value);
+        }
+    }
+
+    free(line);
+    fclose(fp);
+    return metrics->rows > 0;
+}
+
+static void table_copy_rows(Table* dst, int dst_row, Table* src) {
+    for (int c = 0; c < src->cols; c++) {
+        int out_col = table_ensure_col(dst, src->labels[c]);
+        for (int r = 0; r < src->rows; r++) {
+            table_set(dst, dst_row + r, out_col, table_get(src, r, c));
+        }
+    }
+}
+
+static void table_fill_scalar(Table* dst, int row, int rows, const char* key, float value) {
+    int col = table_ensure_col(dst, key);
+    for (int r = 0; r < rows; r++) {
+        table_set(dst, row + r, col, value);
+    }
+}
+
+static void load_env(const char* env, int full_dataset, Table* out) {
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "logs/%s", env);
+    struct dirent** ents = NULL;
+    int nents = scandir(dir, &ents, NULL, alphasort);
+    if (nents < 0) {
+        return;
+    }
+
+    for (int i = 0; i < nents; i++) {
+        if (ents[i]->d_name[0] == '.') {
+            free(ents[i]);
+            continue;
+        }
+
+        char path[2048];
+        snprintf(path, sizeof(path), "%s/%s", dir, ents[i]->d_name);
+        free(ents[i]);
+        if (is_dir(path) || (!has_suffix(path, ".ini") && !has_suffix(path, ".log"))) {
+            continue;
+        }
+
+        Dict scalars = {0};
+        Table metrics = {0};
+        if (!load_ini_log(path, &scalars, &metrics)) {
+            dict_clear(&scalars);
+            table_free(&metrics);
+            continue;
+        }
+
+        int start = out->rows;
+        table_resize_rows(out, out->rows + metrics.rows);
+        table_copy_rows(out, start, &metrics);
+        for (int s = 0; s < scalars.size; s++) {
+            DictItem* item = &scalars.items[s];
+            table_fill_scalar(out, start, metrics.rows, item->key, (float)item->value);
+        }
+        for (int k = 0; k < (int)(sizeof(EXTRA_KEYS) / sizeof(EXTRA_KEYS[0])); k++) {
+            if (!dict_find(&scalars, EXTRA_KEYS[k])) {
+                table_fill_scalar(out, start, metrics.rows, EXTRA_KEYS[k], 0);
+            }
+        }
+
+        dict_clear(&scalars);
+        table_free(&metrics);
+    }
+    free(ents);
+
+    int steps_col = table_col(out, "agent_steps");
+    int total_steps_col = table_col(out, "train/total_timesteps");
+    for (int r = 0; r < out->rows; r++) {
+        if (steps_col >= 0) {
+            table_set(out, r, steps_col, table_get(out, r, steps_col) / 1e6f);
+        }
+        if (total_steps_col >= 0) {
+            table_set(out, r, total_steps_col, table_get(out, r, total_steps_col) / 1e6f);
+        }
+    }
+
+    int tsne1 = table_ensure_col(out, "tsne1");
+    int tsne2 = table_ensure_col(out, "tsne2");
+    for (int r = 0; r < out->rows; r++) {
+        table_set(out, r, tsne1, (float)(r % 997) / 997.0f);
+        table_set(out, r, tsne2, (float)((r * 37) % 991) / 991.0f);
+    }
+
+    if (full_dataset || steps_col < 0) {
+        return;
+    }
+
+    int cost_col = table_col(out, "uptime");
+    int score_col = table_col(out, "env/score");
+    if (cost_col < 0 || score_col < 0) {
+        return;
+    }
+
+    int n = out->rows;
+    unsigned char* keep = (unsigned char*)calloc((size_t)n, 1);
+    for (int i = 0; i < n; i++) {
+        keep[i] = 1;
+        for (int j = 0; j < n; j++) {
+            if (table_get(out, j, score_col) >= table_get(out, i, score_col) &&
+                    table_get(out, j, cost_col) < table_get(out, i, cost_col) &&
+                    table_get(out, j, steps_col) < table_get(out, i, steps_col)) {
+                keep[i] = 0;
+                break;
+            }
+        }
+    }
+
+    int w = 0;
+    for (int r = 0; r < n; r++) {
+        if (!keep[r]) {
+            continue;
+        }
+        for (int c = 0; c < out->cols; c++) {
+            table_set(out, w, c, table_get(out, r, c));
+        }
+        w++;
+    }
+    out->rows = w;
+    free(keep);
+}
+
+static void write_env(FILE* fp, const char* env, Table* table) {
+    if (table->rows == 0) {
+        return;
+    }
+
+    fprintf(fp, "\n[%s]\n", env);
+    for (int c = 0; c < table->cols; c++) {
+        fprintf(fp, "%s = ", table->labels[c]);
+        for (int r = 0; r < table->rows; r++) {
+            if (r > 0) {
+                fputc(',', fp);
+            }
+            fprintf(fp, "%.6g", table_get(table, r, c));
+        }
+        fputc('\n', fp);
+    }
+}
+
+int main(int argc, char** argv) {
+    int full_dataset = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--full") == 0) {
+            full_dataset = 1;
+        }
+    }
+
+    if (is_dir("resources/constellation") == 0) {
+        mkdir("resources/constellation", 0777);
+    }
+
+    FILE* fp = fopen("resources/constellation/experiments.ini", "w");
+    if (!fp) {
+        perror("resources/constellation/experiments.ini");
+        return 1;
+    }
+    fprintf(fp, "# PufferLib constellation cache v1\n");
+
+    struct dirent** ents = NULL;
+    int nents = scandir("logs", &ents, NULL, alphasort);
+    if (nents > 0) {
+        for (int i = 0; i < nents; i++) {
+            if (ents[i]->d_name[0] == '.') {
+                free(ents[i]);
+                continue;
+            }
+
+            char path[1024];
+            snprintf(path, sizeof(path), "logs/%s", ents[i]->d_name);
+            if (is_dir(path)) {
+                Table table = {0};
+                snprintf(table.name, sizeof(table.name), "%s", ents[i]->d_name);
+                load_env(ents[i]->d_name, full_dataset, &table);
+                write_env(fp, ents[i]->d_name, &table);
+                table_free(&table);
+            }
+            free(ents[i]);
+        }
+        free(ents);
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+#else
+
 #include "raylib.h"
 
 #define RAYGUI_IMPLEMENTATION
@@ -118,19 +569,7 @@ typedef struct {
 } Tooltip;
 
 typedef struct {
-    char *key;
-    float *ary;
-    int n;
-} Hyper;
-
-typedef struct {
-    char *key;
-    Hyper *hypers;
-    int n;
-} Env;
-
-typedef struct {
-    Env *envs;
+    Table *tables;
     int n;
 } Dataset;
 
@@ -188,18 +627,13 @@ PlotArgs DEFAULT_PLOT_ARGS = {
 };
 
 
-Hyper* get_hyper(Dataset *data, char *env, char* hyper) {
+Table* dataset_table(Dataset *data, char *env) {
     for (int i = 0; i < data->n; i++) {
-        if (strcmp(data->envs[i].key, env) != 0) {
-            continue;
-        }
-        for (int j = 0; j < data->envs[i].n; j++) {
-            if (strcmp(data->envs[i].hypers[j].key, hyper) == 0) {
-                return &data->envs[i].hypers[j];
-            }
+        if (strcmp(data->tables[i].name, env) == 0) {
+            return &data->tables[i];
         }
     }
-    printf("Error: hyper %s not found in env %s\n", hyper, env);
+    printf("Error: env %s not found\n", env);
     exit(1);
     return NULL;
 }
@@ -363,7 +797,7 @@ void draw_axes3() {
     );
 }
 
-void boxplot(Hyper* hyper, int x_scale, int i, int hyper_count, PlotArgs args, Color color, bool* filter) {
+void boxplot(Table* table, int col, int x_scale, int i, int hyper_count, PlotArgs args, Color color, bool* filter) {
     int width = args.width;
     int height = args.height;
 
@@ -375,15 +809,15 @@ void boxplot(Hyper* hyper, int x_scale, int i, int hyper_count, PlotArgs args, C
 
     float dy = plot_height/((float)hyper_count);
 
-    float* ary = hyper->ary;
-    float mmin = ary[0];
-    float mmax = ary[0];
-    for (int j=0; j<hyper->n; j++) {
+    float mmin = table_get(table, 0, col);
+    float mmax = mmin;
+    for (int j=0; j<table->rows; j++) {
         if (filter != NULL && !filter[j]) {
             continue;
         }
-        mmin = fmin(mmin, ary[j]);
-        mmax = fmax(mmax, ary[j]);
+        float val = table_get(table, j, col);
+        mmin = fmin(mmin, val);
+        mmax = fmax(mmax, val);
     }
 
     mmin = scale_val(x_scale, mmin);
@@ -451,9 +885,9 @@ void GuiDropdownFilter(int x, int y, char* options, int *selection, bool *dropdo
     }
 }
 
-void apply_filter(bool* filter, Hyper* param, float min, float max) {
-    for (int i=0; i<param->n; i++) {
-        float val = param->ary[i];
+void apply_filter(bool* filter, Table* table, int col, float min, float max) {
+    for (int i=0; i<table->rows; i++) {
+        float val = table_get(table, i, col);
         if (val < min || val > max) {
             filter[i] = false;
         }
@@ -549,22 +983,22 @@ void update_closest(Tooltip* tooltip, Vector2 *indices, Glyph* glyphs, int size,
     }
 }
 
-void copy_hypers_to_clipboard(Env *env, char* buffer, int ary_idx) {
+void copy_hypers_to_clipboard(Table *table, char* buffer, int row) {
     char* start = buffer;
     char* prefix = NULL;
     int prefix_len = 0;
-    for (int hyper_idx = 0; hyper_idx < env->n; hyper_idx++) {
-        Hyper *hyper = &env->hypers[hyper_idx];
-        char *slash = strchr(hyper->key, '/');
-        if (!slash || ary_idx >= hyper->n) {
+    for (int col = 0; col < table->cols; col++) {
+        char *key = table->labels[col];
+        char *slash = strchr(key, '/');
+        if (!slash || row >= table->rows) {
             continue;
         }
 
-        if (prefix == NULL || strncmp(prefix, hyper->key, prefix_len) != 0) {
+        if (prefix == NULL || strncmp(prefix, key, prefix_len) != 0) {
             if (prefix != NULL) {
                 buffer += sprintf(buffer, "\n");
             }
-            prefix = hyper->key;
+            prefix = key;
             prefix_len = slash - prefix;
             buffer += sprintf(buffer, "[");
             snprintf(buffer, prefix_len+1, "%s", prefix);
@@ -573,15 +1007,11 @@ void copy_hypers_to_clipboard(Env *env, char* buffer, int ary_idx) {
         }
 
         char* suffix = slash + 1;
-        double val = hyper->ary[ary_idx];
+        double val = table_get(table, row, col);
         if (strcmp(suffix, "total_timesteps") == 0) {
             // Use agent_steps (training-only) instead of total_timesteps (train+eval)
-            for (int k = 0; k < env->n; k++) {
-                if (strcmp(env->hypers[k].key, "agent_steps") == 0) {
-                    val = env->hypers[k].ary[ary_idx];
-                    break;
-                }
-            }
+            int agent_steps = table_require_col(table, "agent_steps");
+            val = table_get(table, row, agent_steps);
             buffer += sprintf(buffer, "%s = %lld\n", suffix, (long long)(val * 1e6));
         } else if (strcmp(suffix, "agent_steps") == 0) {
             buffer += sprintf(buffer, "%s = %lld\n", suffix, (long long)(val * 1e6));
@@ -595,117 +1025,102 @@ void copy_hypers_to_clipboard(Env *env, char* buffer, int ary_idx) {
     SetClipboardText(start);
 }
 
-//strof bottlenecks loads
-float fast_atof(char **s) {
-    char *p = *s;
-    float sign = 1.0f;
-    if (*p == '-') {
-        sign = -1.0f; p++;
-    }
-    float val = 0.0f;
-    while (*p >= '0' && *p <= '9') {
-        val = val * 10.0f + (*p++ - '0');
-    }
-    if (*p == '.') {
-        p++;
-        float frac = 0.1f;
-        while (*p >= '0' && *p <= '9') {
-            val += (*p++ - '0') * frac; frac *= 0.1f;
+Table* dataset_get_table(Dataset* data, const char* key) {
+    for (int i = 0; i < data->n; i++) {
+        if (strcmp(data->tables[i].name, key) == 0) {
+            return &data->tables[i];
         }
     }
-    if (*p == 'e' || *p == 'E') {
-      p++;
-      int esign = 1;
-      if (*p == '-') {
-          esign = -1; p++;
-      } else if (*p == '+') {
-          p++;
-      }
-      int exp = 0;
-      while (*p >= '0' && *p <= '9') {
-          exp = exp * 10 + (*p++ - '0');
-      }
-      val *= powf(10.0f, esign * exp);
-  }
-  *s = p;
-  return sign * val;
+    data->tables = realloc(data->tables, (data->n + 1) * sizeof(Table));
+    if (!data->tables) {
+        perror("realloc");
+        exit(1);
+    }
+    Table* table = &data->tables[data->n++];
+    memset(table, 0, sizeof(*table));
+    snprintf(table->name, sizeof(table->name), "%s", key);
+    return table;
+}
+
+void table_add_values(Table* table, const char* key, const char* values) {
+    double* vals = NULL;
+    int len = 0;
+    if (!puf_ini_parse_list(values, &vals, &len)) {
+        fprintf(stderr, "constellation error: invalid values for %s\n", key);
+        exit(1);
+    }
+
+    if (table->rows == 0) {
+        table_resize_rows(table, len);
+    }
+    if (table->rows != len) {
+        fprintf(stderr, "constellation error: column %s has %d values, expected %d\n",
+            key, len, table->rows);
+        exit(1);
+    }
+
+    int col = table_add_col(table, key);
+    for (int i = 0; i < len; i++) {
+        table_set(table, i, col, (float)vals[i]);
+    }
+    free(vals);
+}
+
+Dataset load_dataset(const char* path) {
+    FILE* fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "could not open %s\n", path);
+        exit(1);
+    }
+
+    Dataset data = {0};
+    char env_name[256] = "";
+    char* line = NULL;
+    int cap = 0;
+    for (int n = 1; puf_ini_read_line(fp, &line, &cap); n++) {
+        puf_ini_strip_comment(line);
+        char* s = puf_ini_trim(line);
+        if (!*s) {
+            continue;
+        }
+
+        size_t len = strlen(s);
+        if (s[0] == '[' && len >= 3 && s[len - 1] == ']') {
+            s[len - 1] = 0;
+            snprintf(env_name, sizeof(env_name), "%s", puf_ini_trim(s + 1));
+            continue;
+        }
+
+        char* eq = strchr(s, '=');
+        if (!eq) {
+            fprintf(stderr, "%s:%d: expected key=value\n", path, n);
+            exit(1);
+        }
+        if (!env_name[0]) {
+            fprintf(stderr, "%s:%d: expected section before key=value\n", path, n);
+            exit(1);
+        }
+        *eq = 0;
+        char* key = puf_ini_trim(s);
+        char* val = puf_ini_trim(eq + 1);
+        puf_ini_strip_quotes(val);
+        table_add_values(dataset_get_table(&data, env_name), key, val);
+    }
+    free(line);
+    fclose(fp);
+    return data;
 }
 
 int main(void) {
-    FILE *file = fopen("resources/constellation/experiments.json", "r");
-    if (!file) {
-        printf("Error opening file\n");
-        return 1;
-    }
-
-    // Read in file
-    fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    char *json_str = malloc(file_size + 1);
-    fread(json_str, 1, file_size, file);
-    json_str[file_size] = '\0';
-    fclose(file);
-    cJSON *root = cJSON_Parse(json_str);
-    if (!root) {
-        printf("JSON parse error: %.100s\n", cJSON_GetErrorPtr());
-        free(json_str);
-        return 1;
-    }
-    if (!cJSON_IsObject(root)) {
-        printf("Error: Root is not an object\n");
-        return 1;
-    }
-
-    // Load in dataset
-    Dataset data = {NULL, 0};
-    cJSON *json_env = root->child;
-    while (json_env) {
-        data.n++;
-        json_env = json_env->next;
-    }
-
-    Env *envs = calloc(data.n, sizeof(Env));
-    data.envs = envs;
-    json_env = root->child;
+    Dataset data = load_dataset("resources/constellation/experiments.ini");
     int max_data_points = 0;
     for (int i=0; i<data.n; i++) {
-        cJSON *json_hyper = json_env->child;
-        while (json_hyper) {
-            envs[i].n++;
-            json_hyper = json_hyper->next;
-        }
-        envs[i].key = json_env->string;
-        envs[i].hypers = calloc(envs[i].n, sizeof(Hyper));
-        json_hyper = json_env->child;
-        for (int j=0; j<envs[i].n; j++, json_hyper=json_hyper->next) {
-            envs[i].hypers[j].key = json_hyper->string;
-            int capacity = 1;
-            for (char* p = json_hyper->valuestring; *p; p++) {
-                if (*p == ',') {
-                    capacity++;
-                }
-            }
-            if (capacity > max_data_points) {
-                max_data_points = capacity;
-            }
-            envs[i].hypers[j].ary = calloc(capacity, sizeof(float));
-
-            int n = 0;
-            char* s = json_hyper->valuestring;
-            while (*s) {
-                envs[i].hypers[j].ary[n++] = fast_atof(&s);
-                if (*s == ',') {
-                    s++;
-                }
-            }
-            envs[i].hypers[j].n = n;
-        }
-        json_env = json_env->next;
+        max_data_points = data.tables[i].rows > max_data_points ?
+            data.tables[i].rows : max_data_points;
     }
     int total_points = 0;
     for (int i=0; i<data.n; i++) {
-        total_points += envs[i].hypers[0].n;
+        total_points += data.tables[i].rows;
     }
 
     // Create options as a semicolon-separated string
@@ -729,14 +1144,14 @@ int main(void) {
     // Env names as semi-colon-separated string
     size_t env_options_len = 4;
     for (int i = 0; i < data.n; i++) {
-        env_options_len += strlen(data.envs[i].key) + 1;
+        env_options_len += strlen(data.tables[i].name) + 1;
     }
     char *env_options = malloc(env_options_len);
     strcpy(env_options, "all;");
     env_options[4] = '\0';
     for (int i = 0; i < data.n; i++) {
         if (i > 0) strcat(env_options, ";");
-        strcat(env_options, data.envs[i].key);
+        strcat(env_options, data.tables[i].name);
     }
 
     char* clipboard = malloc(16384);
@@ -841,10 +1256,10 @@ int main(void) {
     args4.top_margin = 10;
     args4.bottom_margin = 50;
 
-    Hyper* x;
-    Hyper* y;
-    Hyper* z;
-    Hyper* c;
+    int x;
+    int y;
+    int z;
+    int c;
     char* x_label;
     char* y_label;
     char* z_label;
@@ -891,30 +1306,30 @@ int main(void) {
 
         int size = 0;
         for (int i=start; i<end; i++) {
-            char* env = data.envs[i].key;
-            x = get_hyper(&data, env, hyper_key[fig_x_idx]);
-            y = get_hyper(&data, env, hyper_key[fig_y_idx]);
-            z = get_hyper(&data, env, hyper_key[fig_z_idx]);
+            Table* table = &data.tables[i];
+            x = table_col(table, hyper_key[fig_x_idx]);
+            y = table_col(table, hyper_key[fig_y_idx]);
+            z = table_col(table, hyper_key[fig_z_idx]);
             if (fig_color_idx != 0) {
-                c = get_hyper(&data, env, hyper_key[fig_color_idx - 1]);
+                c = table_col(table, hyper_key[fig_color_idx - 1]);
             }
-            for (int j=0; j<x->n; j++) {
+            for (int j=0; j<table->rows; j++) {
                 filter[j] = true;
             }
-            Hyper* filter_param_1 = get_hyper(&data, env, hyper_key[fig_range1_idx]);
-            apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
-            Hyper* filter_param_2 = get_hyper(&data, env, hyper_key[fig_range2_idx]);
-            apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
+            int filter_param_1 = table_col(table, hyper_key[fig_range1_idx]);
+            apply_filter(filter, table, filter_param_1, fig_range1_min_val, fig_range1_max_val);
+            int filter_param_2 = table_col(table, hyper_key[fig_range2_idx]);
+            apply_filter(filter, table, filter_param_2, fig_range2_min_val, fig_range2_max_val);
 
-            for (int j=0; j<x->n; j++) {
+            for (int j=0; j<table->rows; j++) {
                 if (!filter[j]) {
                     continue;
                 }
                 points[size] = (Point){
-                    x->ary[j],
-                    y->ary[j],
-                    z->ary[j],
-                    (fig_color_idx == 0) ? i/(float)data.n : c->ary[j],
+                    table_get(table, j, x),
+                    table_get(table, j, y),
+                    table_get(table, j, z),
+                    (fig_color_idx == 0) ? i/(float)data.n : table_get(table, j, c),
                 };
                 env_indices[size] = (Vector2){i, j};
                 size++;
@@ -958,24 +1373,24 @@ int main(void) {
         ClearBackground(PUFF_BACKGROUND);
         size = 0;
         for (int i=0; i<data.n; i++) {
-            char* env = data.envs[i].key;
-            x = get_hyper(&data, env, "tsne1");
-            y = get_hyper(&data, env, "tsne2");
-            for (int j=0; j<x->n; j++) {
+            Table* table = &data.tables[i];
+            x = table_col(table, "tsne1");
+            y = table_col(table, "tsne2");
+            for (int j=0; j<table->rows; j++) {
                 filter[j] = true;
             }
-            Hyper* filter_param_1 = get_hyper(&data, env, hyper_key[fig_range1_idx]);
-            apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
-            Hyper* filter_param_2 = get_hyper(&data, env, hyper_key[fig_range2_idx]);
-            apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
+            int filter_param_1 = table_col(table, hyper_key[fig_range1_idx]);
+            apply_filter(filter, table, filter_param_1, fig_range1_min_val, fig_range1_max_val);
+            int filter_param_2 = table_col(table, hyper_key[fig_range2_idx]);
+            apply_filter(filter, table, filter_param_2, fig_range2_min_val, fig_range2_max_val);
 
-            for (int j=0; j<x->n; j++) {
+            for (int j=0; j<table->rows; j++) {
                 if (!filter[j]) {
                     continue;
                 }
                 points[size] = (Point){
-                    x->ary[j],
-                    y->ary[j],
+                    table_get(table, j, x),
+                    table_get(table, j, y),
                     0.0f,
                     i/(float)data.n
                 };
@@ -1009,17 +1424,17 @@ int main(void) {
         BeginBlendMode(BLEND_CUSTOM_SEPARATE);
         Color color = Fade(PUFF_CYAN, 1.0f / (float)(end - start));
         for (int i=start; i<end; i++) {
-            Env* env = &data.envs[i];
-            Hyper* filter_param_1 = get_hyper(&data, env->key, hyper_key[fig_range1_idx]);
-            Hyper* filter_param_2 = get_hyper(&data, env->key, hyper_key[fig_range2_idx]);
+            Table* table = &data.tables[i];
+            int filter_param_1 = table_col(table, hyper_key[fig_range1_idx]);
+            int filter_param_2 = table_col(table, hyper_key[fig_range2_idx]);
             for (int j=0; j<hyper_count; j++) {
-                Hyper* hyper = get_hyper(&data, env->key, hyper_key[j]);
-                for (int k=0; k<hyper->n; k++) {
+                int col = table_col(table, hyper_key[j]);
+                for (int k=0; k<table->rows; k++) {
                     filter[k] = true;
                 }
-                apply_filter(filter, filter_param_1, fig_range1_min_val, fig_range1_max_val);
-                apply_filter(filter, filter_param_2, fig_range2_min_val, fig_range2_max_val);
-                boxplot(hyper, args4.scale[0], j, hyper_count, args4, color, filter);
+                apply_filter(filter, table, filter_param_1, fig_range1_min_val, fig_range1_max_val);
+                apply_filter(filter, table, filter_param_2, fig_range2_min_val, fig_range2_max_val);
+                boxplot(table, col, args4.scale[0], j, hyper_count, args4, color, filter);
             }
         }
         EndBlendMode();
@@ -1184,12 +1599,12 @@ int main(void) {
         // Tooltip
         int env_idx = tooltip.env_idx;
         int ary_idx = tooltip.ary_idx;
-        Env* env = &data.envs[env_idx];
-        char* env_key = env->key;
+        Table* table = &data.tables[env_idx];
+        char* env_key = table->name;
 
-        float cost = get_hyper(&data, env_key, "uptime")->ary[ary_idx];
-        float score = get_hyper(&data, env_key, "env/score")->ary[ary_idx];
-        float steps = get_hyper(&data, env_key, "agent_steps")->ary[ary_idx];
+        float cost = table_get(table, ary_idx, table_col(table, "uptime"));
+        float score = table_get(table, ary_idx, table_col(table, "env/score"));
+        float steps = table_get(table, ary_idx, table_col(table, "agent_steps"));
         if (tooltip.active) {
             const char* text = TextFormat("%s\nscore = %f\ncost = %f\nsteps = %f", env_key, score, cost, steps);
             Vector2 text_size = MeasureTextEx(args1.font_small, text, args1.axis_tick_font_size, 0);
@@ -1209,20 +1624,15 @@ int main(void) {
 
         // Copy hypers to clipboard
         if (right_clicked) {
-            copy_hypers_to_clipboard(env, clipboard, ary_idx);
+            copy_hypers_to_clipboard(table, clipboard, ary_idx);
         }
     }
 
     // Cleanup
     for (int i = 0; i < data.n; i++) {
-        for (int j = 0; j < envs[i].n; j++) {
-            free(envs[i].hypers[j].ary);
-        }
-        free(envs[i].hypers);
+        table_free(&data.tables[i]);
     }
-    free(envs);
-    cJSON_Delete(root);
-    free(json_str);
+    free(data.tables);
     free(options);
     free(env_hyper_options);
     free(env_options);
@@ -1244,3 +1654,5 @@ int main(void) {
     CloseWindow();
     return 0;
 }
+
+#endif
