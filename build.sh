@@ -157,6 +157,20 @@ else
     echo "Error: environment '$ENV' not found" && exit 1
 fi
 
+if [ "$ENV" = "balatro" ]; then
+    BALATRO_ROOT=${BALATRO_ROOT:-$HOME/BalatroLearner}
+    if [ ! -f "$BALATRO_ROOT/include/balatro.h" ]; then
+        echo "Error: BALATRO_ROOT must point to the BalatroLearner repository"
+        exit 1
+    fi
+    if [ ! -f "$BALATRO_ROOT/build-release/libbalatro_core.a" ]; then
+        echo "Error: build balatro_core Release in $BALATRO_ROOT/build-release first"
+        exit 1
+    fi
+    INCLUDES+=(-I"$BALATRO_ROOT/include")
+    LINK_ARCHIVES+=("$BALATRO_ROOT/build-release/libbalatro_core.a")
+fi
+
 OUTPUT_NAME=${OUTPUT_NAME:-$ENV}
 SRC_FILE=${SRC_FILE:-$SRC_DIR/$ENV.c}
 
@@ -309,11 +323,12 @@ if [ "$MODE" = "native" ]; then
         echo "Compiling native ROCm train/eval binary..."
         "$HIPCC" "${ROCM_ARCH_FLAGS[@]}" -std=c++17 \
             -I. -I"$HIPIFY_DIR" -I$SRC_DIR -Ivendor -I$RAYLIB_NAME/include \
+            "${INCLUDES[@]}" \
             "${ENV_COMPILE_FLAGS[@]}" \
             -DENV_NAME=$ENV -DPUFFERLIB_BUILD_MAIN -DPLATFORM_DESKTOP -DUSE_ROCM \
             -fopenmp -Wno-c++11-narrowing $PRECISION \
             "$HIPIFY_DIR/pufferl.hip" \
-            -x none \
+            -x none "${LINK_ARCHIVES[@]}" \
             "$RAYLIB_A" "${EXTRA_LDFLAGS[@]}" \
             -lrccl -lhipblas -lhipsolver -lhiprand \
             -lm -lpthread -lomp "${STANDALONE_LDFLAGS[@]}" \
