@@ -15,6 +15,7 @@ typedef float obs_t;
 
 typedef struct Log {
     float score;
+	float reward;
     float wins;
     float ante;
     float invalid_actions;
@@ -26,6 +27,7 @@ typedef struct Env {
     int num_agents;
     int tag;
     int boundary_reached;
+    float episode_reward;
     unsigned int rng;
     Agent agents[1];
     BalatroConfig config;
@@ -51,12 +53,24 @@ static void balatro_puffer_observe(Env *env) {
 }
 
 void puf_init(Env *env, Dict *kwargs) {
-    (void)kwargs;
     env->num_agents = 1;
     env->tag = 0;
     env->boundary_reached = 0;
+    env->episode_reward = 0.0f;
     env->agents[0].policy = 0;
     balatro_default_config(&env->config);
+    /* Training defaults to the progress potential, while the same wrapper
+       can run the ABI's sparse win-only objective for an apples-to-apples
+       baseline.  Optional env.* overrides are useful for curriculum runs. */
+    DictItem *shaped = dict_find(kwargs, "shaped_reward");
+    DictItem *win_ante = dict_find(kwargs, "win_ante");
+    env->config.shaped_reward = shaped ? (shaped->value != 0.0) : 1;
+    if (win_ante) {
+        int value = (int)win_ante->value;
+        if (value < 1) value = 1;
+        if (value > UINT8_MAX) value = UINT8_MAX;
+        env->config.win_ante = (uint8_t)value;
+    }
 }
 
 void puf_reset(Env *env) {
@@ -65,6 +79,7 @@ void puf_reset(Env *env) {
     env->agents[0].rewards[0] = 0.0f;
     env->agents[0].terminals[0] = 0.0f;
     env->boundary_reached = 0;
+    env->episode_reward = 0.0f;
     balatro_puffer_observe(env);
 }
 
@@ -88,6 +103,7 @@ void puf_step(Env *env) {
         return;
     }
     env->agents[0].rewards[0] = result.reward;
+    env->episode_reward += result.reward;
     if (result.terminal) {
         env->boundary_reached = 1;
         env->agents[0].terminals[0] = 1.0f;
@@ -95,6 +111,7 @@ void puf_step(Env *env) {
         env->log.wins += result.won;
         env->log.ante += result.ante;
         env->log.n += 1.0f;
+		env->log.reward += env->episode_reward;
         puf_reset(env);
         env->agents[0].terminals[0] = 1.0f;
     } else {
@@ -110,6 +127,7 @@ void puf_log(Log *log, Dict *out) {
     dict_set(out, "wins", log->wins);
     dict_set(out, "ante", log->ante);
     dict_set(out, "invalid_actions", log->invalid_actions);
+	dict_set(out, "reward", log->reward);
 }
 
 #endif
