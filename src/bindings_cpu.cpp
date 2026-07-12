@@ -111,7 +111,7 @@ static std::unique_ptr<VecEnv> create_vec(py::dict args, int gpu = 0) {
     auto ve = std::make_unique<VecEnv>();
     {
         py::gil_scoped_release no_gil;
-        ve->vec = create_static_vec(total_agents, num_buffers, 0, vec_dict, env_dict);
+        ve->vec = create_static_vec(total_agents, num_buffers, 0, 0, vec_dict, env_dict);
     }
     ve->total_agents = total_agents;
     ve->obs_size = get_obs_size();

@@ -4,6 +4,7 @@
 #include <nvml.h>
 #include <nccl.h>
 #include <vector>
+#include <type_traits>
 
 #include <time.h>
 #include "models.cu"
@@ -244,7 +245,12 @@ struct EnvBuf {
 
 StaticVec* create_environments(int num_buffers, int total_agents,
         const std::string& env_name, Dict* vec_kwargs, Dict* env_kwargs, EnvBuf& env) {
-    StaticVec* vec = create_static_vec(total_agents, num_buffers, 1, vec_kwargs, env_kwargs);
+    const char* packed_env = getenv("PUFFER_PACKED_OBS");
+    bool packed_enabled = packed_env != nullptr && atoi(packed_env) != 0;
+    bool pack_bf16 = packed_enabled && USE_BF16
+        && std::is_same<OBS_TENSOR_T, FloatTensor>::value;
+    StaticVec* vec = create_static_vec(
+        total_agents, num_buffers, 1, pack_bf16, vec_kwargs, env_kwargs);
     env.obs = {
         .data = (decltype(env.obs.data))vec->gpu_observations,
         .shape = {total_agents, get_obs_size()},
@@ -632,7 +638,14 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     OBS_TENSOR_T& obs_env = env.obs;
     int n = block_size * obs_env.shape[1];
     PrecisionTensor obs_dst = puf_slice(rollouts.observations, t, start, block_size);
-    cast_dispatch(obs_dst.data, obs_env.data + (long)start*obs_env.shape[1], n, stream);
+    if (pufferl->vec->pack_bf16_observations) {
+        const precision_t* packed_obs = (const precision_t*)pufferl->vec->gpu_observations;
+        cudaMemcpyAsync(obs_dst.data,
+            packed_obs + (long)start * obs_env.shape[1],
+            (size_t)n * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
+    } else {
+        cast_dispatch(obs_dst.data, obs_env.data + (long)start*obs_env.shape[1], n, stream);
+    }
 
     PrecisionTensor rew_dst = puf_slice(rollouts.rewards, t, start, block_size);
     n = block_size;

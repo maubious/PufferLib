@@ -330,7 +330,7 @@ std::unique_ptr<VecEnv> create_vec(py::dict args, int gpu) {
     ve->gpu = gpu;
     {
         py::gil_scoped_release no_gil;
-        ve->vec = create_static_vec(total_agents, num_buffers, gpu, vec_dict, env_dict);
+        ve->vec = create_static_vec(total_agents, num_buffers, gpu, 0, vec_dict, env_dict);
     }
     ve->total_agents  = total_agents;
     ve->obs_size      = get_obs_size();

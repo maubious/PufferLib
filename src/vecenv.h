@@ -79,6 +79,7 @@ typedef struct StaticVec {
     int* buffer_env_starts;
     int* buffer_env_counts;
     void* observations;
+    void* packed_observations;  // optional pinned BF16 transport staging
     float* actions;
     float* rewards;
     float* terminals;
@@ -94,6 +95,7 @@ typedef struct StaticVec {
     int num_atns;
     int action_mask_size;        // 0 unless env defines MY_ACTION_MASK
     int gpu;
+    int pack_bf16_observations;
     // Optional permutation: agent_perm[slot] = physical agent index in global buffers.
     // NULL = identity (current behavior). Only valid when env defines MY_USES_PERM.
     int* agent_perm;
@@ -111,7 +113,8 @@ enum EvalProfileIdx {
 };
 
 // Functions implemented by env's static library
-StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* vec_kwargs, Dict* env_kwargs);
+StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu,
+    int pack_bf16_observations, Dict* vec_kwargs, Dict* env_kwargs);
 void static_vec_reset(StaticVec* vec);
 void static_vec_close(StaticVec* vec);
 void static_vec_log(StaticVec* vec, Dict* out);
@@ -166,6 +169,26 @@ int my_put(void* env, Dict* kwargs);
 static inline size_t obs_element_size(void) {
     OBS_TENSOR_T t;
     return sizeof(*t.data);
+}
+
+static inline uint16_t f32_to_bf16_rne(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return (uint16_t)(bits >> 16);
+}
+
+static inline size_t gpu_obs_element_size(const StaticVec* vec) {
+    return vec->pack_bf16_observations ? sizeof(uint16_t) : obs_element_size();
+}
+
+static inline void pack_bf16_observations(StaticVec* vec, int start, int count) {
+    if (!vec->pack_bf16_observations) return;
+    const float* src = (const float*)vec->observations + (size_t)start * OBS_SIZE;
+    uint16_t* dst = (uint16_t*)vec->packed_observations + (size_t)start * OBS_SIZE;
+    int n = count * OBS_SIZE;
+    #pragma omp simd
+    for (int i = 0; i < n; ++i) dst[i] = f32_to_bf16_rne(src[i]);
 }
 
 // Usually near the top, after any #includes
@@ -295,10 +318,13 @@ static void* static_omp_threadmanager(void* arg) {
             clock_gettime(CLOCK_MONOTONIC, &t1);
             my_accum[EVAL_ENV_STEP] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
 
+            pack_bf16_observations(vec, agent_start, agents_per_buffer);
             cudaMemcpyAsync(
-                (char*)vec->gpu_observations + agent_start * OBS_SIZE * obs_element_size(),
-                (char*)vec->observations + agent_start * OBS_SIZE * obs_element_size(),
-                agents_per_buffer * OBS_SIZE * obs_element_size(),
+                (char*)vec->gpu_observations + agent_start * OBS_SIZE * gpu_obs_element_size(vec),
+                vec->pack_bf16_observations
+                    ? (char*)vec->packed_observations + agent_start * OBS_SIZE * sizeof(uint16_t)
+                    : (char*)vec->observations + agent_start * OBS_SIZE * obs_element_size(),
+                agents_per_buffer * OBS_SIZE * gpu_obs_element_size(vec),
                 cudaMemcpyHostToDevice, stream);
             cudaMemcpyAsync(
                 &vec->gpu_rewards[agent_start],
@@ -399,7 +425,8 @@ void my_vec_close(Env* envs) {
 }
 #endif
 
-StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* vec_kwargs, Dict* env_kwargs) {
+StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu,
+        int pack_bf16_observations, Dict* vec_kwargs, Dict* env_kwargs) {
     StaticVec* vec = (StaticVec*)calloc(1, sizeof(StaticVec));
     vec->total_agents = total_agents;
     vec->buffers = num_buffers;
@@ -407,6 +434,7 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
     vec->obs_size = OBS_SIZE;
     vec->num_atns = NUM_ATNS;
     vec->gpu = gpu;
+    vec->pack_bf16_observations = gpu && pack_bf16_observations;
 
     vec->buffer_env_starts = (int*)calloc(num_buffers, sizeof(int));
     vec->buffer_env_counts = (int*)calloc(num_buffers, sizeof(int));
@@ -420,16 +448,22 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
     size_t obs_elem_size = obs_element_size();
     if (gpu) {
         cudaHostAlloc((void**)&vec->observations, total_agents * OBS_SIZE * obs_elem_size, cudaHostAllocPortable);
+        if (vec->pack_bf16_observations) {
+            cudaHostAlloc(&vec->packed_observations,
+                (size_t)total_agents * OBS_SIZE * sizeof(uint16_t), cudaHostAllocPortable);
+        }
         cudaHostAlloc((void**)&vec->actions, total_agents * NUM_ATNS * sizeof(float), cudaHostAllocPortable);
         cudaHostAlloc((void**)&vec->rewards, total_agents * sizeof(float), cudaHostAllocPortable);
         cudaHostAlloc((void**)&vec->terminals, total_agents * sizeof(float), cudaHostAllocPortable);
 
-        cudaMalloc((void**)&vec->gpu_observations, total_agents * OBS_SIZE * obs_elem_size);
+        cudaMalloc((void**)&vec->gpu_observations,
+            (size_t)total_agents * OBS_SIZE * gpu_obs_element_size(vec));
         cudaMalloc((void**)&vec->gpu_actions, total_agents * NUM_ATNS * sizeof(float));
         cudaMalloc((void**)&vec->gpu_rewards, total_agents * sizeof(float));
         cudaMalloc((void**)&vec->gpu_terminals, total_agents * sizeof(float));
 
-        cudaMemset(vec->gpu_observations, 0, total_agents * OBS_SIZE * obs_elem_size);
+        cudaMemset(vec->gpu_observations, 0,
+            (size_t)total_agents * OBS_SIZE * gpu_obs_element_size(vec));
         cudaMemset(vec->gpu_actions, 0, total_agents * NUM_ATNS * sizeof(float));
         cudaMemset(vec->gpu_rewards, 0, total_agents * sizeof(float));
         cudaMemset(vec->gpu_terminals, 0, total_agents * sizeof(float));
@@ -567,8 +601,11 @@ void static_vec_reset(StaticVec* vec) {
         c_reset(&envs[i]);
     }
     if (vec->gpu) {
-        cudaMemcpy(vec->gpu_observations, vec->observations,
-            vec->total_agents * OBS_SIZE * obs_element_size(), cudaMemcpyHostToDevice);
+        pack_bf16_observations(vec, 0, vec->total_agents);
+        cudaMemcpy(vec->gpu_observations,
+            vec->pack_bf16_observations ? vec->packed_observations : vec->observations,
+            (size_t)vec->total_agents * OBS_SIZE * gpu_obs_element_size(vec),
+            cudaMemcpyHostToDevice);
         cudaMemset(vec->gpu_rewards,   0, vec->total_agents * sizeof(float));
         cudaMemset(vec->gpu_terminals, 0, vec->total_agents * sizeof(float));
 #ifdef MY_ACTION_MASK
@@ -640,6 +677,7 @@ void static_vec_close(StaticVec* vec) {
         cudaFree(vec->gpu_rewards);
         cudaFree(vec->gpu_terminals);
         cudaFreeHost(vec->observations);
+        if (vec->packed_observations != NULL) cudaFreeHost(vec->packed_observations);
         cudaFreeHost(vec->actions);
         cudaFreeHost(vec->rewards);
         cudaFreeHost(vec->terminals);
