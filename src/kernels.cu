@@ -259,6 +259,85 @@ static cublasHandle_t cublas_get_handle() {
     return handle;
 }
 
+static bool splitk_enabled() {
+    static int enabled = []() {
+        const char* value = getenv("PUFFER_SPLITK");
+        if (value != nullptr) return atoi(value) != 0;
+        int device = 0;
+        cudaDeviceProp props = {};
+        cudaGetDevice(&device);
+        cudaGetDeviceProperties(&props, device);
+        // Ampere+ has native BF16 tensor cores and should retain its vendor
+        // GEMM path unless explicitly opted in. Split-K defaults on for the
+        // pre-Ampere devices whose long reductions motivated this path.
+        return props.major < 8;
+    }();
+    return enabled;
+}
+
+static float* splitk_get_workspace(cudaStream_t stream) {
+    static thread_local float* workspace = nullptr;
+    if (workspace == nullptr) {
+        cudaStreamCaptureStatus capture_status;
+        cudaStreamIsCapturing(stream, &capture_status);
+        if (capture_status != cudaStreamCaptureStatusNone) return nullptr;
+        if (cudaMalloc(&workspace, CUBLAS_WS_BYTES) != cudaSuccess) {
+            workspace = nullptr;
+        }
+    }
+    return workspace;
+}
+
+__global__ void puf_reduce_splitk(precision_t* __restrict__ out,
+        const float* __restrict__ partials, int elems, int splits) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= elems) return;
+    float sum = 0.0f;
+    for (int split = 0; split < splits; ++split) {
+        sum += partials[(int64_t)split * elems + idx];
+    }
+    out[idx] = from_float(sum);
+}
+
+// Weight gradients have the shape A(K,M)^T @ B(K,N), with K equal to the
+// minibatch size. Without native BF16 tensor cores, very large K and small M/N select
+// a nearly serial reduction kernel. Split K into independent batched GEMMs,
+// accumulate each partial in FP32, then reduce once into model precision.
+static bool puf_mm_tn_splitk(PrecisionTensor* a, PrecisionTensor* b,
+        PrecisionTensor* out, int M, int N, int K, cudaStream_t stream) {
+    if (!splitk_enabled() || K < 32768) return false;
+
+    int output_elems = M * N;
+    int split_k;
+    if (output_elems <= 1024) split_k = 256;
+    else if (output_elems <= 8192) split_k = 512;
+    else split_k = 2048;
+    if (K % split_k != 0) return false;
+
+    int splits = K / split_k;
+    size_t partial_bytes = (size_t)splits * output_elems * sizeof(float);
+    if (partial_bytes > CUBLAS_WS_BYTES) return false;
+    float* partials = splitk_get_workspace(stream);
+    if (partials == nullptr) return false;
+
+    float alpha = 1.0f, beta = 0.0f;
+    cublasHandle_t handle = cublas_get_handle();
+    cublasSetStream(handle, stream);
+    cublasStatus_t status = cublasGemmStridedBatchedEx(handle,
+        CUBLAS_OP_N, CUBLAS_OP_T, N, M, split_k,
+        &alpha,
+        b->data, CUBLAS_PRECISION, N, (long long)split_k * N,
+        a->data, CUBLAS_PRECISION, M, (long long)split_k * M,
+        &beta,
+        partials, CUDA_R_32F, N, (long long)output_elems,
+        splits, CUBLAS_COMPUTE_PRECISION, CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS) return false;
+
+    puf_reduce_splitk<<<grid_size(output_elems), BLOCK_SIZE, 0, stream>>>(
+        out->data, partials, output_elems, splits);
+    return true;
+}
+
 static inline void cublasGemmExDense(
         cublasOperation_t op_a, cublasOperation_t op_b,
         int M, int N, int K, void* A, void* B, void* C,
@@ -287,6 +366,7 @@ void puf_mm_tn(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* out, cud
     int M = a->shape[ndim(a->shape)-1];
     int K = batch_size(a->shape) * a->shape[ndim(a->shape)-2];
     int N = b->shape[ndim(b->shape)-1];
+    if (puf_mm_tn_splitk(a, b, out, M, N, K, stream)) return;
     cublasGemmExDense(CUBLAS_OP_T, CUBLAS_OP_N, M, N, K,
         a->data, b->data, out->data, stream);
 }

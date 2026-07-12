@@ -103,8 +103,8 @@ __device__ __forceinline__ void log_coeffs_and_values_bwd(float grad_log_coeffs,
     *grad_hidden_out = (hidden >= 0.0f) ? grad_log_values / (hidden + 0.5f) : grad_log_values * sigmoid(-hidden);
 }
 
-__global__ void mingru_gate(precision_t* out, precision_t* next_state,
-        const precision_t* combined, const precision_t* state_in,
+__global__ void mingru_gate(precision_t* out,
+        const precision_t* combined, precision_t* state_in,
         const precision_t* x_in, int H, int B) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * H;
@@ -128,8 +128,8 @@ __global__ void mingru_gate(precision_t* out, precision_t* next_state,
     float hidden_tilde = (hidden >= 0.0f) ? hidden + 0.5f : fast_sigmoid(hidden);
     float mingru_out = lerp(state, hidden_tilde, gate_sigmoid);
 
-    // next_state is mingru_out (for recurrence)
-    next_state[idx] = from_float(mingru_out);
+    // Update recurrent state in place. Each (B, H) lane has one owning thread.
+    state_in[idx] = from_float(mingru_out);
 
     // Highway connection: sigmoid(proj) * mingru_out + (1 - sigmoid(proj)) * x (highway gate)
     float proj_sigmoid = sigmoid(proj);
@@ -412,7 +412,7 @@ __global__ void assemble_decoder_grad(
 static PrecisionTensor encoder_forward(void* w, void* activations, PrecisionTensor input, cudaStream_t stream) {
     EncoderWeights* ew = (EncoderWeights*)w;
     EncoderActivations* a = (EncoderActivations*)activations;
-    if (a->saved_input.data) puf_copy(&a->saved_input, &input, stream);
+    if (a->saved_input.shape[0]) a->saved_input = input;
     puf_mm(&input, &ew->weight, &a->out, stream);
     return a->out;
 }
@@ -446,7 +446,6 @@ static void encoder_reg_train(void* w, void* activations, Allocator* acts, Alloc
         .wgrad_scratch =    {.shape = {ew->out_dim, ew->in_dim}},
     };
     alloc_register(acts,&a->out);
-    alloc_register(acts,&a->saved_input);
     alloc_register(grads,&a->wgrad_scratch);
 }
 
@@ -485,9 +484,7 @@ struct DecoderActivations {
 static PrecisionTensor decoder_forward(void* w, void* activations, PrecisionTensor input, cudaStream_t stream) {
     DecoderWeights* dw = (DecoderWeights*)w;
     DecoderActivations* a = (DecoderActivations*)activations;
-    if (a->saved_input.data) {
-        puf_copy(&a->saved_input, &input, stream);
-    }
+    if (a->saved_input.shape[0]) a->saved_input = input;
     puf_mm(&input, &dw->weight, &a->out, stream);
     return a->out;
 }
@@ -524,7 +521,6 @@ static void decoder_reg_train(void* w, void* activations, Allocator* acts, Alloc
         .logstd_scratch =   {.shape = {1, dw->output_dim}},
     };
     alloc_register(acts,&a->out);
-    alloc_register(acts,&a->saved_input);
     alloc_register(acts,&a->grad_out);
     alloc_register(acts,&a->grad_input);
     alloc_register(grads,&a->wgrad_scratch);
@@ -575,7 +571,6 @@ struct MinGRUActivations {
     // Rollout
     PrecisionTensor* combined;       // (B rollout, 3*T)[num_layers]
     PrecisionTensor out;             // (B rollout, T)
-    PrecisionTensor next_state;      // (B rollout, T)
     // Training
     PrecisionTensor* saved_inputs;   // (B, TT, T)[num_layers]
     PrefixScan* scan_bufs;           // [num_layers]
@@ -650,7 +645,6 @@ static void mingru_reg_train(void* w, void* activations, Allocator* acts, Alloca
         a->saved_inputs[i]  = {.shape = {B, TT, H}};
         a->combined_bufs[i] = {.shape = {B_TT, 3 * H}};
         a->wgrad_scratch[i] = {.shape = {3 * H, H}};
-        alloc_register(acts,&a->saved_inputs[i]);
         alloc_register(acts,&a->combined_bufs[i]);
         alloc_register(acts,&a->scan_bufs[i].out);
         alloc_register(acts,&a->scan_bufs[i].next_state);
@@ -675,9 +669,7 @@ static void mingru_reg_rollout(void* weights, void* activations, Allocator* allo
         alloc_register(alloc,&a->combined[i]);
     }
     a->out = {.shape = {B_inf, H}};
-    a->next_state = {.shape = {B_inf, H}};
     alloc_register(alloc,&a->out);
-    alloc_register(alloc,&a->next_state);
 }
 
 static void* mingru_create_weights(void* self) {
@@ -710,9 +702,7 @@ static PrecisionTensor mingru_forward(void* w, PrecisionTensor x, PrecisionTenso
         PrecisionTensor state_i = mingru_state_layer(m, state, i);
         puf_mm(&x, &m->weights[i], &a->combined[i], stream);
         mingru_gate<<<grid_size(B*H), BLOCK_SIZE, 0, stream>>>(
-            a->out.data, a->next_state.data,
-            a->combined[i].data, state_i.data, x.data, H, B);
-        puf_copy(&state_i, &a->next_state, stream);
+            a->out.data, a->combined[i].data, state_i.data, x.data, H, B);
         x = a->out;
     }
     return x;
@@ -724,7 +714,7 @@ static PrecisionTensor mingru_forward_train(void* w, PrecisionTensor x, Precisio
     MinGRUActivations* a = (MinGRUActivations*)activations;
     int B = x.shape[0];
     for (int i = 0; i < m->num_layers; i++) {
-        puf_copy(&a->saved_inputs[i], &x, stream);
+        a->saved_inputs[i] = x;
         PrecisionTensor state_i = mingru_state_layer(m, state, i);
         puf_mm(&x, &m->weights[i], &a->combined_bufs[i], stream);
         a->scan_bufs[i].combined_ptr = a->combined_bufs[i].data;

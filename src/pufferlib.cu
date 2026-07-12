@@ -467,6 +467,7 @@ __global__ void sample_logits(
         PrecisionTensor logstd_puf,           // (1, od) - continuous actions only
         IntTensor act_sizes_puf,              // (num_atns,) action head sizes
         precision_t* __restrict__ actions,    // (B, num_atns)
+        float* __restrict__ env_actions,       // optional FP32 mirror for env step
         precision_t* __restrict__ logprobs,   // (B,)
         precision_t* __restrict__ value_out,  // (B,)
         curandStatePhilox4_32_10_t* __restrict__ rng_states,
@@ -516,6 +517,9 @@ __global__ void sample_logits(
             float log_prob = -0.5f * normalized * normalized - 0.5f * LOG_2PI - log_std;
 
             actions[idx * num_atns + h] = stored_action_p;
+            if (env_actions != nullptr) {
+                env_actions[idx * num_atns + h] = stored_action;
+            }
             total_log_prob += log_prob;
         }
     } else {
@@ -574,7 +578,11 @@ __global__ void sample_logits(
             float log_prob = sampled_logit - logsumexp;
 
             // Write action for this head
-            actions[idx * num_atns + h] = from_float(sampled_action);
+            precision_t stored_action = from_float(sampled_action);
+            actions[idx * num_atns + h] = stored_action;
+            if (env_actions != nullptr) {
+                env_actions[idx * num_atns + h] = to_float(stored_action);
+            }
             total_log_prob += log_prob;
 
             // Advance to next action head
@@ -701,13 +709,11 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         // Offset RNG by bank_off so banks don't collide on per-buffer rng slots.
         sample_logits<<<grid_size(bank_size), BLOCK_SIZE, 0, stream>>>(
             dec_puf, p_logstd, pufferl->act_sizes_puf,
-            act_b.data, lp_b.data, val_b.data,
+            act_b.data, env.actions.data + (long)sub_start * act_cols,
+            lp_b.data, val_b.data,
             pufferl->rng_states[buf] + bank_off,
             mask_b.data, mask_stride_b);
 
-        cast<<<grid_size(numel(act_b.shape)), BLOCK_SIZE, 0, stream>>>(
-                env.actions.data + (long)sub_start * act_cols,
-                act_b.data, numel(act_b.shape));
     }
 
     if (capturing) {
@@ -1521,8 +1527,6 @@ void train_impl(PuffeRL& pufferl) {
         rollouts.rewards.data, src.rewards.data, T, B, 1);
     transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
         rollouts.terminals.data, src.terminals.data, T, B, 1);
-    transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
-        rollouts.ratio.data, src.ratio.data, T, B, 1);
     transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
         rollouts.values.data, src.values.data, T, B, 1);
     if (src.action_mask.data != nullptr) {

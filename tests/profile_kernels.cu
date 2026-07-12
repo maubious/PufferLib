@@ -36,6 +36,9 @@ void print_usage(const char* prog) {
     printf("  fusedscan      - Fused scan (checkpointed) kernel only\n");
     printf("  samplelogits   - Sample logits kernel only\n");
     printf("  ppoloss        - PPO loss fused fwd+bwd kernel\n");
+    printf("  modelgemms     - Exact Breakout rollout/train GEMM signatures\n");
+    printf("  modelsplitk    - Split-K weight-gradient candidates\n");
+    printf("  splitkparity   - Compare split-K and current weight gradients\n");
     printf("  im2col         - im2col + col2im (nmmo3 conv sizes, B=1024)\n");
     printf("  envspeed       - Environment step throughput\n");
     printf("    --buffers N  - Number of buffers (default: %d)\n", BUF);
@@ -91,7 +94,7 @@ inline float profile_kernel(kernel_fn fn, void* args) {
 }
 
 struct MingruGateProfile {
-    PrecisionTensor state, combined, x_in, out, next_state;
+    PrecisionTensor state, combined, x_in, out;
     Allocator alloc;
     int B, H;
 };
@@ -103,13 +106,11 @@ MingruGateProfile* create_mingrugate(int B, int H) {
     p->combined  = {.shape = {B, 3*H}};
     p->x_in      = {.shape = {B, H}};
     p->out       = {.shape = {B, H}};
-    p->next_state = {.shape = {B, H}};
     p->alloc = {};
     alloc_register(&p->alloc, &p->state);
     alloc_register(&p->alloc, &p->combined);
     alloc_register(&p->alloc, &p->x_in);
     alloc_register(&p->alloc, &p->out);
-    alloc_register(&p->alloc, &p->next_state);
     alloc_create(&p->alloc);
 
     int N = B * H;
@@ -126,7 +127,7 @@ MingruGateProfile* create_mingrugate(int B, int H) {
 
 void run_mingrugate(MingruGateProfile* p) {
     mingru_gate<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(
-        p->out.data, p->next_state.data, p->combined.data,
+        p->out.data, p->combined.data,
         p->state.data, p->x_in.data, p->H, p->B);
 }
 
@@ -315,6 +316,195 @@ void profile_fusedscan(int B, int T, int H) {
     printf("\n");
     alloc_free(&p->alloc);
     free(p);
+}
+
+struct GemmProfile {
+    PrecisionTensor a, b, c;
+    Allocator alloc;
+    cublasOperation_t op_a, op_b;
+    int M, N, K;
+};
+
+GemmProfile* create_gemm(cublasOperation_t op_a, cublasOperation_t op_b,
+        int M, int N, int K) {
+    auto* p = (GemmProfile*)calloc(1, sizeof(GemmProfile));
+    p->op_a = op_a; p->op_b = op_b; p->M = M; p->N = N; p->K = K;
+    p->a = (op_a == CUBLAS_OP_N)
+        ? PrecisionTensor{.shape = {M, K}}
+        : PrecisionTensor{.shape = {K, M}};
+    p->b = (op_b == CUBLAS_OP_N)
+        ? PrecisionTensor{.shape = {K, N}}
+        : PrecisionTensor{.shape = {N, K}};
+    p->c = {.shape = {M, N}};
+    alloc_register(&p->alloc, &p->a);
+    alloc_register(&p->alloc, &p->b);
+    alloc_register(&p->alloc, &p->c);
+    alloc_create(&p->alloc);
+    return p;
+}
+
+void run_gemm(GemmProfile* p) {
+    cublasGemmExDense(p->op_a, p->op_b, p->M, p->N, p->K,
+        p->a.data, p->b.data, p->c.data, 0);
+}
+
+void profile_model_gemm(const char* name, cublasOperation_t op_a,
+        cublasOperation_t op_b, int M, int N, int K, int repeats) {
+    auto* p = create_gemm(op_a, op_b, M, N, K);
+    for (int i = 0; i < 20; ++i) run_gemm(p);
+    cudaDeviceSynchronize();
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start); cudaEventCreate(&stop);
+    cudaEventRecord(start);
+    for (int i = 0; i < repeats; ++i) run_gemm(p);
+    cudaEventRecord(stop); cudaEventSynchronize(stop);
+    float total_ms;
+    cudaEventElapsedTime(&total_ms, start, stop);
+    float us = total_ms * 1000.0f / repeats;
+    double tflops = 2.0 * M * N * K / (us * 1e6);
+    printf("  %-18s %c%c %6d x %3d x %6d  %8.1f us  %6.3f TF/s  %5.1f%% peak\n",
+        name, op_a == CUBLAS_OP_N ? 'N' : 'T', op_b == CUBLAS_OP_N ? 'N' : 'T',
+        M, N, K, us, tflops, 100.0 * tflops / 4.88448);
+    cudaEventDestroy(start); cudaEventDestroy(stop);
+    alloc_free(&p->alloc); free(p);
+}
+
+void profile_model_gemms() {
+    printf("Breakout model GEMMs (H=64, obs=118, out=4, minibatch=65536)\n");
+    printf("Rollout forward (M=512 per buffer)\n");
+    profile_model_gemm("encoder fwd", CUBLAS_OP_N, CUBLAS_OP_T, 512, 64, 118, 1000);
+    profile_model_gemm("mingru fwd", CUBLAS_OP_N, CUBLAS_OP_T, 512, 192, 64, 1000);
+    profile_model_gemm("decoder fwd", CUBLAS_OP_N, CUBLAS_OP_T, 512, 4, 64, 1000);
+    printf("Training forward\n");
+    profile_model_gemm("encoder fwd", CUBLAS_OP_N, CUBLAS_OP_T, 65536, 64, 118, 50);
+    profile_model_gemm("mingru fwd", CUBLAS_OP_N, CUBLAS_OP_T, 65536, 192, 64, 50);
+    profile_model_gemm("decoder fwd", CUBLAS_OP_N, CUBLAS_OP_T, 65536, 4, 64, 100);
+    printf("Training backward\n");
+    profile_model_gemm("decoder dW", CUBLAS_OP_T, CUBLAS_OP_N, 4, 64, 65536, 100);
+    profile_model_gemm("decoder dX", CUBLAS_OP_N, CUBLAS_OP_N, 65536, 64, 4, 100);
+    profile_model_gemm("mingru dW", CUBLAS_OP_T, CUBLAS_OP_N, 192, 64, 65536, 50);
+    profile_model_gemm("mingru dX", CUBLAS_OP_N, CUBLAS_OP_N, 65536, 64, 192, 50);
+    profile_model_gemm("encoder dW", CUBLAS_OP_T, CUBLAS_OP_N, 64, 118, 65536, 50);
+    printf("Explicit-transpose candidate (GEMM only)\n");
+    profile_model_gemm("decoder dW NN", CUBLAS_OP_N, CUBLAS_OP_N, 4, 64, 65536, 100);
+    profile_model_gemm("mingru dW NN", CUBLAS_OP_N, CUBLAS_OP_N, 192, 64, 65536, 50);
+    profile_model_gemm("encoder dW NN", CUBLAS_OP_N, CUBLAS_OP_N, 64, 118, 65536, 50);
+    printf("\n");
+}
+
+__global__ void reduce_splitk(precision_t* __restrict__ out,
+        const float* __restrict__ partials, int elems, int splits) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= elems) return;
+    float sum = 0.0f;
+    for (int split = 0; split < splits; ++split)
+        sum += partials[split * elems + idx];
+    out[idx] = from_float(sum);
+}
+
+__global__ void init_splitk_input(precision_t* data, int n, unsigned int seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    unsigned int x = (unsigned int)idx + seed;
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    data[idx] = from_float(((int)(x & 0xffff) - 32768) / 32768.0f);
+}
+
+struct SplitKGemm {
+    precision_t *a, *b;
+    float* partials;
+    precision_t* out;
+    int M, N, K, split_k, splits;
+};
+
+SplitKGemm* create_splitk(int M, int N, int K, int split_k) {
+    auto* p = (SplitKGemm*)calloc(1, sizeof(SplitKGemm));
+    p->M=M; p->N=N; p->K=K; p->split_k=split_k; p->splits=K/split_k;
+    cudaMalloc(&p->a, (size_t)K*M*sizeof(precision_t));
+    cudaMalloc(&p->b, (size_t)K*N*sizeof(precision_t));
+    cudaMalloc(&p->partials, (size_t)p->splits*M*N*sizeof(float));
+    cudaMalloc(&p->out, (size_t)M*N*sizeof(precision_t));
+    init_splitk_input<<<grid_size(K*M), BLOCK_SIZE>>>(p->a, K*M, 17);
+    init_splitk_input<<<grid_size(K*N), BLOCK_SIZE>>>(p->b, K*N, 71);
+    return p;
+}
+
+void run_splitk(SplitKGemm* p) {
+    float alpha=1.0f, beta=0.0f;
+    cublasHandle_t handle = cublas_get_handle();
+    cublasSetStream(handle, 0);
+    cublasGemmStridedBatchedEx(handle,
+        CUBLAS_OP_N, CUBLAS_OP_T, p->N, p->M, p->split_k,
+        &alpha,
+        p->b, CUBLAS_PRECISION, p->N, (long long)p->split_k*p->N,
+        p->a, CUBLAS_PRECISION, p->M, (long long)p->split_k*p->M,
+        &beta,
+        p->partials, CUDA_R_32F, p->N, (long long)p->M*p->N,
+        p->splits, CUBLAS_COMPUTE_PRECISION, CUBLAS_GEMM_DEFAULT);
+    reduce_splitk<<<grid_size(p->M*p->N), BLOCK_SIZE>>>(
+        p->out, p->partials, p->M*p->N, p->splits);
+}
+
+void profile_splitk_shape(const char* name, int M, int N, int K) {
+    printf("  %s (%dx%dx%d)\n", name, M, N, K);
+    for (int split_k: {256, 512, 1024, 2048, 4096, 8192}) {
+        auto* p = create_splitk(M,N,K,split_k);
+        for (int i=0;i<10;i++) run_splitk(p);
+        cudaDeviceSynchronize();
+        cudaEvent_t start,stop; cudaEventCreate(&start); cudaEventCreate(&stop);
+        cudaEventRecord(start);
+        for (int i=0;i<20;i++) run_splitk(p);
+        cudaEventRecord(stop); cudaEventSynchronize(stop);
+        float ms; cudaEventElapsedTime(&ms,start,stop);
+        float us=ms*1000.0f/20;
+        double tflops=2.0*M*N*K/(us*1e6);
+        printf("    split_k=%4d splits=%3d  %8.1f us  %6.3f TF/s\n",
+            split_k,p->splits,us,tflops);
+        cudaEventDestroy(start); cudaEventDestroy(stop);
+        cudaFree(p->a); cudaFree(p->b); cudaFree(p->partials); cudaFree(p->out); free(p);
+    }
+}
+
+void profile_model_splitk() {
+    printf("Split-K weight-gradient candidates (batched GEMM + FP32 reduction)\n");
+    profile_splitk_shape("decoder dW",4,64,65536);
+    profile_splitk_shape("mingru dW",192,64,65536);
+    profile_splitk_shape("encoder dW",64,118,65536);
+    printf("\n");
+}
+
+void compare_splitk_shape(const char* name, int M, int N, int K, int split_k) {
+    auto* p = create_splitk(M,N,K,split_k);
+    precision_t* reference;
+    cudaMalloc(&reference, (size_t)M*N*sizeof(precision_t));
+    cublasGemmExDense(CUBLAS_OP_T,CUBLAS_OP_N,M,N,K,
+        p->a,p->b,reference,0);
+    run_splitk(p);
+    cudaDeviceSynchronize();
+    int elems=M*N;
+    precision_t* ref_h=(precision_t*)malloc(elems*sizeof(precision_t));
+    precision_t* got_h=(precision_t*)malloc(elems*sizeof(precision_t));
+    cudaMemcpy(ref_h,reference,elems*sizeof(precision_t),cudaMemcpyDeviceToHost);
+    cudaMemcpy(got_h,p->out,elems*sizeof(precision_t),cudaMemcpyDeviceToHost);
+    double max_abs=0,mean_abs=0,max_rel=0; int outside=0;
+    for(int i=0;i<elems;i++) {
+        double ref=to_float(ref_h[i]),got=to_float(got_h[i]);
+        double ae=fabs(ref-got),re=ae/fmax(fabs(ref),1e-6);
+        max_abs=fmax(max_abs,ae); max_rel=fmax(max_rel,re); mean_abs+=ae;
+        if(ae>1e-4+1e-3*fabs(ref)) outside++;
+    }
+    printf("  %-12s split_k=%d max_abs=%.5g mean_abs=%.5g max_rel=%.5g outside=%d/%d (%.3f%%)\n",
+        name,split_k,max_abs,mean_abs/elems,max_rel,outside,elems,100.0*outside/elems);
+    free(ref_h);free(got_h);cudaFree(reference);
+    cudaFree(p->a);cudaFree(p->b);cudaFree(p->partials);cudaFree(p->out);free(p);
+}
+
+void compare_model_splitk() {
+    printf("Split-K BF16 parity against current cuBLAS path\n");
+    compare_splitk_shape("decoder dW",4,64,65536,256);
+    compare_splitk_shape("mingru dW",192,64,65536,2048);
+    compare_splitk_shape("encoder dW",64,118,65536,512);
+    printf("\n");
 }
 
 struct PPOProfile {
@@ -515,7 +705,7 @@ SampleLogitsProfile* create_samplelogits(int B, int A) {
 void run_samplelogits(SampleLogitsProfile* p) {
     sample_logits<<<grid_size(p->B), BLOCK_SIZE>>>(
         p->dec_out, p->logstd, p->act_sizes,
-        p->actions_t.data, p->logprobs_t.data, p->value_out_t.data,
+        p->actions_t.data, nullptr, p->logprobs_t.data, p->value_out_t.data,
         p->rng_states, nullptr, 0);
 }
 
@@ -724,6 +914,12 @@ int main(int argc, char** argv) {
         profile_samplelogits(BR, A_);
     if (strcmp(profile, "kernels") == 0 || strcmp(profile, "ppoloss") == 0 || run_all)
         profile_ppoloss(BT, T_, A_);
+    if (strcmp(profile, "modelgemms") == 0)
+        profile_model_gemms();
+    if (strcmp(profile, "modelsplitk") == 0)
+        profile_model_splitk();
+    if (strcmp(profile, "splitkparity") == 0)
+        compare_model_splitk();
     if (strcmp(profile, "kernels") == 0 || strcmp(profile, "im2col") == 0 || run_all) {
         profile_im2col(1024, N3_C1_IC, N3_MAP_H, N3_MAP_W, N3_C1_K, N3_C1_S, N3_C1_OH, N3_C1_OW);
         profile_im2col(1024, N3_C2_IC, N3_C1_OH, N3_C1_OW, N3_C2_K, N3_C2_S, N3_C2_OH, N3_C2_OW);
@@ -739,6 +935,9 @@ int main(int argc, char** argv) {
         && strcmp(profile, "fusedscan") != 0
         && strcmp(profile, "samplelogits") != 0
         && strcmp(profile, "ppoloss") != 0
+        && strcmp(profile, "modelgemms") != 0
+        && strcmp(profile, "modelsplitk") != 0
+        && strcmp(profile, "splitkparity") != 0
         && strcmp(profile, "im2col") != 0
         && strcmp(profile, "envspeed") != 0
     ) {
