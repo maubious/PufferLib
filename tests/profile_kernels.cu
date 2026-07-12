@@ -298,7 +298,7 @@ FusedScanProfile* create_fusedscan(int B, int T, int H) {
 }
 
 void run_fusedscan_fwd(FusedScanProfile* p) {
-    mingru_scan_forward<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(p->scan);
+    mingru_scan_forward<false><<<grid_size(p->B * p->H), BLOCK_SIZE>>>(p->scan);
 }
 
 void run_fusedscan_bwd(FusedScanProfile* p) {
@@ -306,13 +306,65 @@ void run_fusedscan_bwd(FusedScanProfile* p) {
         p->scan, p->grad_out.data, p->grad_next_state.data);
 }
 
+void run_fusedscan_saved_fwd(FusedScanProfile* p) {
+    mingru_scan_forward<true><<<grid_size(p->B * p->H), BLOCK_SIZE>>>(p->scan);
+}
+
+void run_fusedscan_saved_bwd(FusedScanProfile* p) {
+    mingru_scan_backward_saved<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(
+        p->scan, p->grad_out.data, p->grad_next_state.data);
+}
+
+precision_t* snapshot_tensor(const PrecisionTensor& t) {
+    long n = numel(t.shape);
+    auto* host = (precision_t*)malloc(n * sizeof(precision_t));
+    cudaMemcpy(host, t.data, n * sizeof(precision_t), cudaMemcpyDeviceToHost);
+    return host;
+}
+
+void compare_snapshot(const char* name, const precision_t* ref, const PrecisionTensor& got) {
+    long n = numel(got.shape);
+    auto* host = snapshot_tensor(got);
+    long different = 0;
+    double max_abs = 0.0;
+    for (long i = 0; i < n; ++i) {
+        float a = to_float(ref[i]), b = to_float(host[i]);
+        if (a != b) different++;
+        max_abs = fmax(max_abs, fabs((double)a - b));
+    }
+    printf("  parity %-14s different=%ld/%ld max_abs=%.6g\n",
+        name, different, n, max_abs);
+    free(host);
+}
+
+void check_saved_scan(FusedScanProfile* p) {
+    run_fusedscan_fwd(p); run_fusedscan_bwd(p); cudaDeviceSynchronize();
+    precision_t* out = snapshot_tensor(p->scan.out);
+    precision_t* next = snapshot_tensor(p->scan.next_state);
+    precision_t* combined = snapshot_tensor(p->scan.grad_combined);
+    precision_t* state = snapshot_tensor(p->scan.grad_state);
+    precision_t* input = snapshot_tensor(p->scan.grad_input);
+    run_fusedscan_saved_fwd(p); run_fusedscan_saved_bwd(p); cudaDeviceSynchronize();
+    compare_snapshot("out", out, p->scan.out);
+    compare_snapshot("next_state", next, p->scan.next_state);
+    compare_snapshot("grad_combined", combined, p->scan.grad_combined);
+    compare_snapshot("grad_state", state, p->scan.grad_state);
+    compare_snapshot("grad_input", input, p->scan.grad_input);
+    free(out); free(next); free(combined); free(state); free(input);
+}
+
 void profile_fusedscan(int B, int T, int H) {
     printf("fused_scan (N=%d, %dx%dx%d)\n", B*T*H, B, T, H);
     auto* p = create_fusedscan(B, T, H);
+    check_saved_scan(p);
     float fwd = profile_kernel((kernel_fn)run_fusedscan_fwd, p);
     print_timing("forward", fwd, B*T);
     float bwd = profile_kernel((kernel_fn)run_fusedscan_bwd, p);
     print_timing("backward", bwd, B*T);
+    float saved_fwd = profile_kernel((kernel_fn)run_fusedscan_saved_fwd, p);
+    print_timing("saved forward", saved_fwd, B*T);
+    float saved_bwd = profile_kernel((kernel_fn)run_fusedscan_saved_bwd, p);
+    print_timing("saved backward", saved_bwd, B*T);
     printf("\n");
     alloc_free(&p->alloc);
     free(p);

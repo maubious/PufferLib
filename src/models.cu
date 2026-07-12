@@ -150,6 +150,7 @@ struct PrefixScan {
 
 // Checkpointing trades off partial recomputation for memory bandwidth.
 #define CHECKPOINT_INTERVAL 4
+template<bool STORE_ALL>
 __global__ void mingru_scan_forward(PrefixScan scan) {
     int T_seq = scan.T, H = scan.H, B = scan.B;
     precision_t* __restrict__ out = scan.out.data;
@@ -224,7 +225,7 @@ __global__ void mingru_scan_forward(PrefixScan scan) {
         out_curr += H;
         t_offset += H3;
 
-        if (t % CHECKPOINT_INTERVAL == 0) {
+        if (STORE_ALL || t % CHECKPOINT_INTERVAL == 0) {
             a_star_buf[buf_curr] = a_star;
             s_buf[buf_curr] = s;
             log_values_buf[buf_curr] = log_value;
@@ -233,6 +234,91 @@ __global__ void mingru_scan_forward(PrefixScan scan) {
 
     // Write timestep T to next_state (raw scan_result, no proj, for recurrence)
     next_state[bH + h] = from_float(scan_result);
+}
+
+// Uses intermediates saved by mingru_scan_forward<true>. This is algebraically
+// identical to the checkpointed backward kernel, but trades forward writes for
+// eliminating chunk recomputation and its per-thread register arrays.
+__global__ void mingru_scan_backward_saved(PrefixScan scan,
+        const precision_t* __restrict__ grad_out,
+        const precision_t* __restrict__ grad_next_state) {
+    int T_seq = scan.T, H = scan.H, B = scan.B;
+    precision_t* __restrict__ grad_combined = scan.grad_combined.data;
+    precision_t* __restrict__ grad_state = scan.grad_state.data;
+    precision_t* __restrict__ grad_input = scan.grad_input.data;
+    const precision_t* __restrict__ combined = scan.combined_ptr;
+    const precision_t* __restrict__ state = scan.state_ptr;
+    const precision_t* __restrict__ input = scan.input_ptr;
+    const float* __restrict__ a_star_buf = scan.a_star.data;
+    const float* __restrict__ s_buf = scan.s_vals.data;
+    const float* __restrict__ log_values_buf = scan.log_values_buf.data;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H) return;
+
+    int b = idx / H;
+    int h = idx % H;
+    int bHT = b * H * T_seq;
+    int cbase = 3 * bHT;
+    int H3 = 3 * H, H2 = 2 * H;
+    int state_idx = b * H + h;
+    int out_base = bHT + h;
+    int buf_base = b * (T_seq + 1) * H + h;
+
+    const precision_t* hidden_base = &combined[cbase + h];
+    const precision_t* gate_base = &combined[cbase + H + h];
+    const precision_t* proj_base = &combined[cbase + H2 + h];
+    precision_t* grad_hidden_base = &grad_combined[cbase + h];
+    precision_t* grad_gate_base = &grad_combined[cbase + H + h];
+    precision_t* grad_proj_base = &grad_combined[cbase + H2 + h];
+
+    float acc = 0.0f;
+    float s_val_next = 0.0f;
+    float carry_grad_a = 0.0f;
+    for (int t = T_seq; t > 0; --t) {
+        int t_offset = (t - 1) * H3;
+        int input_idx = out_base + (t - 1) * H;
+        int buf_idx = buf_base + t * H;
+        float a_star_t = a_star_buf[buf_idx];
+        float s_t = s_buf[buf_idx];
+        float log_value_t = log_values_buf[buf_idx];
+        float hidden_val = to_float(hidden_base[t_offset]);
+        float gate_val = to_float(gate_base[t_offset]);
+        float proj_val = to_float(proj_base[t_offset]);
+        float x_val = to_float(input[input_idx]);
+
+        float scan_result = __expf(a_star_t + s_t);
+        float z = log_value_t - a_star_t;
+        float grad_out_val = to_float(grad_out[input_idx]);
+        float grad_scan_from_next = t == T_seq
+            ? to_float(grad_next_state[state_idx]) : 0.0f;
+        float proj_sigmoid = sigmoid(proj_val);
+        float grad_scan_result = grad_scan_from_next + grad_out_val * proj_sigmoid;
+        float grad_proj = grad_out_val * (scan_result - x_val)
+            * proj_sigmoid * (1.0f - proj_sigmoid);
+        grad_input[input_idx] = from_float(grad_out_val * (1.0f - proj_sigmoid));
+
+        float grad_log_h = grad_scan_result * scan_result;
+        float grad_s = grad_log_h;
+        acc = t == T_seq ? grad_s : grad_s + acc * __expf(s_t - s_val_next);
+        float grad_z = acc * __expf(z - s_t);
+        s_val_next = s_t;
+        float grad_a = grad_log_h + carry_grad_a - grad_z;
+        carry_grad_a = grad_a;
+
+        float grad_g, grad_h;
+        log_coeffs_and_values_bwd(
+            grad_a, grad_z, gate_val, hidden_val, &grad_g, &grad_h);
+        grad_hidden_base[t_offset] = from_float(grad_h);
+        grad_gate_base[t_offset] = from_float(grad_g);
+        grad_proj_base[t_offset] = from_float(grad_proj);
+    }
+
+    float s_0 = s_buf[buf_base];
+    float z_0 = log_values_buf[buf_base] - a_star_buf[buf_base];
+    acc *= __expf(s_0 - s_val_next);
+    float grad_z_0 = acc * __expf(z_0 - s_0);
+    grad_state[state_idx] = from_float(grad_z_0 / to_float(state[state_idx]));
 }
 
 // Reads sparse checkpoints from forward pass, recomputes intermediate values in chunks
@@ -593,6 +679,14 @@ struct MinGRUWeights {
     PrecisionTensor* weights;  // [num_layers]
 };
 
+static bool mingru_saved_scan_enabled() {
+    static int enabled = []() {
+        const char* value = getenv("PUFFER_MINGRU_SAVED_SCAN");
+        return value == nullptr || atoi(value) != 0;
+    }();
+    return enabled;
+}
+
 static PrecisionTensor mingru_state_layer(MinGRUWeights* m, PrecisionTensor& state, int i) {
     long B = state.shape[1], H = state.shape[2];
     return {.data = state.data + i * B * H, .shape = {B, H}};
@@ -720,7 +814,11 @@ static PrecisionTensor mingru_forward_train(void* w, PrecisionTensor x, Precisio
         a->scan_bufs[i].combined_ptr = a->combined_bufs[i].data;
         a->scan_bufs[i].state_ptr = state_i.data;
         a->scan_bufs[i].input_ptr = a->saved_inputs[i].data;
-        mingru_scan_forward<<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(a->scan_bufs[i]);
+        if (mingru_saved_scan_enabled()) {
+            mingru_scan_forward<true><<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(a->scan_bufs[i]);
+        } else {
+            mingru_scan_forward<false><<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(a->scan_bufs[i]);
+        }
         x = a->scan_bufs[i].out;
     }
     return x;
@@ -731,8 +829,13 @@ static PrecisionTensor mingru_backward(void* w, PrecisionTensor grad, void* acti
     MinGRUActivations* a = (MinGRUActivations*)activations;
     for (int i = m->num_layers - 1; i >= 0; i--) {
         PrefixScan& scan = a->scan_bufs[i];
-        mingru_scan_backward<<<grid_size(scan.B*scan.H), BLOCK_SIZE, 0, stream>>>(
-            scan, grad.data, a->grad_next_state.data);
+        if (mingru_saved_scan_enabled()) {
+            mingru_scan_backward_saved<<<grid_size(scan.B*scan.H), BLOCK_SIZE, 0, stream>>>(
+                scan, grad.data, a->grad_next_state.data);
+        } else {
+            mingru_scan_backward<<<grid_size(scan.B*scan.H), BLOCK_SIZE, 0, stream>>>(
+                scan, grad.data, a->grad_next_state.data);
+        }
         puf_mm_tn(&scan.grad_combined, &a->saved_inputs[i], &a->wgrad_scratch[i], stream);
         puf_mm_nn(&scan.grad_combined, &m->weights[i], &a->grad_input_buf, stream);
         int n = numel(scan.grad_input.shape);
