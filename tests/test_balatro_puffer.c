@@ -35,8 +35,38 @@ int main(void) {
     puf_step(&env);
     assert(env.log.truncations == 1.0f);
     assert(env.log.score == 0.0f);
+    assert(terminal > 0.5f);
+    assert(fabsf(reward - BALATRO_TIMEOUT_REWARD) < 1e-6f);
+
+    /* Invalid structured combinations are discouraged, but are deliberately
+       much cheaper than a terminal loss so early mask mistakes do not
+       dominate the learning signal. */
+    env.log.invalid_actions = 0.0f;
+    env.log.truncations = 0.0f;
+    env.log.n = 0.0f;
+    env.log.reward = 0.0f;
     env.max_episode_steps = 128;
     puf_reset(&env);
+    actions[0] = (float)BALATRO_ACTION_REROLL_BOSS;
+    actions[1] = 0.0f;
+    actions[2] = 0.0f;
+    for (int i = 0; i < BALATRO_MAX_SELECTION; ++i) actions[3 + i] = 0.0f;
+    actions[8] = 0.0f;
+    puf_step(&env);
+    assert(env.log.invalid_actions == 1.0f);
+    assert(terminal < 0.5f);
+    assert(fabsf(reward - BALATRO_INVALID_ACTION_REWARD) < 1e-6f);
+    env.max_episode_steps = 1;
+    puf_reset(&env);
+    puf_step(&env);
+    assert(env.log.invalid_actions == 2.0f);
+    assert(env.log.truncations == 1.0f);
+    assert(terminal > 0.5f);
+    assert(fabsf(reward - (BALATRO_INVALID_ACTION_REWARD + BALATRO_TIMEOUT_REWARD)) < 1e-6f);
+    assert(fabsf(env.log.reward - (BALATRO_INVALID_ACTION_REWARD + BALATRO_TIMEOUT_REWARD)) < 1e-6f);
+    puf_reset(&env);
+    env.log.invalid_actions = 0.0f;
+    env.max_episode_steps = 128;
 
     int transitions = 0;
     int terminals = 0;

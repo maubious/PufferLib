@@ -16,6 +16,8 @@
 #define NUM_ATNS 9
 #define ACT_SIZES {23, 64, 6, 64, 64, 64, 64, 64, 64}
 #define ACTION_MASK_SIZE (23 + 64 + 6 + 64 + 64 + 64 + 64 + 64 + 64)
+#define BALATRO_INVALID_ACTION_REWARD (-0.02f)
+#define BALATRO_TIMEOUT_REWARD (-1.0f)
 
 typedef float obs_t;
 
@@ -183,12 +185,18 @@ static int balatro_episode_timed_out(const Env *env) {
 }
 
 static void balatro_truncate_episode(Env *env) {
+    float transition_reward = env->agents[0].rewards[0] + BALATRO_TIMEOUT_REWARD;
     env->boundary_reached = 1;
     env->agents[0].terminals[0] = 1.0f;
     env->log.truncations += 1.0f;
     env->log.n += 1.0f;
+    env->agents[0].rewards[0] = transition_reward;
+    env->episode_reward += BALATRO_TIMEOUT_REWARD;
     env->log.reward += env->episode_reward;
     puf_reset(env);
+    /* puf_reset clears the reward slot; restore the boundary transition's
+       reward after resetting the next episode's state. */
+    env->agents[0].rewards[0] = transition_reward;
     env->agents[0].terminals[0] = 1.0f;
 }
 
@@ -210,7 +218,8 @@ void puf_step(Env *env) {
     int error = balatro_step_observe(&env->state, &policy, &result, &observation);
     if (error != BALATRO_OK) {
         env->log.invalid_actions += 1.0f;
-        env->agents[0].rewards[0] = -1.0f;
+        env->agents[0].rewards[0] = BALATRO_INVALID_ACTION_REWARD;
+        env->episode_reward += BALATRO_INVALID_ACTION_REWARD;
         if (balatro_episode_timed_out(env)) balatro_truncate_episode(env);
         else balatro_puffer_observe(env);
         return;
@@ -218,6 +227,7 @@ void puf_step(Env *env) {
     env->agents[0].rewards[0] = result.reward;
     env->episode_reward += result.reward;
     if (result.terminal) {
+        float transition_reward = env->agents[0].rewards[0];
         env->boundary_reached = 1;
         env->agents[0].terminals[0] = 1.0f;
         env->log.score += result.won;
@@ -226,6 +236,7 @@ void puf_step(Env *env) {
         env->log.n += 1.0f;
 		env->log.reward += env->episode_reward;
         puf_reset(env);
+        env->agents[0].rewards[0] = transition_reward;
         env->agents[0].terminals[0] = 1.0f;
     } else if (balatro_episode_timed_out(env)) {
         balatro_truncate_episode(env);
