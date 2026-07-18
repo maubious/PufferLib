@@ -1,6 +1,6 @@
 #include "balatro.h"
 
-#define OBS_SIZE 8448
+#define OBS_SIZE ((int)sizeof(BalatroObservation))
 #define NUM_ATNS 9
 #define ACT_SIZES {23, 64, 6, 64, 64, 64, 64, 64, 64}
 #define OBS_TENSOR_T FloatTensor

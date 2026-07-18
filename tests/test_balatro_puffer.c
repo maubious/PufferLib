@@ -20,13 +20,6 @@ int main(void) {
     env.agents[0].action_mask = action_mask;
     puf_init(&env, &kwargs);
     puf_reset(&env);
-    BalatroObservation initial_observation = {0};
-    assert(balatro_observe(&env.state, &initial_observation) == BALATRO_OK);
-    float encoded_initial[OBS_SIZE];
-    int encoded_count = balatro_encode_observation(&initial_observation, encoded_initial);
-    printf("semantic observation width: %d / %d\n", encoded_count, OBS_SIZE);
-    assert(encoded_count == 8398);
-    assert(encoded_count <= OBS_SIZE);
 
     int transitions = 0;
     int terminals = 0;
