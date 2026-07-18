@@ -13,12 +13,29 @@ int main(void) {
     float terminal = 0.0f;
     unsigned char action_mask[ACTION_MASK_SIZE];
 
+    DictItem *timeout = dict_item(&kwargs, "max_episode_steps");
+    timeout->value = 1.0;
     env.agents[0].observations = observation;
     env.agents[0].actions = actions;
     env.agents[0].rewards = &reward;
     env.agents[0].terminals = &terminal;
     env.agents[0].action_mask = action_mask;
     puf_init(&env, &kwargs);
+    puf_reset(&env);
+
+    /* A one-step limit must truncate a nonterminal initial blind-select step. */
+    BalatroLegalView timeout_view = {0};
+    assert(balatro_legal_view(&env.state, &timeout_view) == BALATRO_OK);
+    BalatroAction timeout_action = {0};
+    assert(balatro_legal_group_action(&timeout_view.groups[0], 0, &timeout_action) == BALATRO_OK);
+    actions[0] = (float)timeout_action.type;
+    actions[1] = (float)timeout_action.primary;
+    actions[2] = (float)timeout_action.selection_count;
+    for (int i = 0; i < BALATRO_MAX_SELECTION; ++i) actions[3 + i] = (float)timeout_action.selection[i];
+    puf_step(&env);
+    assert(env.log.truncations == 1.0f);
+    assert(env.log.score == 0.0f);
+    env.max_episode_steps = 128;
     puf_reset(&env);
 
     int transitions = 0;

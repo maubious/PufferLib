@@ -25,6 +25,7 @@ typedef struct Log {
     float wins;
     float ante;
     float invalid_actions;
+    float truncations;
     float n;
 } Log;
 
@@ -35,6 +36,8 @@ typedef struct Env {
     int boundary_reached;
     float episode_reward;
     unsigned int rng;
+    uint32_t episode_steps;
+    uint32_t max_episode_steps;
     Agent agents[1];
     BalatroConfig config;
     BalatroState state;
@@ -148,7 +151,14 @@ void puf_init(Env *env, Dict *kwargs) {
        baseline.  Optional env.* overrides are useful for curriculum runs. */
     DictItem *shaped = dict_find(kwargs, "shaped_reward");
     DictItem *win_ante = dict_find(kwargs, "win_ante");
+    DictItem *max_episode_steps = dict_find(kwargs, "max_episode_steps");
     env->config.shaped_reward = shaped ? (shaped->value != 0.0) : 1;
+    env->max_episode_steps = 0;
+    if (max_episode_steps && max_episode_steps->value > 0.0) {
+        double value = max_episode_steps->value;
+        if (value > UINT32_MAX) value = UINT32_MAX;
+        env->max_episode_steps = (uint32_t)value;
+    }
     if (win_ante) {
         int value = (int)win_ante->value;
         if (value < 1) value = 1;
@@ -164,7 +174,22 @@ void puf_reset(Env *env) {
     env->agents[0].terminals[0] = 0.0f;
     env->boundary_reached = 0;
     env->episode_reward = 0.0f;
+    env->episode_steps = 0;
     balatro_puffer_observe(env);
+}
+
+static int balatro_episode_timed_out(const Env *env) {
+    return env->max_episode_steps > 0 && env->episode_steps >= env->max_episode_steps;
+}
+
+static void balatro_truncate_episode(Env *env) {
+    env->boundary_reached = 1;
+    env->agents[0].terminals[0] = 1.0f;
+    env->log.truncations += 1.0f;
+    env->log.n += 1.0f;
+    env->log.reward += env->episode_reward;
+    puf_reset(env);
+    env->agents[0].terminals[0] = 1.0f;
 }
 
 void puf_step(Env *env) {
@@ -179,13 +204,15 @@ void puf_step(Env *env) {
     policy.reorder_destination = (uint16_t)env->agents[0].actions[8];
     env->agents[0].rewards[0] = 0.0f;
     env->agents[0].terminals[0] = 0.0f;
+    if (env->episode_steps < UINT32_MAX) env->episode_steps++;
     BalatroStepResult result;
     BalatroObservation observation;
     int error = balatro_step_observe(&env->state, &policy, &result, &observation);
     if (error != BALATRO_OK) {
         env->log.invalid_actions += 1.0f;
         env->agents[0].rewards[0] = -1.0f;
-        balatro_puffer_observe(env);
+        if (balatro_episode_timed_out(env)) balatro_truncate_episode(env);
+        else balatro_puffer_observe(env);
         return;
     }
     env->agents[0].rewards[0] = result.reward;
@@ -200,6 +227,8 @@ void puf_step(Env *env) {
 		env->log.reward += env->episode_reward;
         puf_reset(env);
         env->agents[0].terminals[0] = 1.0f;
+    } else if (balatro_episode_timed_out(env)) {
+        balatro_truncate_episode(env);
     } else {
         balatro_puffer_observe(env);
     }
@@ -213,6 +242,7 @@ void puf_log(Log *log, Dict *out) {
     dict_set(out, "wins", log->wins);
     dict_set(out, "ante", log->ante);
     dict_set(out, "invalid_actions", log->invalid_actions);
+	dict_set(out, "truncations", log->truncations);
 	dict_set(out, "reward", log->reward);
 }
 
