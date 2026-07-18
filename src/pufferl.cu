@@ -3147,9 +3147,7 @@ static void puf_log_write(const char* path, Config* cfg, PufLogHistory* history)
         exit(1);
     }
 
-    fprintf(fp, "# PufferLib log v1\n");
-    puf_ini_write(fp, &cfg->ini);
-    fprintf(fp, "\n[metrics]\n");
+    fprintf(fp, "# PufferLib metrics v1\n\n[metrics]\n");
 
     int downsample = (int)puf_config_get(cfg, "sweep", "downsample");
     Dict keys = {0};
@@ -4321,6 +4319,16 @@ TrainResult run_train(Config* cfg, TrainContext* ctx) {
         char log_path[4096];
         snprintf(log_path, sizeof(log_path), "%s/%s.ini", log_dir, run_id);
         puf_log_write(log_path, cfg, &log_history);
+        char config_path[4096];
+        snprintf(config_path, sizeof(config_path), "%s/%s.config.ini", log_dir, run_id);
+        FILE* config_fp = fopen(config_path, "w");
+        if (!config_fp) {
+            fprintf(stderr, "failed to write config %s\n", config_path);
+            exit(1);
+        }
+        fprintf(config_fp, "# PufferLib config v1\n");
+        puf_ini_write(config_fp, &cfg->ini);
+        fclose(config_fp);
     }
     puf_log_history_free(&log_history);
     free(selfplay);
