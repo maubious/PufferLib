@@ -1,6 +1,7 @@
 #ifndef PUFFER_BALATRO_H
 #define PUFFER_BALATRO_H
 
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,10 +10,10 @@
 #include <balatro_core.h>
 
 /* PufferLib's tensor boundary is flat, while Simulatro's public observation
-   is a fixed-layout structure. Encode each public byte as a finite float so
-   the complete current observation remains available without duplicating its
-   schema here. */
-#define OBS_SIZE ((int)sizeof(BalatroObservation))
+   is a fixed-layout structure. Encode its fields semantically rather than
+   exposing C padding/endianness as neural-network features. The capacity is
+   intentionally fixed so the Puffer tensor ABI remains stable. */
+#define OBS_SIZE 8448
 #define NUM_ATNS 9
 #define ACT_SIZES {23, 64, 6, 64, 64, 64, 64, 64, 64}
 #define ACTION_MASK_SIZE (23 + 64 + 6 + 64 + 64 + 64 + 64 + 64 + 64)
@@ -42,11 +43,212 @@ typedef struct Env {
     int legal_count;
 } Env;
 
-static void balatro_encode_observation(const BalatroObservation *observation, float *out) {
-    const unsigned char *bytes = (const unsigned char *)observation;
-    for (int i = 0; i < OBS_SIZE; ++i)
-        out[i] = (float)bytes[i] * (1.0f / 255.0f);
+typedef struct BalatroObservationEncoder {
+    float *out;
+    int count;
+} BalatroObservationEncoder;
+
+static void balatro_encode_float(BalatroObservationEncoder *encoder, float value) {
+    encoder->out[encoder->count++] = isfinite(value) ? value : 0.0f;
 }
+
+static void balatro_encode_u8(BalatroObservationEncoder *encoder, uint8_t value) {
+    balatro_encode_float(encoder, (float)value * (1.0f / 255.0f));
+}
+
+static void balatro_encode_u16(BalatroObservationEncoder *encoder, uint16_t value) {
+    balatro_encode_float(encoder, (float)value * (1.0f / 65535.0f));
+}
+
+static void balatro_encode_u32(BalatroObservationEncoder *encoder, uint32_t value) {
+    balatro_encode_u16(encoder, (uint16_t)value);
+    balatro_encode_u16(encoder, (uint16_t)(value >> 16));
+}
+
+static void balatro_encode_u64(BalatroObservationEncoder *encoder, uint64_t value) {
+    balatro_encode_u16(encoder, (uint16_t)value);
+    balatro_encode_u16(encoder, (uint16_t)(value >> 16));
+    balatro_encode_u16(encoder, (uint16_t)(value >> 32));
+    balatro_encode_u16(encoder, (uint16_t)(value >> 48));
+}
+
+static void balatro_encode_selection(BalatroObservationEncoder *encoder,
+                                      const BalatroObservedSelection *selection) {
+    balatro_encode_u64(encoder, selection->allowed_hand);
+    balatro_encode_u64(encoder, selection->required_hand);
+    balatro_encode_u8(encoder, selection->minimum);
+    balatro_encode_u8(encoder, selection->maximum);
+    balatro_encode_u8(encoder, selection->valid);
+}
+
+static void balatro_encode_deck_summary(BalatroObservationEncoder *encoder,
+                                        const BalatroDeckSummary *deck) {
+    for (int i = 0; i < 13; ++i) balatro_encode_u16(encoder, deck->rank[i]);
+    for (int i = 0; i < 4; ++i) balatro_encode_u16(encoder, deck->suit[i]);
+    for (int suit = 0; suit < 4; ++suit)
+        for (int rank = 0; rank < 13; ++rank)
+            balatro_encode_u16(encoder, deck->rank_suit[suit][rank]);
+    for (int i = 0; i < 9; ++i) balatro_encode_u16(encoder, deck->enhancement[i]);
+    for (int i = 0; i < 5; ++i) balatro_encode_u16(encoder, deck->edition[i]);
+    for (int i = 0; i < 5; ++i) balatro_encode_u16(encoder, deck->seal[i]);
+    balatro_encode_u16(encoder, deck->face);
+    balatro_encode_u16(encoder, deck->numbered);
+    balatro_encode_u16(encoder, deck->ace);
+    balatro_encode_u16(encoder, deck->stone);
+    balatro_encode_u16(encoder, deck->wild);
+    balatro_encode_u16(encoder, deck->steel);
+    balatro_encode_u16(encoder, deck->gold);
+    balatro_encode_u16(encoder, deck->glass);
+    balatro_encode_u16(encoder, deck->enhanced);
+    balatro_encode_u16(encoder, deck->unmodified);
+    balatro_encode_u16(encoder, deck->total);
+}
+
+#define BALATRO_ENCODE_CARD_TABLE(encoder, table, capacity) \
+    do { \
+        balatro_encode_u16(&(encoder), (table).count); \
+        for (int i = 0; i < (capacity); ++i) { \
+            balatro_encode_u16(&(encoder), (table).center_id[i]); \
+            balatro_encode_u8(&(encoder), (table).rank[i]); \
+            balatro_encode_u8(&(encoder), (table).suit[i]); \
+            balatro_encode_u8(&(encoder), (table).enhancement[i]); \
+            balatro_encode_u8(&(encoder), (table).edition[i]); \
+            balatro_encode_u8(&(encoder), (table).seal[i]); \
+            balatro_encode_u8(&(encoder), (table).flags[i]); \
+            balatro_encode_float(&(encoder), (table).perma_bonus[i]); \
+            balatro_encode_float(&(encoder), (table).cost[i]); \
+            balatro_encode_float(&(encoder), (table).sell_cost[i]); \
+            for (int k = 0; k < 4; ++k) balatro_encode_u32(&(encoder), (uint32_t)(table).mutable_raw[k][i]); \
+            for (int k = 0; k < 4; ++k) balatro_encode_float(&(encoder), (table).mutable_value[k][i]); \
+            balatro_encode_u8(&(encoder), (table).valid[i]); \
+        } \
+    } while (0)
+
+static int balatro_encode_observation(const BalatroObservation *observation, float *out) {
+    BalatroObservationEncoder encoder = {.out = out, .count = 0};
+    const BalatroObservationScalars *scalars = &observation->scalars;
+    balatro_encode_u16(&encoder, observation->profile.playing_cards);
+    balatro_encode_u16(&encoder, observation->profile.playing_variants);
+    balatro_encode_u16(&encoder, observation->profile.hand);
+    balatro_encode_u16(&encoder, observation->profile.jokers);
+    balatro_encode_u16(&encoder, observation->profile.consumables);
+    balatro_encode_u16(&encoder, observation->profile.tags);
+    balatro_encode_u16(&encoder, observation->profile.shop_vouchers);
+    balatro_encode_u32(&encoder, observation->encoded_bytes);
+    balatro_encode_u16(&encoder, observation->required_capacity);
+    balatro_encode_u8(&encoder, observation->truncation_reason);
+    balatro_encode_u8(&encoder, observation->overflow_section);
+
+    balatro_encode_u16(&encoder, scalars->deck_id);
+    balatro_encode_u16(&encoder, scalars->blind_id);
+    balatro_encode_u16(&encoder, scalars->next_boss_id);
+    balatro_encode_u16(&encoder, scalars->next_voucher_id);
+    balatro_encode_u16(&encoder, scalars->last_tarot_planet);
+    const uint8_t *scalar_bytes = &scalars->stake;
+    for (int i = 0; i < 36; ++i) balatro_encode_u8(&encoder, scalar_bytes[i]);
+    balatro_encode_u32(&encoder, scalars->ante);
+    balatro_encode_u32(&encoder, scalars->round);
+    balatro_encode_u32(&encoder, scalars->actions_taken);
+    balatro_encode_u32(&encoder, scalars->run_hands_played);
+    balatro_encode_u16(&encoder, scalars->hands_left);
+    balatro_encode_u16(&encoder, scalars->discards_left);
+    balatro_encode_u16(&encoder, scalars->hands_played);
+    balatro_encode_u16(&encoder, scalars->discards_used);
+    balatro_encode_u16(&encoder, scalars->hand_size);
+    balatro_encode_u16(&encoder, scalars->joker_slots);
+    balatro_encode_u16(&encoder, scalars->consumable_slots);
+    balatro_encode_u16(&encoder, scalars->skips);
+    balatro_encode_u16(&encoder, scalars->pack_choices);
+    balatro_encode_u16(&encoder, scalars->unused_discards);
+    balatro_encode_u16(&encoder, scalars->blind_hands_mask);
+    balatro_encode_u16(&encoder, scalars->tarots_used);
+    balatro_encode_u16(&encoder, scalars->planet_usage_mask);
+    balatro_encode_u8(&encoder, scalars->chips_number);
+    balatro_encode_u8(&encoder, scalars->blind_chips_number);
+    balatro_encode_u8(&encoder, scalars->last_hand_score_number);
+    balatro_encode_u8(&encoder, scalars->chips_over_blind_number);
+    balatro_encode_float(&encoder, scalars->dollars);
+    balatro_encode_float(&encoder, scalars->chips);
+    balatro_encode_float(&encoder, scalars->blind_chips);
+    balatro_encode_float(&encoder, scalars->last_hand_score);
+    balatro_encode_float(&encoder, scalars->chips_over_blind);
+    balatro_encode_float(&encoder, scalars->reroll_cost);
+    balatro_encode_float(&encoder, scalars->round_earnings);
+    balatro_encode_float(&encoder, scalars->interest_cap);
+    balatro_encode_float(&encoder, scalars->interest_amount);
+    balatro_encode_float(&encoder, scalars->blind_reward);
+    balatro_encode_float(&encoder, scalars->joker_rate);
+    balatro_encode_float(&encoder, scalars->tarot_rate);
+    balatro_encode_float(&encoder, scalars->planet_rate);
+    balatro_encode_float(&encoder, scalars->spectral_rate);
+    balatro_encode_float(&encoder, scalars->playing_card_rate);
+    balatro_encode_float(&encoder, scalars->edition_rate);
+    for (int i = 0; i < BALATRO_CENTER_COUNT; ++i)
+        balatro_encode_u8(&encoder, scalars->redeemed_vouchers[i]);
+
+    balatro_encode_u16(&encoder, observation->variants.count);
+    for (int i = 0; i < BALATRO_OBS_MAX_PLAYING_VARIANTS; ++i) {
+        balatro_encode_u8(&encoder, observation->variants.rank[i]);
+        balatro_encode_u8(&encoder, observation->variants.suit[i]);
+        balatro_encode_u8(&encoder, observation->variants.enhancement[i]);
+        balatro_encode_u8(&encoder, observation->variants.edition[i]);
+        balatro_encode_u8(&encoder, observation->variants.seal[i]);
+        balatro_encode_u8(&encoder, observation->variants.flags[i]);
+        balatro_encode_float(&encoder, observation->variants.perma_bonus[i]);
+        balatro_encode_u16(&encoder, observation->variants.owned_count[i]);
+        balatro_encode_u16(&encoder, observation->variants.draw_count[i]);
+        balatro_encode_u16(&encoder, observation->variants.hand_count[i]);
+        balatro_encode_u16(&encoder, observation->variants.discard_count[i]);
+        balatro_encode_u8(&encoder, observation->variants.valid[i]);
+    }
+    balatro_encode_u16(&encoder, observation->hand.count);
+    for (int i = 0; i < BALATRO_OBS_MAX_HAND; ++i) {
+        balatro_encode_u16(&encoder, observation->hand.variant[i]);
+        balatro_encode_u8(&encoder, observation->hand.flags[i]);
+        balatro_encode_u8(&encoder, observation->hand.valid[i]);
+    }
+    balatro_encode_deck_summary(&encoder, &observation->owned_deck);
+    balatro_encode_deck_summary(&encoder, &observation->draw_pile);
+    BALATRO_ENCODE_CARD_TABLE(encoder, observation->jokers, BALATRO_OBS_MAX_JOKERS);
+    BALATRO_ENCODE_CARD_TABLE(encoder, observation->consumables, BALATRO_OBS_MAX_CONSUMABLES);
+    BALATRO_ENCODE_CARD_TABLE(encoder, observation->shop, BALATRO_OBS_MAX_SHOP_MAIN);
+    BALATRO_ENCODE_CARD_TABLE(encoder, observation->shop_vouchers, BALATRO_OBS_MAX_SHOP_VOUCHERS);
+    BALATRO_ENCODE_CARD_TABLE(encoder, observation->shop_boosters, BALATRO_OBS_MAX_SHOP_BOOSTERS);
+    BALATRO_ENCODE_CARD_TABLE(encoder, observation->pack, BALATRO_OBS_MAX_PACK_CARDS);
+    balatro_encode_u16(&encoder, observation->tags.count);
+    for (int i = 0; i < BALATRO_OBS_MAX_TAGS; ++i) {
+        balatro_encode_u8(&encoder, observation->tags.tag_id[i]);
+        balatro_encode_u8(&encoder, observation->tags.orbital_hand[i]);
+        balatro_encode_u8(&encoder, observation->tags.flags[i]);
+        balatro_encode_u8(&encoder, observation->tags.valid[i]);
+    }
+    for (int i = 0; i < BALATRO_HAND_COUNT; ++i) {
+        balatro_encode_u8(&encoder, observation->poker_hands.visible[i]);
+        balatro_encode_u32(&encoder, observation->poker_hands.level[i]);
+        balatro_encode_float(&encoder, observation->poker_hands.chips[i]);
+        balatro_encode_float(&encoder, observation->poker_hands.mult[i]);
+        balatro_encode_u32(&encoder, observation->poker_hands.total_plays[i]);
+        balatro_encode_u32(&encoder, observation->poker_hands.round_plays[i]);
+    }
+    for (int i = 0; i < BALATRO_ACTION_TYPE_COUNT; ++i) {
+        balatro_encode_u8(&encoder, observation->legal.action_type[i]);
+        balatro_encode_u64(&encoder, observation->legal.primary[i]);
+    }
+    balatro_encode_selection(&encoder, &observation->legal.play);
+    balatro_encode_selection(&encoder, &observation->legal.discard);
+    for (int i = 0; i < BALATRO_OBS_MAX_CONSUMABLES; ++i)
+        balatro_encode_selection(&encoder, &observation->legal.consumable[i]);
+    for (int i = 0; i < BALATRO_OBS_MAX_SHOP_MAIN; ++i)
+        balatro_encode_selection(&encoder, &observation->legal.shop[i]);
+    for (int i = 0; i < BALATRO_OBS_MAX_PACK_CARDS; ++i)
+        balatro_encode_selection(&encoder, &observation->legal.pack[i]);
+    for (int i = 0; i < BALATRO_OBS_MAX_HAND; ++i)
+        balatro_encode_u64(&encoder, observation->legal.hand_reorder_destination[i]);
+    for (int i = 0; i < BALATRO_OBS_MAX_JOKERS; ++i)
+        balatro_encode_u64(&encoder, observation->legal.joker_reorder_destination[i]);
+    return encoder.count;
+}
+#undef BALATRO_ENCODE_CARD_TABLE
 
 static void balatro_mask_range(unsigned char *mask, int offset, int count) {
     for (int i = 0; i < count; ++i) mask[offset + i] = 1;
@@ -128,7 +330,8 @@ static int balatro_puffer_observe(Env *env) {
     float *out = (float *)env->agents[0].observations;
     memset(out, 0, OBS_SIZE * sizeof(float));
     if (error == BALATRO_OK) {
-        balatro_encode_observation(&observation, out);
+        int encoded = balatro_encode_observation(&observation, out);
+        if (encoded > OBS_SIZE) error = BALATRO_ERR_OBSERVATION_CAPACITY;
         if (env->agents[0].action_mask)
             balatro_puffer_mask(&observation, env->agents[0].action_mask);
     }
