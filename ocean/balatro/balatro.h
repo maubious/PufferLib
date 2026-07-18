@@ -1,15 +1,21 @@
 #ifndef PUFFER_BALATRO_H
 #define PUFFER_BALATRO_H
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "pufferenv.h"
 #include <balatro_core.h>
 
-#define OBS_SIZE BALATRO_OBSERVATION_SIZE
-#define NUM_ATNS 1
-#define ACT_SIZES {BALATRO_MAX_LEGAL_ACTIONS}
+/* PufferLib's tensor boundary is flat, while Simulatro's public observation
+   is a fixed-layout structure. Encode each public byte as a finite float so
+   the complete current observation remains available without duplicating its
+   schema here. */
+#define OBS_SIZE ((int)sizeof(BalatroObservation))
+#define NUM_ATNS 9
+#define ACT_SIZES {23, 64, 6, 64, 64, 64, 64, 64, 64}
+#define ACTION_MASK_SIZE (23 + 64 + 6 + 64 + 64 + 64 + 64 + 64 + 64)
 
 typedef float obs_t;
 
@@ -36,20 +42,98 @@ typedef struct Env {
     int legal_count;
 } Env;
 
-static void balatro_puffer_observe(Env *env) {
+static void balatro_encode_observation(const BalatroObservation *observation, float *out) {
+    const unsigned char *bytes = (const unsigned char *)observation;
+    for (int i = 0; i < OBS_SIZE; ++i)
+        out[i] = (float)bytes[i] * (1.0f / 255.0f);
+}
+
+static void balatro_mask_range(unsigned char *mask, int offset, int count) {
+    for (int i = 0; i < count; ++i) mask[offset + i] = 1;
+}
+
+static void balatro_puffer_mask(const BalatroObservation *observation, unsigned char *mask) {
+    memset(mask, 0, ACTION_MASK_SIZE);
+    int type_offset = 0;
+    int primary_offset = type_offset + 23;
+    int count_offset = primary_offset + 64;
+    int selection_offset = count_offset + 6;
+    int reorder_offset = selection_offset + 5 * 64;
+    int any_type = 0;
+    int any_selection = 0;
+    int any_reorder = 0;
+
+    for (int type = 0; type < BALATRO_ACTION_TYPE_COUNT; ++type) {
+        if (!observation->legal.action_type[type]) continue;
+        mask[type_offset + type] = 1;
+        any_type = 1;
+        uint64_t primary = observation->legal.primary[type];
+        for (int slot = 0; slot < 64; ++slot)
+            if (primary & (UINT64_C(1) << slot)) mask[primary_offset + slot] = 1;
+    }
+
+    const BalatroObservedSelection *families[BALATRO_OBS_MAX_CONSUMABLES +
+        BALATRO_OBS_MAX_SHOP_MAIN + BALATRO_OBS_MAX_PACK_CARDS + 2];
+    int family_count = 0;
+    families[family_count++] = &observation->legal.play;
+    families[family_count++] = &observation->legal.discard;
+    for (int i = 0; i < BALATRO_OBS_MAX_CONSUMABLES; ++i)
+        families[family_count++] = &observation->legal.consumable[i];
+    for (int i = 0; i < BALATRO_OBS_MAX_SHOP_MAIN; ++i)
+        families[family_count++] = &observation->legal.shop[i];
+    for (int i = 0; i < BALATRO_OBS_MAX_PACK_CARDS; ++i)
+        families[family_count++] = &observation->legal.pack[i];
+    for (int i = 0; i < family_count; ++i) {
+        const BalatroObservedSelection *selection = families[i];
+        if (!selection->valid) continue;
+        any_selection = 1;
+        for (int card = 0; card < 64; ++card)
+            if (selection->allowed_hand & (UINT64_C(1) << card))
+                for (int position = 0; position < 5; ++position)
+                    mask[selection_offset + position * 64 + card] = 1;
+    }
+    for (int i = 0; i < BALATRO_OBS_MAX_HAND; ++i)
+        if (observation->legal.hand_reorder_destination[i]) {
+            any_reorder = 1;
+            for (int destination = 0; destination < 64; ++destination)
+                if (observation->legal.hand_reorder_destination[i] &
+                    (UINT64_C(1) << destination))
+                    mask[reorder_offset + destination] = 1;
+        }
+    for (int i = 0; i < BALATRO_OBS_MAX_JOKERS; ++i)
+        if (observation->legal.joker_reorder_destination[i]) {
+            any_reorder = 1;
+            for (int destination = 0; destination < 64; ++destination)
+                if (observation->legal.joker_reorder_destination[i] &
+                    (UINT64_C(1) << destination))
+                    mask[reorder_offset + destination] = 1;
+        }
+
+    /* Every categorical head must have at least one finite option. The
+       structured validator remains authoritative for cross-head combinations. */
+    if (!any_type) mask[type_offset] = 1;
+    int any_primary = 0;
+    for (int i = 0; i < 64; ++i) any_primary |= mask[primary_offset + i] != 0;
+    if (!any_primary) mask[primary_offset] = 1;
+    if (any_selection) balatro_mask_range(mask, count_offset, 6);
+    else mask[count_offset] = 1;
+    if (!any_selection)
+        for (int position = 0; position < 5; ++position) mask[selection_offset + position * 64] = 1;
+    if (!any_reorder) mask[reorder_offset] = 1;
+}
+
+static int balatro_puffer_observe(Env *env) {
     BalatroObservation observation;
-    balatro_observe(&env->state, &observation);
+    int error = balatro_observe(&env->state, &observation);
     float *out = (float *)env->agents[0].observations;
     memset(out, 0, OBS_SIZE * sizeof(float));
-    memcpy(out, observation.values, observation.length * sizeof(float));
-
-    env->legal_count = balatro_legal_actions(
-        &env->state,
-        env->legal,
-        env->agents[0].action_mask,
-        BALATRO_MAX_LEGAL_ACTIONS
-    );
-    if (env->legal_count < 0) env->legal_count = 0;
+    if (error == BALATRO_OK) {
+        balatro_encode_observation(&observation, out);
+        if (env->agents[0].action_mask)
+            balatro_puffer_mask(&observation, env->agents[0].action_mask);
+    }
+    env->legal_count = 0;
+    return error;
 }
 
 void puf_init(Env *env, Dict *kwargs) {
@@ -84,18 +168,20 @@ void puf_reset(Env *env) {
 }
 
 void puf_step(Env *env) {
-    int slot = (int)env->agents[0].actions[0];
+    BalatroPolicyAction policy = {0};
+    policy.type = (uint8_t)env->agents[0].actions[0];
+    policy.primary = (uint16_t)env->agents[0].actions[1];
+    policy.selection_count = (uint8_t)env->agents[0].actions[2];
+    if (policy.selection_count > BALATRO_MAX_SELECTION)
+        policy.selection_count = BALATRO_MAX_SELECTION;
+    for (int i = 0; i < BALATRO_MAX_SELECTION; ++i)
+        policy.selection[i] = (uint16_t)env->agents[0].actions[3 + i];
+    policy.reorder_destination = (uint16_t)env->agents[0].actions[8];
     env->agents[0].rewards[0] = 0.0f;
     env->agents[0].terminals[0] = 0.0f;
-    if (slot < 0 || slot >= env->legal_count) {
-        env->log.invalid_actions += 1.0f;
-        env->agents[0].rewards[0] = -1.0f;
-        balatro_puffer_observe(env);
-        return;
-    }
-
     BalatroStepResult result;
-    int error = balatro_step(&env->state, &env->legal[slot], &result);
+    BalatroObservation observation;
+    int error = balatro_step_observe(&env->state, &policy, &result, &observation);
     if (error != BALATRO_OK) {
         env->log.invalid_actions += 1.0f;
         env->agents[0].rewards[0] = -1.0f;

@@ -1,10 +1,9 @@
 #include "balatro.h"
 
-#define OBS_SIZE BALATRO_OBSERVATION_SIZE
-#define NUM_ATNS 1
-#define ACT_SIZES {BALATRO_MAX_LEGAL_ACTIONS}
+#define OBS_SIZE ((int)sizeof(BalatroObservation))
+#define NUM_ATNS 9
+#define ACT_SIZES {23, 64, 6, 64, 64, 64, 64, 64, 64}
 #define OBS_TENSOR_T FloatTensor
-#define MY_ACTION_MASK BALATRO_MAX_LEGAL_ACTIONS
+#define MY_ACTION_MASK (23 + 64 + 6 + 64 + 64 + 64 + 64 + 64 + 64)
 #define Env Env
 #include "vecenv.h"
-

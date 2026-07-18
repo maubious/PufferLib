@@ -158,17 +158,20 @@ else
 fi
 
 if [ "$ENV" = "balatro" ]; then
-    BALATRO_ROOT=${BALATRO_ROOT:-$HOME/BalatroLearner}
-    if [ ! -f "$BALATRO_ROOT/include/balatro.h" ]; then
-        echo "Error: BALATRO_ROOT must point to the BalatroLearner repository"
+    SIMULATRO_ROOT=${SIMULATRO_ROOT:-$HOME/simulatro}
+    SIMULATRO_BUILD=${SIMULATRO_BUILD:-$SIMULATRO_ROOT/build-release}
+    if [ ! -f "$SIMULATRO_ROOT/include/balatro.h" ]; then
+        echo "Error: SIMULATRO_ROOT must point to the Simulatro repository"
         exit 1
     fi
-    if [ ! -f "$BALATRO_ROOT/build-release/libbalatro_core.a" ]; then
-        echo "Error: build balatro_core Release in $BALATRO_ROOT/build-release first"
-        exit 1
+    if [ ! -f "$SIMULATRO_BUILD/libbalatro_core.a" ]; then
+        echo "Configuring Simulatro Release library in $SIMULATRO_BUILD..."
+        cmake -S "$SIMULATRO_ROOT" -B "$SIMULATRO_BUILD" \
+            -DCMAKE_BUILD_TYPE=Release -DBALATRO_BUILD_TESTS=OFF
+        cmake --build "$SIMULATRO_BUILD" -j"$(nproc)"
     fi
-    INCLUDES+=(-I"$BALATRO_ROOT/include")
-    LINK_ARCHIVES+=("$BALATRO_ROOT/build-release/libbalatro_core.a")
+    INCLUDES+=(-I"$SIMULATRO_ROOT/include")
+    LINK_ARCHIVES+=("$SIMULATRO_BUILD/libbalatro_core.a")
 fi
 
 OUTPUT_NAME=${OUTPUT_NAME:-$ENV}
@@ -259,7 +262,12 @@ if [ "$BACKEND" = "rocm" ]; then
     HIPIFY_DIR=build/hip/src
     rm -rf "$HIPIFY_DIR"
     echo "Hipifying CUDA sources for ROCm..."
-    python - <<PY
+    PYTHON=${PYTHON:-$(command -v python || command -v python3 || true)}
+    if [ -z "$PYTHON" ]; then
+        echo "Error: python or python3 is required for CUDA/ROCm hipification"
+        exit 1
+    fi
+    "$PYTHON" - <<PY
 from torch.utils.hipify import hipify_python
 hipify_python.hipify(
     project_directory="$(pwd)/src",
