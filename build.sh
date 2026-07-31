@@ -2,7 +2,8 @@
 set -e
 
 # Usage:
-#   ./build.sh breakout              # Full native train/eval binary
+#   ./build.sh breakout              # Full native train/eval binary (CPU envs)
+#   ./build.sh breakout --gpu        # GPU env path (Env* on device; requires ocean/ENV/ENV.cu)
 #   ./build.sh breakout --float      # float32 precision (required for --slowly)
 #   ./build.sh breakout --cpu        # Tiny standalone CPU eval executable
 #   ./build.sh breakout --debug      # Debug build
@@ -21,8 +22,10 @@ fi
 ENV=$1
 shift
 
+USE_GPU_ENV=0
 for arg in "$@"; do
     case $arg in
+        --gpu) USE_GPU_ENV=1 ;;
         --float) PRECISION="-DPRECISION_FLOAT" ;;
         --debug) DEBUG=1 ;;
         --local) MODE=local ;;
@@ -138,19 +141,23 @@ elif [ "$ENV" = "impulse_wars" ]; then
     LINK_ARCHIVES+=("./$BOX2D_NAME/libbox2d.a")
 elif [ "$ENV" = "nethack" ]; then
     SRC_DIR="ocean/$ENV"
-    NLE_DIR="vendor/nle"
-    NLE_REPO="https://github.com/liujonathan24/NetHack.git"
+    EXTRA_CFLAGS+=(-DPUFFER_NETHACK)
+    NLE_DIR="vendor/fast-nle"
+    NLE_REPO="https://github.com/FinlaySanders/fast-nle.git"
     if [ ! -d "$NLE_DIR/src" ]; then
-        echo "Cloning modified NLE from $NLE_REPO ..."
+        echo "Cloning fast-nle from $NLE_REPO ..."
         git clone --depth 1 "$NLE_REPO" "$NLE_DIR"
     fi
-    NETHACK_LIB_DIR="$(pwd)/$NLE_DIR/src/build"
+    NETHACK_LIB_DIR="$(pwd)/$NLE_DIR/build"
     if [ ! -f "$NETHACK_LIB_DIR/libnethack.so" ]; then
         echo "Building libnethack.so ..."
-        make -C "$NETHACK_LIB_DIR" nethack -j$(nproc)
+        cmake -S "$NLE_DIR" -B "$NETHACK_LIB_DIR" -DCMAKE_BUILD_TYPE=Release
+        cmake --build "$NETHACK_LIB_DIR" --target nethack -j$(nproc)
     fi
-    INCLUDES+=(-I./$NLE_DIR/include)
-    EXTRA_LDFLAGS+=(-L"$NETHACK_LIB_DIR" -lnethack -Wl,-rpath,"$NETHACK_LIB_DIR" -ldl)
+    INCLUDES+=(-I./$NLE_DIR/include
+               -I./$NLE_DIR/build/_deps/deboost_context-src/include)
+    EXTRA_LDFLAGS+=(-L"$NETHACK_LIB_DIR" -lnethack
+                    -Xlinker -rpath -Xlinker "$NETHACK_LIB_DIR" -ldl)
 elif [ -d "ocean/$ENV" ]; then
     SRC_DIR="ocean/$ENV"
 else
@@ -186,7 +193,8 @@ if [ -n "$DEBUG" ] || [ "$MODE" = "local" ]; then
     NVCC_OPT="-O0 -g"
     LINK_OPT="-g"
 else
-    CLANG_OPT=(-O2 -DNDEBUG "${CLANG_WARN[@]}" "${SIMD_FLAGS[@]}")
+# No -DNDEBUG: keep assert() active (train/sweep fail-fast with messages).
+    CLANG_OPT=(-O2 "${CLANG_WARN[@]}" "${SIMD_FLAGS[@]}")
     NVCC_OPT="-O2 --threads 0"
     LINK_OPT="-O2"
 fi
@@ -219,7 +227,7 @@ elif [ "$MODE" = "web" ]; then
         -sUSE_GLFW=3 -sUSE_WEBGL2=1 -sASYNCIFY -sFILESYSTEM -sFORCE_FILESYSTEM=1 \
         --shell-file vendor/minshell.html \
         -sINITIAL_MEMORY=512MB -sALLOW_MEMORY_GROWTH -sSTACK_SIZE=512KB \
-        -DNDEBUG -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES3 \
+        -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES3 \
         --preload-file resources/$ENV@resources/$ENV \
         --preload-file resources/shared@resources/shared \
         "${EXTRA_CFLAGS[@]}"
@@ -259,8 +267,9 @@ if [ "$BACKEND" = "rocm" ]; then
         exit 1
     fi
 
-    HIPIFY_DIR=build/hip/src
-    rm -rf "$HIPIFY_DIR"
+    HIPIFY_ROOT=build/hip
+    HIPIFY_DIR="$HIPIFY_ROOT/src"
+    rm -rf "$HIPIFY_ROOT"
     echo "Hipifying CUDA sources for ROCm..."
     PYTHON=${PYTHON:-$(command -v python || command -v python3 || true)}
     if [ -z "$PYTHON" ]; then
@@ -277,6 +286,15 @@ hipify_python.hipify(
     show_detailed=False,
     is_pytorch_extension=True,
 )
+for env in ("nmmo3", "minimal", "nethack"):
+    hipify_python.hipify(
+        project_directory=f"$(pwd)/ocean/{env}",
+        output_directory=f"$(pwd)/$HIPIFY_ROOT/ocean/{env}",
+        includes=["*"],
+        show_progress=False,
+        show_detailed=False,
+        is_pytorch_extension=True,
+    )
 PY
 
     ROCM_ARCH_FLAGS=()
@@ -323,6 +341,15 @@ if ! grep -q 'typedef[[:space:]].*obs_t' "$ENV_HEADER" 2>/dev/null; then
 fi
 
 ENV_COMPILE_FLAGS=(-DENV_HEADER=\"$ENV_HEADER\")
+# GPU env is compile-time exclusive (not a runtime dual path with CPU workers).
+if [ "$USE_GPU_ENV" = "1" ]; then
+    GPU_ENV_HEADER="$SRC_DIR/$ENV.cu"
+    if [ ! -f "$GPU_ENV_HEADER" ]; then
+        echo "Error: --gpu requires $GPU_ENV_HEADER"
+        exit 1
+    fi
+    ENV_COMPILE_FLAGS+=(-DPUFFER_GPU_ENV -DGPU_ENV_HEADER=\"$GPU_ENV_HEADER\")
+fi
 
 MODE=${MODE:-native}
 
@@ -333,7 +360,8 @@ if [ "$MODE" = "native" ]; then
             -I. -I"$HIPIFY_DIR" -I$SRC_DIR -Ivendor -I$RAYLIB_NAME/include \
             "${INCLUDES[@]}" \
             "${ENV_COMPILE_FLAGS[@]}" \
-            -DENV_NAME=$ENV -DPUFFERLIB_BUILD_MAIN -DPLATFORM_DESKTOP -DUSE_ROCM \
+            -DENV_NAME=$ENV -DPUFFER_ENV_NAME=\"$ENV\" -DPUFFERLIB_BUILD_MAIN \
+            -DPLATFORM_DESKTOP -DUSE_ROCM \
             -fopenmp -Wno-c++11-narrowing $PRECISION \
             "$HIPIFY_DIR/pufferl.hip" \
             -x none "${LINK_ARCHIVES[@]}" \
@@ -347,12 +375,15 @@ if [ "$MODE" = "native" ]; then
     echo "Compiling native train/eval binary ($ARCH)..."
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
         -I. -Isrc -I$SRC_DIR -Ivendor \
-        -I$CUDA_HOME/include $NCCL_IFLAG -I$RAYLIB_NAME/include \
+        "${INCLUDES[@]}" \
+        -I$CUDA_HOME/include -I$CUDA_HOME/include/cccl $NCCL_IFLAG -I$RAYLIB_NAME/include \
 	    "${ENV_COMPILE_FLAGS[@]}" \
 	    -DENV_NAME=$ENV \
+	    -DPUFFER_ENV_NAME=\"$ENV\" \
 	    -DPUFFERLIB_BUILD_MAIN \
 	    -Xcompiler=-DPLATFORM_DESKTOP \
 	    -Xcompiler=-fopenmp \
+	    "${EXTRA_CFLAGS[@]}" \
 	    $PRECISION \
 	    src/pufferl.cu \
         "$RAYLIB_A" \
@@ -367,15 +398,19 @@ elif [ "$MODE" = "profile" ]; then
     echo "Compiling profile binary ($ARCH)..."
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
         -I. -Isrc -I$SRC_DIR -Ivendor \
-        -I$CUDA_HOME/include $NCCL_IFLAG -I$RAYLIB_NAME/include \
+        "${INCLUDES[@]}" \
+        -I$CUDA_HOME/include -I$CUDA_HOME/include/cccl $NCCL_IFLAG -I$RAYLIB_NAME/include \
         "${ENV_COMPILE_FLAGS[@]}" \
         -DENV_NAME=$ENV \
+	    -DPUFFER_ENV_NAME=\"$ENV\" \
         -Xcompiler=-DPLATFORM_DESKTOP \
+	    "${EXTRA_CFLAGS[@]}" \
         $PRECISION \
         -Xcompiler=-fopenmp \
         tests/profile_kernels.cu \
         "$RAYLIB_A" \
-        -lnccl -lnvidia-ml -lcublas -lcurand \
+        -L$CUDA_HOME/lib64 \
+        -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand \
         -lGL -lm -lpthread $OMP_LIB \
         -o profile
     echo "Built: ./profile"

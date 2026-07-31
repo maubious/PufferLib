@@ -9,7 +9,14 @@
 
 #define ACT_SIZES {3}
 typedef Env Breakout;
+// Native bf16 train (pufferl defines from_float + precision_t before including
+// this header): store obs as precision_t so env→rollout is a D2D copy. Standalone
+// CPU / float builds keep float obs_t.
+#if defined(from_float) && !defined(PRECISION_FLOAT)
+typedef precision_t obs_t;
+#else
 typedef float obs_t;
+#endif
 
 #define NOOP 0
 #define LEFT 1
@@ -43,6 +50,7 @@ typedef struct Client {
     Texture2D ball;
 } Client;
 
+// CPU Env. GPU breakout is a separate source: ocean/breakout/breakout.cu
 struct Env {
     Client* client;
     Log log;
