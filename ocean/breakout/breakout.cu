@@ -8,8 +8,21 @@
 // Device Env* batch backend (see pufferenv.h PUF_BACKEND).
 #define PUF_BACKEND PUF_GPU
 
+#ifdef USE_ROCM
+#include <hip/hip_bf16.h>
+#include <hip/hip_runtime.h>
+#define cudaStream_t hipStream_t
+#define cudaMemcpyToSymbol hipMemcpyToSymbol
+#define cudaMalloc hipMalloc
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaFree hipFree
+#define cudaStreamSynchronize hipStreamSynchronize
+#else
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +42,11 @@
 #define BRICK_INDEX_PADDLE_COLLISION -1
 
 // Fixed env obs dtype (not tied to train precision build flags).
+#ifdef USE_ROCM
+typedef __hip_bfloat16 obs_t;
+#else
 typedef __nv_bfloat16 obs_t;
+#endif
 
 struct Log {
     float perf;

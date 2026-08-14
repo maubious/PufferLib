@@ -1,5 +1,8 @@
-#ifndef PUFFER_BALATRO_H
-#define PUFFER_BALATRO_H
+#ifndef PUFFER_ENV_H
+#define PUFFER_ENV_H
+
+#define PUFFER_BALATRO
+#define PUFFER_PACKED_OBS
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -7,29 +10,54 @@
 
 #include "pufferenv.h"
 #include <balatro_core.h>
+#include "policy.h"
 
-/* PufferLib's tensor boundary is flat, while Simulatro's public observation
-   is a fixed-layout structure. Encode each public byte as a finite float so
-   the complete current observation remains available without duplicating its
-   schema here. */
-#define OBS_SIZE ((int)sizeof(BalatroObservation))
+#define OBS_SIZE ((int)sizeof(Observation))
 #define NUM_ATNS 9
 #define ACT_SIZES {23, 64, 6, 64, 64, 64, 64, 64, 64}
-#define ACTION_MASK_SIZE (23 + 64 + 6 + 64 + 64 + 64 + 64 + 64 + 64)
-#define BALATRO_INVALID_ACTION_REWARD (-0.02f)
-#define BALATRO_TIMEOUT_REWARD (-1.0f)
+#define ACTION_MASK_SIZE POLICY_MASK_SIZE
+#define INVALID_ACTION_REWARD (-0.002f)
+#define TIMEOUT_REWARD (-1.0f)
 
-typedef float obs_t;
+typedef unsigned char obs_t;
 
 typedef struct Log {
-    float score;
+	float score;
+	float perf;
 	float reward;
     float wins;
     float ante;
     float invalid_actions;
     float truncations;
     float n;
+    float action_counts[ACTION_TYPE_COUNT];
 } Log;
+
+static const char *const action_log_names[ACTION_TYPE_COUNT] = {
+    "actions/play_hand",
+    "actions/discard",
+    "actions/select_blind",
+    "actions/skip_blind",
+    "actions/cash_out",
+    "actions/reroll",
+    "actions/next_round",
+    "actions/skip_pack",
+    "actions/buy_card",
+    "actions/sell_joker",
+    "actions/sell_consumable",
+    "actions/use_consumable",
+    "actions/redeem_voucher",
+    "actions/open_booster",
+    "actions/pick_pack_card",
+    "actions/swap_jokers_left",
+    "actions/swap_jokers_right",
+    "actions/swap_hand_left",
+    "actions/swap_hand_right",
+    "actions/sort_hand_rank",
+    "actions/sort_hand_suit",
+    "actions/buy_and_use",
+    "actions/reroll_boss",
+};
 
 typedef struct Env {
     Log log;
@@ -41,105 +69,185 @@ typedef struct Env {
     uint32_t episode_steps;
     uint32_t max_episode_steps;
     Agent agents[1];
-    BalatroConfig config;
-    BalatroState state;
-    BalatroAction legal[BALATRO_MAX_LEGAL_ACTIONS];
-    int legal_count;
+    Config config;
+    State state;
+    LegalMasks legal_masks;
+    float invalid_action_reward;
 } Env;
 
-static void balatro_encode_observation(const BalatroObservation *observation, float *out) {
-    const unsigned char *bytes = (const unsigned char *)observation;
-    for (int i = 0; i < OBS_SIZE; ++i)
-        out[i] = (float)bytes[i] * (1.0f / 255.0f);
+static inline float action_sum(const Log *log, const int *types, int count) {
+    float total = 0.0f;
+    for (int i = 0; i < count; ++i) total += log->action_counts[types[i]];
+    return total;
 }
 
-static void balatro_mask_range(unsigned char *mask, int offset, int count) {
-    for (int i = 0; i < count; ++i) mask[offset + i] = 1;
+static inline void disable_move_actions(LegalMasks *legal) {
+    static const int move_actions[] = {
+        ACTION_SWAP_HAND_LEFT, ACTION_SWAP_HAND_RIGHT,
+        ACTION_SORT_HAND_RANK, ACTION_SORT_HAND_SUIT,
+        ACTION_SWAP_JOKERS_LEFT, ACTION_SWAP_JOKERS_RIGHT,
+    };
+    for (unsigned int i = 0; i < sizeof(move_actions) / sizeof(move_actions[0]); ++i) {
+        legal->action_type[move_actions[i]] = 0;
+        legal->primary[move_actions[i]] = 0;
+    }
 }
 
-static void balatro_puffer_mask(const BalatroObservation *observation, unsigned char *mask) {
+static inline void store_u64(unsigned char *out, uint64_t value) {
+    memcpy(out, &value, sizeof(value));
+}
+
+static inline void store_selection(
+        unsigned char *mask, int entry,
+        const ObservedSelection *selection) {
+    if (!selection || !selection->valid || entry < 0) return;
+    unsigned char *out = mask + POLICY_SELECTION_OFFSET +
+        entry * POLICY_SELECTION_BYTES;
+    out[0] = selection->minimum;
+    out[1] = selection->maximum;
+    store_u64(out + 2, selection->allowed_hand);
+    store_u64(out + 10, selection->required_hand);
+}
+
+static void puffer_mask(const LegalMasks *legal, unsigned char *mask) {
     memset(mask, 0, ACTION_MASK_SIZE);
-    int type_offset = 0;
-    int primary_offset = type_offset + 23;
-    int count_offset = primary_offset + 64;
-    int selection_offset = count_offset + 6;
-    int reorder_offset = selection_offset + 5 * 64;
-    int any_type = 0;
-    int any_selection = 0;
-    int any_reorder = 0;
 
-    for (int type = 0; type < BALATRO_ACTION_TYPE_COUNT; ++type) {
-        if (!observation->legal.action_type[type]) continue;
-        mask[type_offset + type] = 1;
-        any_type = 1;
-        uint64_t primary = observation->legal.primary[type];
-        for (int slot = 0; slot < 64; ++slot)
-            if (primary & (UINT64_C(1) << slot)) mask[primary_offset + slot] = 1;
+    for (int type = 0; type < ACTION_TYPE_COUNT; ++type) {
+        if (!legal->action_type[type]) continue;
+        mask[type] = 1;
+        store_u64(mask + POLICY_PRIMARY_OFFSET +
+            type * POLICY_PRIMARY_BYTES, legal->primary[type]);
     }
 
-    const BalatroObservedSelection *families[BALATRO_OBS_MAX_CONSUMABLES +
-        BALATRO_OBS_MAX_SHOP_MAIN + BALATRO_OBS_MAX_PACK_CARDS + 2];
-    int family_count = 0;
-    families[family_count++] = &observation->legal.play;
-    families[family_count++] = &observation->legal.discard;
-    for (int i = 0; i < BALATRO_OBS_MAX_CONSUMABLES; ++i)
-        families[family_count++] = &observation->legal.consumable[i];
-    for (int i = 0; i < BALATRO_OBS_MAX_SHOP_MAIN; ++i)
-        families[family_count++] = &observation->legal.shop[i];
-    for (int i = 0; i < BALATRO_OBS_MAX_PACK_CARDS; ++i)
-        families[family_count++] = &observation->legal.pack[i];
-    for (int i = 0; i < family_count; ++i) {
-        const BalatroObservedSelection *selection = families[i];
-        if (!selection->valid) continue;
-        any_selection = 1;
-        for (int card = 0; card < 64; ++card)
-            if (selection->allowed_hand & (UINT64_C(1) << card))
-                for (int position = 0; position < 5; ++position)
-                    mask[selection_offset + position * 64 + card] = 1;
-    }
-    for (int i = 0; i < BALATRO_OBS_MAX_HAND; ++i)
-        if (observation->legal.hand_reorder_destination[i]) {
-            any_reorder = 1;
-            for (int destination = 0; destination < 64; ++destination)
-                if (observation->legal.hand_reorder_destination[i] &
-                    (UINT64_C(1) << destination))
-                    mask[reorder_offset + destination] = 1;
-        }
-    for (int i = 0; i < BALATRO_OBS_MAX_JOKERS; ++i)
-        if (observation->legal.joker_reorder_destination[i]) {
-            any_reorder = 1;
-            for (int destination = 0; destination < 64; ++destination)
-                if (observation->legal.joker_reorder_destination[i] &
-                    (UINT64_C(1) << destination))
-                    mask[reorder_offset + destination] = 1;
-        }
-
-    /* Every categorical head must have at least one finite option. The
-       structured validator remains authoritative for cross-head combinations. */
-    if (!any_type) mask[type_offset] = 1;
-    int any_primary = 0;
-    for (int i = 0; i < 64; ++i) any_primary |= mask[primary_offset + i] != 0;
-    if (!any_primary) mask[primary_offset] = 1;
-    if (any_selection) balatro_mask_range(mask, count_offset, 6);
-    else mask[count_offset] = 1;
-    if (!any_selection)
-        for (int position = 0; position < 5; ++position) mask[selection_offset + position * 64] = 1;
-    if (!any_reorder) mask[reorder_offset] = 1;
+    store_selection(mask,
+        policy_selection_entry(ACTION_PLAY_HAND, 0),
+        &legal->play);
+    store_selection(mask,
+        policy_selection_entry(ACTION_DISCARD, 0),
+        &legal->discard);
+    for (int i = 0; i < OBS_MAX_CONSUMABLES; ++i)
+        store_selection(mask,
+            policy_selection_entry(ACTION_USE_CONSUMABLE, i),
+            &legal->consumable[i]);
+    for (int i = 0; i < OBS_MAX_SHOP_MAIN; ++i)
+        store_selection(mask,
+            policy_selection_entry(ACTION_BUY_AND_USE, i),
+            &legal->shop[i]);
+    for (int i = 0; i < OBS_MAX_PACK_CARDS; ++i)
+        store_selection(mask,
+            policy_selection_entry(ACTION_PICK_PACK_CARD, i),
+            &legal->pack[i]);
 }
 
-static int balatro_puffer_observe(Env *env) {
-    BalatroObservation observation;
-    int error = balatro_observe(&env->state, &observation);
-    float *out = (float *)env->agents[0].observations;
-    memset(out, 0, OBS_SIZE * sizeof(float));
-    if (error == BALATRO_OK) {
-        balatro_encode_observation(&observation, out);
+static int puffer_observe(Env *env) {
+    obs_t *out = (obs_t *)env->agents[0].observations;
+    int error = observe(&env->state, (Observation *)out, &env->legal_masks);
+    if (error == OK) {
+        disable_move_actions(&env->legal_masks);
         if (env->agents[0].action_mask)
-            balatro_puffer_mask(&observation, env->agents[0].action_mask);
+            puffer_mask(&env->legal_masks, env->agents[0].action_mask);
+    } else {
+        memset(out, 0, OBS_SIZE * sizeof(*out));
     }
-    env->legal_count = 0;
     return error;
 }
+
+static inline const ObservedSelection *cached_selection(
+        const LegalMasks *legal, uint8_t type, uint8_t primary) {
+    if (type == ACTION_PLAY_HAND) return &legal->play;
+    if (type == ACTION_DISCARD) return &legal->discard;
+    if (type == ACTION_USE_CONSUMABLE && primary < OBS_MAX_CONSUMABLES)
+        return &legal->consumable[primary];
+    if (type == ACTION_BUY_AND_USE && primary < OBS_MAX_SHOP_MAIN)
+        return &legal->shop[primary];
+    if (type == ACTION_PICK_PACK_CARD && primary < OBS_MAX_PACK_CARDS)
+        return &legal->pack[primary];
+    return NULL;
+}
+
+static inline int cached_action_is_legal(const Env *env,
+        const Action *policy) {
+    if (!policy || policy->type >= ACTION_TYPE_COUNT ||
+        policy->selection_count > MAX_SELECTION)
+        return 0;
+    uint8_t type = policy->type;
+    uint8_t primary = (uint8_t)policy->primary;
+    int has_primary = type >= ACTION_BUY_CARD &&
+                      type <= ACTION_SWAP_HAND_RIGHT;
+    if (!has_primary && primary != 0) return 0;
+    uint8_t observed_primary = has_primary ? primary : 0;
+    const LegalMasks *legal = &env->legal_masks;
+    if (!legal->action_type[type] || observed_primary >= 64 ||
+        !(legal->primary[type] & (UINT64_C(1) << observed_primary)))
+        return 0;
+
+    const ObservedSelection *selection =
+        cached_selection(legal, type, observed_primary);
+    if (!selection || !selection->valid)
+        return policy->selection_count == 0;
+    if (policy->selection_count < selection->minimum ||
+        policy->selection_count > selection->maximum)
+        return 0;
+
+    uint64_t selected = 0;
+    for (uint8_t i = 0; i < policy->selection_count; ++i) {
+        uint8_t index = policy->selection[i];
+        if (index >= MAX_HAND || index >= env->state.hand_count ||
+            (i && policy->selection[i - 1] >= index))
+            return 0;
+        selected |= UINT64_C(1) << index;
+    }
+    return selected && !(selected & ~selection->allowed_hand) &&
+           (selected & selection->required_hand) == selection->required_hand;
+}
+
+static inline void canonicalize_policy_action(
+        const Env *env, Action *policy) {
+    if (!policy || policy->type >= ACTION_TYPE_COUNT) return;
+    int has_primary = policy->type >= ACTION_BUY_CARD &&
+                      policy->type <= ACTION_SWAP_HAND_RIGHT;
+    if (!has_primary) {
+        policy->primary = 0;
+    } else {
+        uint64_t primary = env->legal_masks.primary[policy->type];
+        if (!primary) return;
+        if (policy->primary >= 64 || !(primary & (UINT64_C(1) << policy->primary)))
+            policy->primary = (uint8_t)__builtin_ctzll(primary);
+    }
+    const ObservedSelection *selection = cached_selection(
+        &env->legal_masks, policy->type, policy->primary);
+    if (!selection || !selection->valid) {
+        policy->selection_count = 0;
+        return;
+    }
+
+    uint8_t target = policy->selection_count;
+    if (target < selection->minimum) target = selection->minimum;
+    if (target > selection->maximum) target = selection->maximum;
+    uint8_t required_count = (uint8_t)__builtin_popcountll(selection->required_hand);
+    if (target < required_count) target = required_count;
+    uint64_t chosen = selection->required_hand;
+    for (uint8_t i = 0; i < policy->selection_count &&
+                        __builtin_popcountll(chosen) < target; ++i) {
+        uint8_t index = policy->selection[i];
+        if (index >= env->state.hand_count || index >= MAX_HAND) continue;
+        uint64_t bit = UINT64_C(1) << index;
+        if (selection->allowed_hand & bit) chosen |= bit;
+    }
+    uint64_t allowed = selection->allowed_hand & ~chosen;
+    while (__builtin_popcountll(chosen) < target && allowed) {
+        int index = __builtin_ctzll(allowed);
+        chosen |= UINT64_C(1) << index;
+        allowed &= allowed - 1;
+    }
+    policy->selection_count = 0;
+    for (int index = 0; index < MAX_HAND &&
+                        policy->selection_count < target; ++index) {
+        if (chosen & (UINT64_C(1) << index))
+            policy->selection[policy->selection_count++] = (uint8_t)index;
+    }
+}
+
 
 void puf_init(Env *env, Dict *kwargs) {
     env->num_agents = 1;
@@ -147,14 +255,18 @@ void puf_init(Env *env, Dict *kwargs) {
     env->boundary_reached = 0;
     env->episode_reward = 0.0f;
     env->agents[0].policy = 0;
-    balatro_default_config(&env->config);
-    /* Training defaults to the progress potential, while the same wrapper
-       can run the ABI's sparse win-only objective for an apples-to-apples
-       baseline.  Optional env.* overrides are useful for curriculum runs. */
+    default_config(&env->config);
     DictItem *shaped = dict_find(kwargs, "shaped_reward");
     DictItem *win_ante = dict_find(kwargs, "win_ante");
     DictItem *max_episode_steps = dict_find(kwargs, "max_episode_steps");
+    DictItem *invalid_action_reward = dict_find(kwargs, "invalid_action_reward");
+    DictItem *fast_rng = dict_find(kwargs, "fast_rng");
     env->config.shaped_reward = shaped ? (shaped->value != 0.0) : 1;
+    /* Fast splitmix RNG by default (training). Set fast_rng=0 for the
+       bit-compatible reference-game RNG used by the differential tools. */
+    env->config.fast_rng = fast_rng ? (fast_rng->value != 0.0) : 1;
+    env->invalid_action_reward = invalid_action_reward
+        ? (float)invalid_action_reward->value : INVALID_ACTION_REWARD;
     env->max_episode_steps = 0;
     if (max_episode_steps && max_episode_steps->value > 0.0) {
         double value = max_episode_steps->value;
@@ -171,27 +283,49 @@ void puf_init(Env *env, Dict *kwargs) {
 
 void puf_reset(Env *env) {
     uint64_t seed = ((uint64_t)rand_r(&env->rng) << 32) | rand_r(&env->rng);
-    balatro_init(&env->state, &env->config, seed);
+    init(&env->state, &env->config, seed);
     env->agents[0].rewards[0] = 0.0f;
     env->agents[0].terminals[0] = 0.0f;
     env->boundary_reached = 0;
     env->episode_reward = 0.0f;
     env->episode_steps = 0;
-    balatro_puffer_observe(env);
+    puffer_observe(env);
 }
 
-static int balatro_episode_timed_out(const Env *env) {
+static int episode_timed_out(const Env *env) {
     return env->max_episode_steps > 0 && env->episode_steps >= env->max_episode_steps;
 }
 
-static void balatro_truncate_episode(Env *env) {
-    float transition_reward = env->agents[0].rewards[0] + BALATRO_TIMEOUT_REWARD;
+static float episode_perf(const Env *env) {
+    const State *state = &env->state;
+    const double target_antes = state->config.win_ante ? state->config.win_ante : 1.0;
+    const double completed_antes = state->ante > 0 ? (double)state->ante - 1.0 : 0.0;
+    double perf = completed_antes / target_antes;
+
+    double blind_fraction = 0.0;
+    if ((state->phase == PHASE_SELECTING_HAND || state->phase == PHASE_GAME_OVER) &&
+        state->blind_chips > 0.0) {
+        blind_fraction = state->chips / state->blind_chips;
+        if (!(blind_fraction >= 0.0)) blind_fraction = 0.0;
+        if (blind_fraction > 1.0) blind_fraction = 1.0;
+    }
+    double blind_index = state->blind_on_deck < 3 ? (double)state->blind_on_deck : 3.0;
+    perf += (blind_index + blind_fraction) / (3.0 * target_antes);
+    if (!(perf >= 0.0)) perf = 0.0;
+    if (perf > 1.0) perf = 1.0;
+    return (float)perf;
+}
+
+static void truncate_episode(Env *env) {
+    float transition_reward = env->agents[0].rewards[0] + TIMEOUT_REWARD;
     env->boundary_reached = 1;
     env->agents[0].terminals[0] = 1.0f;
     env->log.truncations += 1.0f;
     env->log.n += 1.0f;
     env->agents[0].rewards[0] = transition_reward;
-    env->episode_reward += BALATRO_TIMEOUT_REWARD;
+    env->episode_reward += TIMEOUT_REWARD;
+    env->log.score += env->episode_reward;
+    env->log.perf += episode_perf(env);
     env->log.reward += env->episode_reward;
     puf_reset(env);
     /* puf_reset clears the reward slot; restore the boundary transition's
@@ -201,47 +335,64 @@ static void balatro_truncate_episode(Env *env) {
 }
 
 void puf_step(Env *env) {
-    BalatroPolicyAction policy = {0};
+    Action policy = {0};
     policy.type = (uint8_t)env->agents[0].actions[0];
-    policy.primary = (uint16_t)env->agents[0].actions[1];
+    policy.primary = (uint8_t)env->agents[0].actions[1];
     policy.selection_count = (uint8_t)env->agents[0].actions[2];
-    if (policy.selection_count > BALATRO_MAX_SELECTION)
-        policy.selection_count = BALATRO_MAX_SELECTION;
-    for (int i = 0; i < BALATRO_MAX_SELECTION; ++i)
-        policy.selection[i] = (uint16_t)env->agents[0].actions[3 + i];
-    policy.reorder_destination = (uint16_t)env->agents[0].actions[8];
+    if (policy.selection_count > MAX_SELECTION)
+        policy.selection_count = MAX_SELECTION;
+    for (int i = 0; i < MAX_SELECTION; ++i)
+        policy.selection[i] = (uint8_t)env->agents[0].actions[3 + i];
+    canonicalize_policy_action(env, &policy);
     env->agents[0].rewards[0] = 0.0f;
     env->agents[0].terminals[0] = 0.0f;
     if (env->episode_steps < UINT32_MAX) env->episode_steps++;
-    BalatroStepResult result;
-    BalatroObservation observation;
-    int error = balatro_step_observe(&env->state, &policy, &result, &observation);
-    if (error != BALATRO_OK) {
+    if (policy.type < ACTION_TYPE_COUNT)
+        env->log.action_counts[policy.type] += 1.0f;
+    StepResult result = {0};
+    int error;
+    if (!cached_action_is_legal(env, &policy)) {
         env->log.invalid_actions += 1.0f;
-        env->agents[0].rewards[0] = BALATRO_INVALID_ACTION_REWARD;
-        env->episode_reward += BALATRO_INVALID_ACTION_REWARD;
-        if (balatro_episode_timed_out(env)) balatro_truncate_episode(env);
-        else balatro_puffer_observe(env);
+        env->agents[0].rewards[0] = env->invalid_action_reward;
+        env->episode_reward += env->invalid_action_reward;
+        if (episode_timed_out(env)) truncate_episode(env);
         return;
     }
+    error = apply_step(&env->state, &policy, &env->legal_masks, &result);
+    if (error != OK) {
+        env->log.invalid_actions += 1.0f;
+        env->agents[0].rewards[0] = env->invalid_action_reward;
+        env->episode_reward += env->invalid_action_reward;
+        if (episode_timed_out(env)) truncate_episode(env);
+        else if (error != ERR_ACTION) {
+            /* step validates before mutating the state. An invalid action
+               therefore leaves the cached observation and legal mask current. */
+            puffer_observe(env);
+        }
+        return;
+    }
+    /* Do not transform or replace result.reward here: it is Simulatro's
+       shaped transition reward. */
     env->agents[0].rewards[0] = result.reward;
     env->episode_reward += result.reward;
     if (result.terminal) {
-        float transition_reward = env->agents[0].rewards[0];
         env->boundary_reached = 1;
         env->agents[0].terminals[0] = 1.0f;
-        env->log.score += result.won;
+        /* Puffer's score is the episodic return used for sweep ranking.
+           Keep wins separate as a sparse evaluation metric. */
+        env->log.score += env->episode_reward;
         env->log.wins += result.won;
+        env->log.perf += episode_perf(env);
         env->log.ante += result.ante;
         env->log.n += 1.0f;
-		env->log.reward += env->episode_reward;
+        env->log.reward += env->episode_reward;
         puf_reset(env);
-        env->agents[0].rewards[0] = transition_reward;
+        env->agents[0].rewards[0] = result.reward;
         env->agents[0].terminals[0] = 1.0f;
-    } else if (balatro_episode_timed_out(env)) {
-        balatro_truncate_episode(env);
+    } else if (episode_timed_out(env)) {
+        truncate_episode(env);
     } else {
-        balatro_puffer_observe(env);
+        puffer_observe(env);
     }
 }
 
@@ -250,11 +401,57 @@ void puf_close(Env *env) { (void)env; }
 
 void puf_log(Log *log, Dict *out) {
     dict_set(out, "score", log->score);
+    dict_set(out, "perf", log->perf);
     dict_set(out, "wins", log->wins);
     dict_set(out, "ante", log->ante);
-    dict_set(out, "invalid_actions", log->invalid_actions);
+	dict_set(out, "invalid_actions", log->invalid_actions);
 	dict_set(out, "truncations", log->truncations);
 	dict_set(out, "reward", log->reward);
+
+    static const int play[] = {ACTION_PLAY_HAND};
+    static const int discard[] = {ACTION_DISCARD};
+    static const int card_move[] = {
+        ACTION_SWAP_HAND_LEFT, ACTION_SWAP_HAND_RIGHT,
+        ACTION_SORT_HAND_RANK, ACTION_SORT_HAND_SUIT,
+    };
+    static const int joker_move[] = {
+        ACTION_SWAP_JOKERS_LEFT, ACTION_SWAP_JOKERS_RIGHT,
+    };
+    static const int consumable[] = {
+        ACTION_SELL_CONSUMABLE, ACTION_USE_CONSUMABLE,
+    };
+    static const int shop[] = {
+        ACTION_REROLL, ACTION_BUY_CARD,
+        ACTION_REDEEM_VOUCHER, ACTION_OPEN_BOOSTER,
+        ACTION_BUY_AND_USE,
+    };
+    static const int pack[] = {
+        ACTION_SKIP_PACK, ACTION_PICK_PACK_CARD,
+    };
+    static const int blind[] = {
+        ACTION_SELECT_BLIND, ACTION_SKIP_BLIND,
+        ACTION_REROLL_BOSS,
+    };
+    static const int round[] = {
+        ACTION_CASH_OUT, ACTION_NEXT_ROUND,
+    };
+    static const int joker[] = {ACTION_SELL_JOKER};
+    /* These grouped counters are emitted first so they appear beside ante,
+       invalid_actions, reward, and truncations in Puffer's User Stats panel. */
+    dict_set(out, "play_actions", action_sum(log, play, 1));
+    dict_set(out, "discard_actions", action_sum(log, discard, 1));
+    dict_set(out, "card_move_actions", action_sum(log, card_move, 4));
+    dict_set(out, "joker_move_actions", action_sum(log, joker_move, 2));
+    dict_set(out, "consumable_actions", action_sum(log, consumable, 2));
+    dict_set(out, "shop_actions", action_sum(log, shop, 5));
+    dict_set(out, "pack_actions", action_sum(log, pack, 2));
+    dict_set(out, "blind_actions", action_sum(log, blind, 3));
+    dict_set(out, "round_actions", action_sum(log, round, 2));
+    dict_set(out, "joker_actions", action_sum(log, joker, 1));
+
+    /* Keep per-action detail in the environment log as well. */
+    for (int i = 0; i < ACTION_TYPE_COUNT; ++i)
+        dict_set(out, action_log_names[i], log->action_counts[i]);
 }
 
 #endif

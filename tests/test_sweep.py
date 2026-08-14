@@ -59,7 +59,6 @@ def test_sweep(args):
             expansion_rate = 1.0,
             use_gpu=True,
             prune_pareto=True,
-            # ucb_beta=0.1,
         )
     else:
         raise ValueError(f'Invalid sweep method {method} (random/pareto_genetic/protein)')

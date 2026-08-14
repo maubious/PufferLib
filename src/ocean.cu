@@ -24,14 +24,24 @@ void puf_normal_init(Prec* dst, float std, ulong seed, cudaStream_t stream) {
 }
 
 #ifdef USE_ROCM
+#ifndef PUFFER_PACKED_OBS
 #include "../ocean/nmmo3/nmmo3.hip"
 #include "../ocean/minimal/minimal.hip"
+#endif
+#ifdef PUFFER_BALATRO
+#include "../ocean/balatro/balatro.hip"
+#endif
 #ifdef PUFFER_NETHACK
 #include "../ocean/nethack/nethack.hip"
 #endif
 #else
+#ifndef PUFFER_PACKED_OBS
 #include "../ocean/nmmo3/nmmo3.cu"
 #include "../ocean/minimal/minimal.cu"
+#endif
+#ifdef PUFFER_BALATRO
+#include "../ocean/balatro/balatro.cu"
+#endif
 #ifdef PUFFER_NETHACK
 #include "../ocean/nethack/nethack.cu"
 #endif
@@ -44,6 +54,7 @@ static void create_custom_encoder(const char* env_name, Encoder* enc) {
         return;
     }
 #endif
+#ifndef PUFFER_PACKED_OBS
     if (strcmp(env_name, "nmmo3") == 0) {
         create_nmmo3_encoder(enc);
         return;
@@ -52,9 +63,20 @@ static void create_custom_encoder(const char* env_name, Encoder* enc) {
         create_minimal_encoder(enc);
         return;
     }
+#endif
+#ifdef PUFFER_BALATRO
+    if (strcmp(env_name, "balatro") == 0) {
+        create_balatro_encoder(enc);
+        return;
+    }
+#endif
 }
 
 static void create_custom_decoder(const char* env_name, Decoder* dec) {
+#ifdef POLICY_MASK_SIZE
+    dec->ar = true;
+    return;
+#endif
 #ifdef PUFFER_NETHACK
     if (strcmp(env_name, "nethack") == 0) {
         create_nethack_decoder(dec);

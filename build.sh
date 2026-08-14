@@ -295,7 +295,7 @@ hipify_python.hipify(
     show_detailed=False,
     is_pytorch_extension=True,
 )
-for env in ("nmmo3", "minimal", "nethack"):
+for env in ("nmmo3", "minimal", "balatro", "nethack"):
     hipify_python.hipify(
         project_directory=f"$(pwd)/ocean/{env}",
         output_directory=f"$(pwd)/$HIPIFY_ROOT/ocean/{env}",
@@ -360,6 +360,15 @@ if ! grep -q 'typedef[[:space:]].*obs_t' "$ENV_HEADER" 2>/dev/null; then
 fi
 
 ENV_COMPILE_FLAGS=(-DENV_HEADER=\"$ENV_HEADER\")
+# GPU env is compile-time exclusive (not a runtime dual path with CPU workers).
+if [ "$USE_GPU_ENV" = "1" ]; then
+    GPU_ENV_HEADER="$SRC_DIR/$ENV.cu"
+    if [ ! -f "$GPU_ENV_HEADER" ]; then
+        echo "Error: --gpu requires $GPU_ENV_HEADER"
+        exit 1
+    fi
+    ENV_COMPILE_FLAGS+=(-DPUFFER_GPU_ENV -DGPU_ENV_HEADER=\"$GPU_ENV_HEADER\")
+fi
 
 MODE=${MODE:-native}
 
@@ -369,7 +378,7 @@ NVCC_NARROW=(-Xcompiler=-Wno-narrowing --diag-suppress=2361)
 if [ "$MODE" = "native" ]; then
     if [ "$BACKEND" = "rocm" ]; then
         echo "Compiling native ROCm train/eval binary..."
-        "$HIPCC" "${ROCM_ARCH_FLAGS[@]}" -std=c++17 \
+        "$HIPCC" "${ROCM_ARCH_FLAGS[@]}" -std=c++17 -w \
             -I. -I"$HIPIFY_DIR" -I$SRC_DIR -Ivendor -I$RAYLIB_NAME/include \
             "${INCLUDES[@]}" \
             "${ENV_COMPILE_FLAGS[@]}" \
