@@ -23,7 +23,8 @@ typedef Prec (*decoder_backward_fn)(void* weights, void* activations,
 typedef Prec (*network_forward_fn)(void* weights, Prec x,
     Prec state, void* activations, cudaStream_t stream);
 typedef Prec (*network_forward_train_fn)(void* weights, Prec x,
-    Prec state, Prec terminals, void* activations, cudaStream_t stream);
+    Prec state, Prec terminals, void* activations, int agent_off,
+    cudaStream_t stream);
 typedef Prec (*network_backward_fn)(void* weights,
     Prec grad, void* activations, cudaStream_t stream);
 
@@ -685,9 +686,12 @@ struct MinGRUWeights {
     Prec* weights;  // [num_layers]
 };
 
-Prec mingru_state_layer(MinGRUWeights* m, Prec& state, int i) {
-    long B = state.shape[1], H = state.shape[2];
-    return {.data = state.data + i * B * H, .shape = {B, H}};
+Prec mingru_state_layer(Prec& state, int layer, int agent_off, int B) {
+    long A = state.shape[1], H = state.shape[2];
+    return {
+        .data = state.data + ((long)layer * A + agent_off) * H,
+        .shape = {B, H},
+    };
 }
 
 void mingru_init_weights(void* w, ulong* seed, cudaStream_t stream) {
@@ -780,7 +784,7 @@ Prec mingru_forward(void* w, Prec x, Prec state,
     int B = state.shape[1];
     int H = state.shape[2];
     for (int i = 0; i < m->num_layers; i++) {
-        Prec state_i = mingru_state_layer(m, state, i);
+        Prec state_i = mingru_state_layer(state, i, 0, B);
         puf_mm(&x, &m->weights[i], &a->combined[i], stream);
         mingru_gate<<<grid_size(B*H), BLOCK_SIZE, 0, stream>>>(
             a->out.data, a->next_state.data,
@@ -792,12 +796,13 @@ Prec mingru_forward(void* w, Prec x, Prec state,
 }
 
 Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
-        void* activations, cudaStream_t stream) {
+        void* activations, int agent_off, cudaStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
+    int B = (int)x.shape[0];
     for (int i = 0; i < m->num_layers; i++) {
         puf_copy(&a->saved_inputs[i], &x, stream);
-        Prec state_i = mingru_state_layer(m, state, i);
+        Prec state_i = mingru_state_layer(state, i, agent_off, B);
         puf_mm(&x, &m->weights[i], &a->combined_bufs[i], stream);
         PrefixScan& scan = a->scan_bufs[i];
         scan.combined_ptr = a->combined_bufs[i].data;
@@ -864,18 +869,6 @@ Prec arch_forward(Arch* p, Weights& w, Activations& activations,
     return p->decoder.forward(w.decoder, activations.decoder, h, stream);
 }
 
-Prec arch_forward_train(Arch* p, Weights& w,
-        Activations& activations, PolicyObs x,
-        Prec state, Prec terminals, cudaStream_t stream) {
-    int B = x.shape[0], TT = x.shape[1];
-    Prec h = p->encoder.forward(w.encoder,
-        activations.encoder, *puf_squeeze(&x, 0), stream);
-    h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT),
-        state, terminals, activations.network, stream);
-    Prec dec_out = p->decoder.forward(
-        w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
-    return *puf_unsqueeze(&dec_out, 0, B, TT);
-}
 
 void arch_backward(Arch* p, Weights& w,
         Activations& activations, Float grad_logits,
@@ -1323,264 +1316,32 @@ void normuon_step(NorMuon* m, Float weights, Prec grads,
         weights.data, grads.data, m->lr, 0.0f, n_grad);
 }
 
-// Train data layout is transposed to (B, T) from rollouts layout (T, B)
-// This allows env workers to collect data with contiguous writes and
-// training to perform several (though not all) ops in contiguous memory
+// Train layout is (B, T). Views are sliced each mb; scratch is allocated.
 struct TrainGraph {
-    Prec mb_state;       // (layers, B, hidden)
-    PolicyObs mb_obs;    // (B, T, packed bytes or precision values)
-    Prec mb_actions;     // (B, T, num_atns)
-    Prec mb_logprobs;    // (B, T)
-    Prec mb_terminals;   // (B, T), resets recurrent state before timestep t
-    Prec mb_advantages;  // ...
-    Prec mb_values;
-    Prec mb_returns;
-    Prec mb_ratio;
-    Prec mb_newvalue;
-    Prec mb_prio;        // (B,)
-    Prec mb_action_mask; // (B, T, mask_size); always allocated
+    Prec mb_state;       // view into train_state (L, A, H); read with agent_off
+    PolicyObs mb_obs;    // view (B, T, packed bytes or precision values)
+    Prec mb_actions;     // view (B, T, num_atns)
+    Prec mb_logprobs;    // view (B, T)
+    Prec mb_terminals;   // view (B, T)
+    Prec mb_rewards;     // view (B, T)
+    Prec mb_advantages;  // scratch
+    Prec mb_values;      // view: frozen rollout V (vf-clip)
+    Prec mb_returns;     // view: aliases mb_gae_v after GAE (V+A)
+    Prec mb_action_mask; // view (B, T, mask_size)
+    Prec mb_imp;         // scratch
+    Prec mb_gae_v;       // scratch: live V in, overwritten with returns
 };
 
-void register_train_buffers(TrainGraph& bufs, Allocator* alloc,
-        int B, int T, int input_size, int hidden_size,
-        int num_atns, int num_layers, int mask_size) {
+void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T) {
     bufs = (TrainGraph){
-        .mb_state =         {.shape = {num_layers, B, hidden_size}},
-        .mb_obs =           {.shape = {B, T, input_size}},
-        .mb_actions =       {.shape = {B, T, num_atns}},
-        .mb_logprobs =      {.shape = {B, T}},
-        .mb_terminals =     {.shape = {B, T}},
         .mb_advantages =    {.shape = {B, T}},
-        .mb_values =        {.shape = {B, T}},
-        .mb_returns =       {.shape = {B, T}},
-        .mb_ratio =         {.shape = {B, T}},
-        .mb_newvalue =      {.shape = {B, T}},
-        .mb_prio =          {.shape = {B}},
-        .mb_action_mask =   {.shape = {B, T, mask_size}},
+        .mb_imp =           {.shape = {B, T}},
+        .mb_gae_v =         {.shape = {B, T}},
     };
-    alloc_register(alloc, &bufs.mb_obs);
-    alloc_register(alloc, &bufs.mb_state);
-    alloc_register(alloc, &bufs.mb_actions);
-    alloc_register(alloc, &bufs.mb_logprobs);
-    alloc_register(alloc, &bufs.mb_terminals);
     alloc_register(alloc, &bufs.mb_advantages);
-    alloc_register(alloc, &bufs.mb_prio);
-    alloc_register(alloc, &bufs.mb_values);
-    alloc_register(alloc, &bufs.mb_returns);
-    alloc_register(alloc, &bufs.mb_ratio);
-    alloc_register(alloc, &bufs.mb_newvalue);
-    alloc_register(alloc, &bufs.mb_action_mask);
+    alloc_register(alloc, &bufs.mb_imp);
+    alloc_register(alloc, &bufs.mb_gae_v);
 }
-
-// Prioritized replay over single-epoch data. These kernels are
-// the least cleaned because we will likely have a better method in 5.0.
-struct PrioBuffers {
-    Float prio_probs, cdf, mb_prio;
-    Int idx;
-};
-
-void register_prio_buffers(PrioBuffers& bufs, Allocator* alloc,
-        int B, int minibatch_segments) {
-    bufs = (PrioBuffers){
-        .prio_probs = {.shape = {B}},
-        .cdf = {.shape = {B}},
-        .mb_prio = {.shape = {minibatch_segments}},
-        .idx = {.shape = {minibatch_segments}},
-    };
-    alloc_register(alloc, &bufs.prio_probs);
-    alloc_register(alloc, &bufs.cdf);
-    alloc_register(alloc, &bufs.idx);
-    alloc_register(alloc, &bufs.mb_prio);
-}
-
-#define PRIO_WARP_SIZE 32
-#ifdef USE_ROCM
-#define PRIO_FULL_MASK 0xffffffffffffffffULL
-#else
-#define PRIO_FULL_MASK 0xffffffffU
-#endif
-// Prio block for normalize/cdf/sample; 512 beat 256 on B>=8k in microbench.
-#define PRIO_BLOCK_SIZE 512
-#define PRIO_NUM_WARPS (PRIO_BLOCK_SIZE / PRIO_WARP_SIZE)
-
-// Per-trajectory |adv| reduction → unnormalized priority weight.
-__global__ void prio_reduce(const precision_t* __restrict__ advantages,
-        float* prio_weights, float prio_alpha, int stride) {
-    int row = blockIdx.x;
-    int tx = threadIdx.x;
-    int offset = row * stride;
-
-    float local_sum = 0.0f;
-    for (int t = tx; t < stride; t += blockDim.x) {
-        local_sum += fabsf(to_float(advantages[offset + t]));
-    }
-
-    for (int s = 16; s >= 1; s /= 2) {
-        local_sum += __shfl_down_sync(PRIO_FULL_MASK, local_sum, s, 32);
-    }
-    if (tx == 0) {
-        float pw = __powf(local_sum, prio_alpha);
-        if (isnan(pw) || isinf(pw)) {
-            pw = 0.0f;
-        }
-        prio_weights[row] = pw;
-    }
-}
-
-// Normalize prio_weights in place, then inclusive prefix sum → cdf.
-// Single-block: sum → scale → chunked scan (same geometry as old normalize+cdf).
-__global__ void prio_normalize_cdf(float* __restrict__ prio_weights,
-        float* __restrict__ cdf, int B) {
-    __shared__ float shmem[PRIO_BLOCK_SIZE / 32];
-    __shared__ float block_sum;
-    __shared__ float warp_tot[PRIO_BLOCK_SIZE / 32];
-    __shared__ float warp_exc[PRIO_BLOCK_SIZE / 32];
-
-    int tid = threadIdx.x;
-    int lane = tid % 32;
-    int warp_id = tid / 32;
-    const float eps = 1e-6f;
-
-    float local_sum = 0.0f;
-    for (int t = tid; t < B; t += blockDim.x) {
-        local_sum += prio_weights[t];
-    }
-    for (int s = 16; s >= 1; s /= 2) {
-        local_sum += __shfl_down_sync(PRIO_FULL_MASK, local_sum, s, 32);
-    }
-    if (lane == 0) {
-        shmem[warp_id] = local_sum;
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
-        float val = (lane < PRIO_BLOCK_SIZE / 32) ? shmem[lane] : 0.0f;
-        for (int s = PRIO_BLOCK_SIZE / 64; s >= 1; s /= 2) {
-            val += __shfl_down_sync(PRIO_FULL_MASK, val, s, 32);
-        }
-        if (tid == 0) {
-            block_sum = val + eps;
-        }
-    }
-    __syncthreads();
-
-    for (int t = tid; t < B; t += blockDim.x) {
-        prio_weights[t] = (prio_weights[t] + eps) / block_sum;
-    }
-    __syncthreads();
-
-    // Chunked inclusive scan into cdf
-    const int chunk = (B + blockDim.x - 1) / blockDim.x;
-    const int start = tid * chunk;
-    const int end = min(start + chunk, B);
-
-    float run = 0.0f;
-    for (int i = start; i < end; i++) {
-        run += prio_weights[i];
-        cdf[i] = run;
-    }
-    float my_total = (start < B) ? run : 0.0f;
-
-    float incl = my_total;
-    #pragma unroll
-    for (int off = 1; off < 32; off <<= 1) {
-        float n = __shfl_up_sync(PRIO_FULL_MASK, incl, off, 32);
-        if (lane >= off) {
-            incl += n;
-        }
-    }
-    float warp_exclusive = incl - my_total;
-    if (lane == 31) {
-        warp_tot[warp_id] = incl;
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
-        float w = (lane < PRIO_BLOCK_SIZE / 32) ? warp_tot[lane] : 0.0f;
-        float wins = w;
-        #pragma unroll
-        for (int off = 1; off < 32; off <<= 1) {
-            float n = __shfl_up_sync(PRIO_FULL_MASK, wins, off, 32);
-            if (lane >= off) {
-                wins += n;
-            }
-        }
-        if (lane < PRIO_BLOCK_SIZE / 32) {
-            warp_exc[lane] = wins - w;
-        }
-    }
-    __syncthreads();
-
-    float exclusive = warp_exclusive + warp_exc[warp_id];
-    if (exclusive != 0.0f) {
-        for (int i = start; i < end; i++) {
-            cdf[i] += exclusive;
-        }
-    }
-}
-
-// Multinomial sample + importance weights. RNG offset bumped in a follow-up
-// <<<1,1>>> so multi-block loads of *offset_ptr stay race-free.
-__global__ void prio_sample(int* __restrict__ out_idx,
-        float* __restrict__ mb_prio, const float* __restrict__ cdf,
-        const float* __restrict__ prio_probs, int B, int num_samples,
-        int total_agents, float anneal_beta, uint64_t seed,
-        const int64_t* __restrict__ offset_ptr) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_samples) {
-        return;
-    }
-
-    uint64_t base_off = (uint64_t)(*offset_ptr);
-    curandStatePhilox4_32_10_t rng_state;
-    curand_init(seed, base_off + tid, 0, &rng_state);
-    float u = curand_uniform(&rng_state);
-
-    int lo = 0;
-    int hi = B - 1;
-    while (lo < hi) {
-        int mid = (lo + hi) / 2;
-        if (cdf[mid] < u) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    out_idx[tid] = lo;
-    float value = prio_probs[lo] * (float)total_agents;
-    mb_prio[tid] = __powf(value, -anneal_beta);
-}
-
-__global__ void prio_advance_rng(int64_t* __restrict__ offset_ptr, int64_t delta) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        *offset_ptr += delta;
-    }
-}
-
-// Build per-trajectory prio probs + CDF from advantages. Independent of the
-// minibatch sample — call once per train_impl, not once per minibatch.
-void prio_build_cdf_cuda(Prec& advantages, float prio_alpha,
-        PrioBuffers& bufs, cudaStream_t stream) {
-    int B = advantages.shape[0];
-    int T = advantages.shape[1];
-    prio_reduce<<<B, 32, 0, stream>>>(
-        advantages.data, bufs.prio_probs.data, prio_alpha, T);
-    prio_normalize_cdf<<<1, PRIO_BLOCK_SIZE, 0, stream>>>(
-        bufs.prio_probs.data, bufs.cdf.data, B);
-}
-
-// Draw a minibatch index set from a prebuilt CDF and importance weights.
-void prio_sample_cuda(float anneal_beta, PrioBuffers& bufs, ulong seed,
-        long* offset_ptr, cudaStream_t stream) {
-    int B = (int)bufs.cdf.shape[0];
-    int N = (int)bufs.idx.shape[0];
-    int blocks = (N + PRIO_BLOCK_SIZE - 1) / PRIO_BLOCK_SIZE;
-    prio_sample<<<blocks, PRIO_BLOCK_SIZE, 0, stream>>>(
-        bufs.idx.data, bufs.mb_prio.data, bufs.cdf.data, bufs.prio_probs.data,
-        B, N, B, anneal_beta, seed, offset_ptr);
-    prio_advance_rng<<<1, 1, 0, stream>>>(offset_ptr, N);
-}
-
 // TODO: test whether these finite/clamp guards improve continuous-control stability
 // or just hide bad logits/actions.
 __device__ __forceinline__ float finite_or_clamp(float x, float lo, float hi) {
@@ -1604,13 +1365,15 @@ __device__ __forceinline__ float safe_continuous_logstd(const precision_t* logst
 enum LossIdx {
     LOSS_PG = 0, LOSS_VF = 1, LOSS_ENT = 2, LOSS_TOTAL = 3,
     LOSS_OLD_APPROX_KL = 4, LOSS_APPROX_KL = 5, LOSS_CLIPFRAC = 6,
-    LOSS_N = 7, NUM_LOSSES = 8,
+    LOSS_IMP = 7,
+    LOSS_N = 8, NUM_LOSSES = 9,
 };
 
-// consumed-head gating is a experimental feature currently used by Nethack only
-// Must be initialized *before* CUDA graph capture: cudaMalloc/Memcpy are
-// illegal during stream capture, and the device pointer is baked into the
-// captured sample_logits / ppo_loss kernels as a by-value arg.
+#ifdef PUFFER_NETHACK
+#include "../ocean/nethack/nethack_policy.cu"
+#endif
+
+// consumed-head gating is a experimental feature currently used by Nethack only.
 #ifndef PUFFER_PROVIDES_HEAD_CONSUME_MAP
 extern "C" __attribute__((weak)) const signed char* env_head_consume_map(int*, int*);
 #endif
@@ -1678,12 +1441,10 @@ constexpr int PPO_MAX_HEAD_A = ppo_max_head_classes();
 // buffers + args are quite complex. We do the entire
 // forward + backwards pass for the full loss function in one kernel
 struct PPOGraphArgs {
-    precision_t* out_ratio;
-    precision_t* out_newvalue;
+    precision_t* imp;
     const precision_t* actions;
     const precision_t* old_logprobs;
     const precision_t* advantages;
-    const precision_t* prio;
     const precision_t* values;
     const precision_t* returns;
 };
@@ -1695,14 +1456,10 @@ struct PPOKernelArgs {
     const precision_t* logits;
     const precision_t* logstd; // Continuous only
     const precision_t* values_pred;
-    const float* adv_mean;
-    const float* adv_var;
     const int* act_sizes;
-    const precision_t* action_mask; // (N, T, A_total); always present
+    const precision_t* action_mask; // (N, T, mask_size); always present
     const precision_t* condition;
     float* grad_condition;
-    const signed char* head_consume; // (nverbs, num_atns) or NULL
-    int hc_stride;
     int mask_stride;
     int num_atns;
     float clip_coef, vf_clip_coef, vf_coef;
@@ -1711,14 +1468,10 @@ struct PPOKernelArgs {
     bool is_continuous;
 };
 
-// adv_scratch layout: [var, mean, 2*PPO_VM_MAX_BLOCKS partials, flag-as-float-slot]
-#define PPO_ADV_SCRATCH_N (2 + 2 * 1024 + 1)
-
 struct PPOBufs {
     Float grad_logits, grad_values, grad_logstd;
     Float ppo_partials;
     float* ent_coef;     // device scalar (graphs cannot bake host by-value)
-    float* adv_scratch;  // raw workspace, not a real tensor
 };
 
 void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_total, bool is_continuous) {
@@ -1734,7 +1487,6 @@ void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_t
         .grad_logstd = {.shape = {N, T, A_total}},
         .ppo_partials = {.shape = {ppo_grid * LOSS_N}},
         .ent_coef = NULL,
-        .adv_scratch = NULL,
     };
     alloc_register(alloc, &bufs.grad_logits);
     alloc_register(alloc, &bufs.grad_values);
@@ -1743,7 +1495,6 @@ void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_t
     }
     alloc_register(alloc, &bufs.ppo_partials);
     cudaMalloc((void**)&bufs.ent_coef, sizeof(float));
-    cudaMalloc((void**)&bufs.adv_scratch, PPO_ADV_SCRATCH_N * sizeof(float));
 }
 
 // Discrete only. mask is always present (env mask or synthetic all-ones).
@@ -2097,6 +1848,152 @@ __device__ __forceinline__ void ppo_continuous_head(
     *out_entropy = HALF_1_PLUS_LOG_2PI + log_std;
 }
 
+// After decoder GEMM, before GAE. One logit walk: live V, ρ, logp=logit-lse.
+// logp is written into grad_logits (overwritten with grads after GAE). For
+// POLICY_MASK_SIZE envs the walk applies the AR condition bias and legality
+// mask, matching the sampled distribution.
+__global__ void cache_imp_and_v(
+        Prec dec_out,
+        const precision_t* __restrict__ actions,
+        const precision_t* __restrict__ old_logprobs,
+        const precision_t* __restrict__ action_mask,
+        Prec logstd,
+        const int* __restrict__ act_sizes,
+        const precision_t* __restrict__ condition,
+        int mask_stride,
+        precision_t* __restrict__ imp_out,
+        precision_t* __restrict__ value_out,
+        float* __restrict__ logps,
+        float* __restrict__ new_lp_out) {
+    int NT = (int)dec_out.shape[0] * (int)dec_out.shape[1];
+    int fused_cols = (int)dec_out.shape[2];
+    int A_total = fused_cols - 1;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= NT) {
+        return;
+    }
+    int logits_base = idx * fused_cols;
+    int at_base = idx * A_total;
+    int mask_base = idx * mask_stride;
+    int action_base = idx * NUM_ATNS;
+    precision_t* logits = dec_out.data;
+    value_out[idx] = logits[logits_base + A_total];
+
+    float new_lp = 0.0f;
+    if (logstd.data) {
+        for (int h = 0; h < NUM_ATNS; ++h) {
+            float lp, ent;
+            ppo_continuous_head(
+                safe_continuous_mean(logits, logits_base + h),
+                safe_continuous_logstd(logstd.data, h),
+                to_float(actions[idx * NUM_ATNS + h]), &lp, &ent);
+            new_lp += lp;
+        }
+    } else {
+#ifdef PUFFER_NETHACK
+        int verb = (int)actions[idx * NUM_ATNS];
+#endif
+#ifdef POLICY_MASK_SIZE
+        ARContext c = ar_ctx_init(action_mask, mask_base, actions, action_base);
+        ar_ctx_set_count(&c, actions, action_base);
+#endif
+        int logits_offset = 0;
+        for (int h = 0; h < NUM_ATNS; ++h) {
+            int A = act_sizes[h];
+#ifdef PUFFER_NETHACK
+            if (!nethack_head_used(verb, h)) {
+                logits_offset += A;
+                continue;
+            }
+#endif
+#ifdef POLICY_MASK_SIZE
+            if (!ar_head_active(&c, h)) {
+                logits_offset += A;
+                continue;
+            }
+            int act = ar_action_value(actions, action_base, h, A);
+            float max_l = -INFINITY;
+            for (int a = 0; a < A; ++a) {
+                float l = ar_option_legal(&c, action_mask, mask_base, h, a)
+                    ? to_float(logits[logits_base + logits_offset + a]) +
+                        ar_cond_bias(&c, condition, h, a)
+                    : -1e4f;
+                if (l > max_l) max_l = l;
+            }
+            float sum = 0.0f, act_l = 0.0f;
+            for (int a = 0; a < A; ++a) {
+                float l = ar_option_legal(&c, action_mask, mask_base, h, a)
+                    ? to_float(logits[logits_base + logits_offset + a]) +
+                        ar_cond_bias(&c, condition, h, a)
+                    : -1e4f;
+                float e = __expf(l - max_l);
+                sum += e;
+                if (a == act) act_l = l;
+            }
+            float lse = max_l + __logf(sum);
+            for (int a = 0; a < A; ++a) {
+                float l = ar_option_legal(&c, action_mask, mask_base, h, a)
+                    ? to_float(logits[logits_base + logits_offset + a]) +
+                        ar_cond_bias(&c, condition, h, a)
+                    : -1e4f;
+                logps[at_base + logits_offset + a] = l - lse;
+            }
+            new_lp += act_l - lse;
+            if (h >= 3 && h <= 6) {
+                ar_ctx_advance(&c, actions, action_base);
+            }
+#else
+            float cache[PPO_MAX_HEAD_A];
+            float lse = ppo_discrete_logsumexp(
+                logits, logits_base, logits_offset, A,
+                action_mask, mask_base, cache);
+            for (int a = 0; a < A; ++a) {
+                logps[at_base + logits_offset + a] = cache[a] - lse;
+            }
+#ifdef PUFFER_NETHACK
+            int used = nethack_head_used(verb, h);
+            if (used) {
+                int act = (int)actions[idx * NUM_ATNS + h];
+                if (h == 0) {
+                    float mix = 1.0f;
+                    new_lp += nethack_verb_train_logp(
+                        action_mask + mask_base + logits_offset, A,
+                        cache[act] - lse, &mix);
+                } else {
+                    new_lp += cache[act] - lse;
+                }
+            }
+#else
+            new_lp += cache[(int)actions[idx * NUM_ATNS + h]] - lse;
+#endif
+#endif
+            logits_offset += A;
+        }
+    }
+    new_lp_out[idx] = new_lp;
+    imp_out[idx] = from_float(__expf(new_lp - to_float(old_logprobs[idx])));
+}
+
+Prec arch_forward_train(Arch* p, Weights& w,
+        Activations& activations, PolicyObs x,
+        Prec state, Prec terminals, int agent_off,
+        TrainGraph& g, Prec logstd, Prec condition, int* act_sizes,
+        float* logps, float* new_lp, cudaStream_t stream) {
+    int B = x.shape[0], TT = x.shape[1];
+    Prec h = p->encoder.forward(w.encoder,
+        activations.encoder, *puf_squeeze(&x, 0), stream);
+    h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT),
+        state, terminals, activations.network, agent_off, stream);
+    Prec dec_out = p->decoder.forward(
+        w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
+    Prec dec = *puf_unsqueeze(&dec_out, 0, B, TT);
+    cache_imp_and_v<<<grid_size(B * TT), BLOCK_SIZE, 0, stream>>>(
+        dec, g.mb_actions.data, g.mb_logprobs.data, g.mb_action_mask.data,
+        logstd, act_sizes, condition.data, (int)g.mb_action_mask.shape[2],
+        g.mb_imp.data, g.mb_gae_v.data, logps, new_lp);
+    return dec;
+}
+
 __global__ void ppo_loss_compute(
         float* __restrict__ ppo_partials,
         PPOKernelArgs a, PPOGraphArgs g) {
@@ -2109,49 +2006,23 @@ __global__ void ppo_loss_compute(
         block_losses[c][tid] = 0.0f;
     }
 
-#ifdef POLICY_MASK_SIZE
-    // Head-parallel layout: one thread per (row, head). The stored actions are
-    // fixed per row, so the AR heads are independent and can be processed
-    // concurrently; the 8x thread expansion takes the kernel from ~32 blocks
-    // (~20% occupancy, gather-latency bound) to full occupancy. The 9th
-    // NUM_ATNS slot is a dead head (ar_head_active rejects it) and its logits
-    // are zeroed below.
-    constexpr int PPO_HEADS = 8;
-    static_assert(PPO_THREADS % PPO_HEADS == 0, "PPO_THREADS must divide PPO_HEADS");
-    constexpr int PPO_ROWS_PER_BLOCK = PPO_THREADS / PPO_HEADS;
-    int row_in_block = tid / PPO_HEADS;
-    int head = tid % PPO_HEADS;
-    int idx = blockIdx.x * PPO_ROWS_PER_BLOCK + row_in_block;
-    __shared__ float sh_logp[PPO_ROWS_PER_BLOCK * PPO_HEADS];
-    __shared__ float sh_ent[PPO_ROWS_PER_BLOCK * PPO_HEADS];
-    __shared__ float sh_d_new_logp[PPO_ROWS_PER_BLOCK];
-    __shared__ float sh_d_entropy_term[PPO_ROWS_PER_BLOCK];
-#else
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-#endif
 
     if (idx < total_elements) {
-        int n = idx / a.T_seq;
-        int t = idx % a.T_seq;
-        int nt = n * a.T_seq + t;
+        int nt = idx;
         int logits_base = nt * (a.A_total + 1);
         int at_base = nt * a.A_total;
         int mask_base = nt * a.mask_stride;
         int action_base = nt * a.num_atns;
 
-#ifndef POLICY_MASK_SIZE
-        float old_logp = to_float(g.old_logprobs[nt]);
-        float adv = to_float(g.advantages[nt]);
-        float w = to_float(g.prio[n]);
+        float adv_for_pg = to_float(g.advantages[nt]);
         float val = to_float(g.values[nt]);
         float ret = to_float(g.returns[nt]);
         float val_pred = to_float(a.values_pred[logits_base]);
-        g.out_newvalue[nt] = from_float(val_pred);
-
-        float adv_std = sqrtf(a.adv_var[0]);
-        float adv_normalized = (adv - a.adv_mean[0]) / (adv_std + 1e-8f);
         float ent_coef = *a.ent_coef;
         float d_entropy_term = inv_NT * (-ent_coef);
+        float logratio = a.grad_values_pred[nt] - to_float(g.old_logprobs[nt]);
+        float ratio = __expf(logratio);
 
         // Value loss + gradient: 0.5 * max((v-r)^2, (v_clip-r)^2).
         // When clipped term wins, v_clip is constant in val_pred -> grad 0.
@@ -2162,270 +2033,131 @@ __global__ void ppo_loss_compute(
         float v_loss = 0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
         float d_val_pred = (v_loss_clipped > v_loss_unclipped) ? 0.0f : (val_pred - ret);
         a.grad_values_pred[nt] = inv_NT * a.vf_coef * d_val_pred;
-#endif
+        float clip_lo = 1.0f - a.clip_coef;
+        float clip_hi = 1.0f + a.clip_coef;
+        float ratio_clipped = fmaxf(clip_lo, fminf(clip_hi, ratio));
+        float wa = -adv_for_pg;
+        float pg_loss1 = wa * ratio;
+        float pg_loss2 = wa * ratio_clipped;
+        float pg_loss = fmaxf(pg_loss1, pg_loss2);
+        float d_ratio = wa * inv_NT;
+        if (pg_loss2 > pg_loss1 && (ratio <= clip_lo || ratio >= clip_hi)) {
+            d_ratio = 0.0f;
+        }
+        float d_new_logp = d_ratio * ratio;
+        float total_entropy = 0.0f;
 
+        if (a.is_continuous) {
+            for (int h = 0; h < a.num_atns; ++h) {
+                float mean = safe_continuous_mean(a.logits, logits_base + h);
+                float c_logstd = safe_continuous_logstd(a.logstd, h);
+                float c_action = finite_or_clamp(
+                    g.actions[nt * a.num_atns + h], -1.0e6f, 1.0e6f);
+                float lp, ent;
+                ppo_continuous_head(mean, c_logstd, c_action, &lp, &ent);
+                total_entropy += ent;
+                float std = __expf(c_logstd);
+                float var = std * std;
+                float diff = c_action - mean;
+                a.grad_logits[at_base + h] = d_new_logp * diff / var;
+                a.grad_logstd[nt * a.num_atns + h] =
+                    d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
+            }
+        } else {
+#ifdef PUFFER_NETHACK
+            int verb = (int)g.actions[nt * a.num_atns];
+            float verb_mix_scale = 1.0f;
+#endif
 #ifdef POLICY_MASK_SIZE
-        {
-            // Phase 1: this thread's head logsumexp/entropy/action-logp into
-            // shared memory; phase 2 sums the heads, then computes the loss +
-            // this head's gradient. The head split is valid because the stored
-            // actions are fixed per row (no sampling-time cross-head deps).
-            int head_offset = 0;
-            for (int hh = 0; hh < head; ++hh) head_offset += a.act_sizes[hh];
-            int A = a.act_sizes[head];
-            int raw_act = (int)to_float(g.actions[action_base + head]);
-            int act = (unsigned)raw_act < (unsigned)A ? raw_act : 0;
-            // Hoisted AR context: type/primary/selection/prefix read once per
-            // thread instead of being recomputed for every option in each pass
-            // (the non-context helpers rescanned the mask per option).
+            // Balatro AR heads: context hoisted once per row; heads 0..7 are
+            // active per the sampled prefix, head 8 is dead (never active).
+            // Cached logps already carry the AR condition bias (see
+            // cache_imp_and_v); here we only gate and add the condition grad.
             ARContext c = ar_ctx_init(
                 a.action_mask, mask_base, g.actions, action_base);
-            if (head >= 2) ar_ctx_set_count(&c, g.actions, action_base);
-            for (int i = 0; i < head - 3; ++i)
-                ar_ctx_advance(&c, g.actions, action_base);
-            int used = ar_head_active(&c, head);
-            float lse = 0.0f, ent = 0.0f, act_l = 0.0f;
-            if (used) {
-                // Cache-free two passes; all state in registers.
-                float max_l = -INFINITY;
-                for (int j = 0; j < A; ++j) {
-                    float l = ar_option_legal(&c, a.action_mask, mask_base, head, j)
-                        ? to_float(a.logits[logits_base + head_offset + j]) +
-                            ar_cond_bias(&c, a.condition, head, j)
-                        : -1e4f;
-                    if (l > max_l) max_l = l;
-                }
-                float sum = 0.0f, sum_le = 0.0f;
-                for (int j = 0; j < A; ++j) {
-                    float l = ar_option_legal(&c, a.action_mask, mask_base, head, j)
-                        ? to_float(a.logits[logits_base + head_offset + j]) +
-                            ar_cond_bias(&c, a.condition, head, j)
-                        : -1e4f;
-                    float e = __expf(l - max_l);
-                    sum += e;
-                    sum_le += e * l;
-                    if (j == act) act_l = l;
-                }
-                lse = max_l + __logf(sum);
-                ent = lse - sum_le / sum;
-            }
-            sh_logp[row_in_block * PPO_HEADS + head] = used ? act_l - lse : 0.0f;
-            sh_ent[row_in_block * PPO_HEADS + head] = used ? ent : 0.0f;
-            __syncthreads();
-            if (head == 0) {
-                float total_log_prob = 0.0f;
-                float total_entropy = 0.0f;
-                for (int hh = 0; hh < PPO_HEADS; ++hh) {
-                    total_log_prob += sh_logp[row_in_block * PPO_HEADS + hh];
-                    total_entropy += sh_ent[row_in_block * PPO_HEADS + hh];
-                }
-
-                float old_logp = to_float(g.old_logprobs[nt]);
-                float adv = to_float(g.advantages[nt]);
-                float w = to_float(g.prio[n]);
-                float val = to_float(g.values[nt]);
-                float ret = to_float(g.returns[nt]);
-                float val_pred = to_float(a.values_pred[logits_base]);
-                g.out_newvalue[nt] = from_float(val_pred);
-
-                float adv_std = sqrtf(a.adv_var[0]);
-                float adv_normalized =
-                    (adv - a.adv_mean[0]) / (adv_std + 1e-8f);
-                float ent_coef = *a.ent_coef;
-
-                float v_error = val_pred - val;
-                float v_clipped = val + fmaxf(-a.vf_clip_coef,
-                    fminf(a.vf_clip_coef, v_error));
-                float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
-                float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
-                float v_loss =
-                    0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
-                float d_val_pred = v_loss_clipped > v_loss_unclipped
-                    ? 0.0f : val_pred - ret;
-                a.grad_values_pred[nt] =
-                    inv_NT * a.vf_coef * d_val_pred;
-
-                float logratio = total_log_prob - old_logp;
-                float ratio = __expf(logratio);
-                g.out_ratio[nt] = from_float(ratio);
-                float clip_lo = 1.0f - a.clip_coef;
-                float clip_hi = 1.0f + a.clip_coef;
-                float ratio_clipped =
-                    fmaxf(clip_lo, fminf(clip_hi, ratio));
-                float wa = -w * adv_normalized;
-                float pg_loss1 = wa * ratio;
-                float pg_loss2 = wa * ratio_clipped;
-                float pg_loss = fmaxf(pg_loss1, pg_loss2);
-                float d_ratio = wa * inv_NT;
-                if (pg_loss2 > pg_loss1 &&
-                        (ratio <= clip_lo || ratio >= clip_hi)) {
-                    d_ratio = 0.0f;
-                }
-                sh_d_new_logp[row_in_block] = d_ratio * ratio;
-                sh_d_entropy_term[row_in_block] =
-                    inv_NT * (-ent_coef);
-
-                float thread_loss = (pg_loss + a.vf_coef * v_loss
-                    - ent_coef * total_entropy) * inv_NT;
-                block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
-                block_losses[LOSS_VF][tid] = v_loss * inv_NT;
-                block_losses[LOSS_ENT][tid] = total_entropy * inv_NT;
-                block_losses[LOSS_TOTAL][tid] = thread_loss;
-                block_losses[LOSS_OLD_APPROX_KL][tid] =
-                    (-logratio) * inv_NT;
-                block_losses[LOSS_APPROX_KL][tid] =
-                    ((ratio - 1.0f) - logratio) * inv_NT;
-                block_losses[LOSS_CLIPFRAC][tid] =
-                    (fabsf(ratio - 1.0f) > a.clip_coef
-                        ? 1.0f : 0.0f) * inv_NT;
-            }
-            __syncthreads();
-            float d_new_logp = sh_d_new_logp[row_in_block];
-            float d_entropy_term = sh_d_entropy_term[row_in_block];
-
-            if (!used) {
-                for (int j = 0; j < A; ++j) {
-                    a.grad_logits[at_base + head_offset + j] = 0.0f;
-                }
-            } else {
-                for (int j = 0; j < A; ++j) {
-                    if (!ar_option_legal(&c, a.action_mask, mask_base, head, j)) {
-                        a.grad_logits[at_base + head_offset + j] = 0.0f;
-                        continue;
-                    }
-                    float logp = to_float(a.logits[logits_base + head_offset + j])
-                        + ar_cond_bias(&c, a.condition, head, j) - lse;
-                    float p = __expf(logp);
-                    a.grad_logits[at_base + head_offset + j] =
-                        ((j == act ? 1.0f : 0.0f) - p) * d_new_logp
-                        + d_entropy_term * p * (-ent - logp);
-                    ar_cond_add(a.grad_condition + (nt & 7) * AR_CONDITION_SIZE, &c, head, j,
-                        a.grad_logits[at_base + head_offset + j]);
-                }
-            }
-            if (head == PPO_HEADS - 1) {
-                // The 9th NUM_ATNS slot is a dead head (never active); zero its
-                // logit columns so the backward pass sees no stale gradients.
-                int active = head_offset + A;
-                for (int j = active; j < a.A_total; ++j) {
-                    a.grad_logits[at_base + j] = 0.0f;
-                }
-            }
-        }
-#else
-        {
-            float total_log_prob = 0.0f;
-            float total_entropy = 0.0f;
-            float head_logsumexp[NUM_ATNS];
-            float head_entropy[NUM_ATNS];
-            int head_act[NUM_ATNS];
-            int head_used[NUM_ATNS];
-            float logit_cache[NUM_ATNS][PPO_MAX_HEAD_A];
-            float c_mean[NUM_ATNS], c_logstd[NUM_ATNS], c_action[NUM_ATNS];
-
-            if (a.is_continuous) {
-                for (int h = 0; h < a.num_atns; ++h) {
-                    c_mean[h] = safe_continuous_mean(a.logits, logits_base + h);
-                    c_logstd[h] = safe_continuous_logstd(a.logstd, h);
-                    c_action[h] = finite_or_clamp(
-                        to_float(g.actions[nt * a.num_atns + h]), -1.0e6f, 1.0e6f);
-                    float lp, ent;
-                    ppo_continuous_head(c_mean[h], c_logstd[h], c_action[h], &lp, &ent);
-                    total_log_prob += lp;
-                    total_entropy += ent;
-                }
-            } else {
-                int verb = (int)to_float(g.actions[nt * a.num_atns]);
-                int logits_offset = 0;
-                for (int h = 0; h < a.num_atns; ++h) {
-                    int A = a.act_sizes[h];
-                    int raw_act = (int)to_float(g.actions[action_base + h]);
-                    int act = (unsigned)raw_act < (unsigned)A ? raw_act : 0;
-                    head_act[h] = act;
-                    head_used[h] = (a.head_consume == NULL || h == 0)
-                        ? 1 : (int)a.head_consume[verb * a.hc_stride + h];
-                    float* cache = logit_cache[h];
-                    float lse = ppo_discrete_logsumexp(
-                        a.logits, logits_base, logits_offset,
-                        A, a.action_mask, mask_base, cache);
-                    float ent = 0.0f;
-                    for (int aa = 0; aa < A; ++aa) {
-                        float logp = cache[aa] - lse;
-                        ent -= __expf(logp) * logp;
-                    }
-                    head_logsumexp[h] = lse;
-                    head_entropy[h] = ent;
-                    if (head_used[h]) {
-                        total_log_prob += cache[act] - lse;
-                        total_entropy += ent;
-                    }
-                    logits_offset += A;
-                }
-            }
-
-            float logratio = total_log_prob - old_logp;
-            float ratio = __expf(logratio);
-            g.out_ratio[nt] = from_float(ratio);
-            float clip_lo = 1.0f - a.clip_coef;
-            float clip_hi = 1.0f + a.clip_coef;
-            float ratio_clipped = fmaxf(clip_lo, fminf(clip_hi, ratio));
-            float wa = -w * adv_normalized;
-            float pg_loss1 = wa * ratio;
-            float pg_loss2 = wa * ratio_clipped;
-            float pg_loss = fmaxf(pg_loss1, pg_loss2);
-            float d_ratio = wa * inv_NT;
-            if (pg_loss2 > pg_loss1 && (ratio <= clip_lo || ratio >= clip_hi)) {
-                d_ratio = 0.0f;
-            }
-            float d_new_logp = d_ratio * ratio;
-
-            if (a.is_continuous) {
-                for (int h = 0; h < a.num_atns; ++h) {
-                    float std = __expf(c_logstd[h]);
-                    float var = std * std;
-                    float diff = c_action[h] - c_mean[h];
-                    a.grad_logits[at_base + h] = d_new_logp * diff / var;
-                    a.grad_logstd[nt * a.num_atns + h] =
-                        d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
-                }
-            } else {
-                int logits_offset = 0;
-                for (int h = 0; h < a.num_atns; ++h) {
-                    int A = a.act_sizes[h];
-                    if (!head_used[h]) {
-                        for (int j = 0; j < A; ++j) {
-                            a.grad_logits[at_base + logits_offset + j] = 0.0f;
-                        }
-                        logits_offset += A;
-                        continue;
-                    }
-                    float lse = head_logsumexp[h];
-                    float ent = head_entropy[h];
-                    int act = head_act[h];
-                    float* cache = logit_cache[h];
-                    for (int j = 0; j < A; ++j) {
-                        float logp = cache[j] - lse;
-                        float p = __expf(logp);
-                        a.grad_logits[at_base + logits_offset + j] =
-                            ((j == act ? 1.0f : 0.0f) - p) * d_new_logp
-                            + d_entropy_term * p * (-ent - logp);
-                    }
-                    logits_offset += A;
-                }
-            }
-
-            float thread_loss = (pg_loss + a.vf_coef * v_loss
-                - ent_coef * total_entropy) * inv_NT;
-            block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
-            block_losses[LOSS_VF][tid] = v_loss * inv_NT;
-            block_losses[LOSS_ENT][tid] = total_entropy * inv_NT;
-            block_losses[LOSS_TOTAL][tid] = thread_loss;
-            block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_NT;
-            block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_NT;
-            block_losses[LOSS_CLIPFRAC][tid] =
-                (fabsf(ratio - 1.0f) > a.clip_coef ? 1.0f : 0.0f) * inv_NT;
-        }
+            ar_ctx_set_count(&c, g.actions, action_base);
 #endif
+            int logits_offset = 0;
+            for (int h = 0; h < a.num_atns; ++h) {
+                int A = a.act_sizes[h];
+#ifdef PUFFER_NETHACK
+                if (!nethack_head_used(verb, h)) {
+                    for (int j = 0; j < A; ++j) {
+                        a.grad_logits[at_base + logits_offset + j] = 0.0f;
+                    }
+                    logits_offset += A;
+                    continue;
+                }
+#endif
+#ifdef POLICY_MASK_SIZE
+                if (!ar_head_active(&c, h)) {
+                    for (int j = 0; j < A; ++j) {
+                        a.grad_logits[at_base + logits_offset + j] = 0.0f;
+                    }
+                    logits_offset += A;
+                    continue;
+                }
+                int raw_act = (int)to_float(g.actions[action_base + h]);
+                int act = (unsigned)raw_act < (unsigned)A ? raw_act : 0;
+#else
+                int act = (int)g.actions[nt * a.num_atns + h];
+#endif
+                float ent = 0.0f;
+                for (int j = 0; j < A; ++j) {
+                    float logp = a.grad_logits[at_base + logits_offset + j];
+                    ent -= __expf(logp) * logp;
+                }
+                total_entropy += ent;
+#ifdef PUFFER_NETHACK
+                float d_logp = d_new_logp;
+                if (h == 0) {
+                    nethack_verb_train_logp(
+                        a.action_mask + at_base + logits_offset, A,
+                        a.grad_logits[at_base + act],
+                        &verb_mix_scale);
+                    d_logp *= verb_mix_scale;
+                }
+#else
+                float d_logp = d_new_logp;
+#endif
+                for (int j = 0; j < A; ++j) {
+                    float logp = a.grad_logits[at_base + logits_offset + j];
+                    float p = __expf(logp);
+                    a.grad_logits[at_base + logits_offset + j] =
+                        ((j == act ? 1.0f : 0.0f) - p) * d_logp
+                        + d_entropy_term * p * (-ent - logp);
+#ifdef POLICY_MASK_SIZE
+                    if (ar_option_legal(&c, a.action_mask, mask_base, h, j)) {
+                        ar_cond_add(
+                            a.grad_condition + (nt & (COND_STRIPE_COUNT - 1))
+                                * AR_CONDITION_SIZE,
+                            &c, h, j,
+                            a.grad_logits[at_base + logits_offset + j]);
+                    }
+#endif
+                }
+#ifdef POLICY_MASK_SIZE
+                // Advance the card-selection prefix for the next AR head.
+                if (h >= 3 && h <= 6) {
+                    ar_ctx_advance(&c, g.actions, action_base);
+                }
+#endif
+                logits_offset += A;
+            }
+        }
+
+        float thread_loss = (pg_loss + a.vf_coef * v_loss
+            - ent_coef * total_entropy) * inv_NT;
+
+        block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
+        block_losses[LOSS_VF][tid] = v_loss * inv_NT;
+        block_losses[LOSS_ENT][tid] = total_entropy * inv_NT;
+        block_losses[LOSS_TOTAL][tid] = thread_loss;
+        block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_NT;
+        block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_NT;
+        block_losses[LOSS_CLIPFRAC][tid] =
+            (fabsf(ratio - 1.0f) > a.clip_coef ? 1.0f : 0.0f) * inv_NT;
+        block_losses[LOSS_IMP][tid] = ratio * inv_NT;
     }
 
     block_reduce_sum(&block_losses[0][0], &ppo_partials[blockIdx.x * LOSS_N],
@@ -2449,72 +2181,13 @@ __global__ void ppo_loss_reduce(
     }
 }
 
-// Advantage mean + sample variance (one multi-block kernel).
-// Each block: sum (x, x²) → partial. Last block (atomic ticket) folds partials.
-// Multi-block data pass matters for large NT; see tests/bench_ppo_adv_mean.cu.
-constexpr int PPO_VM_THREADS = 256;
-constexpr int PPO_VM_MAX_BLOCKS = 1024;
-
-// Just a mean and adv. Naive impl is annoyingly high overhead on small nets
-__global__ void ppo_adv_mean_var(const precision_t* __restrict__ src,
-        float* __restrict__ partial, float* __restrict__ var_out,
-        float* __restrict__ mean_out, int* __restrict__ flag, int n) {
-    float s = 0.0f, q = 0.0f;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-            i += blockDim.x * gridDim.x) {
-        float x = to_float(src[i]);
-        s += x;
-        q += x * x;
-    }
-    // Block reduce (s, q) — warp shuffles then 8-way shared.
-    __shared__ float wa[PPO_VM_THREADS / 32], wb[PPO_VM_THREADS / 32];
-    int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        s += __shfl_down_sync(PRIO_FULL_MASK, s, o, 32);
-        q += __shfl_down_sync(PRIO_FULL_MASK, q, o, 32);
-    }
-    if (lane == 0) {
-        wa[wid] = s;
-        wb[wid] = q;
-    }
-    __syncthreads();
-    s = (tid < PPO_VM_THREADS / 32) ? wa[tid] : 0.0f;
-    q = (tid < PPO_VM_THREADS / 32) ? wb[tid] : 0.0f;
-    if (wid == 0) {
-        #pragma unroll
-        for (int o = 4; o > 0; o >>= 1) {
-            s += __shfl_down_sync(PRIO_FULL_MASK, s, o, 32);
-            q += __shfl_down_sync(PRIO_FULL_MASK, q, o, 32);
-        }
-    }
-    if (tid == 0) {
-        partial[blockIdx.x] = s;
-        partial[blockIdx.x + gridDim.x] = q;
-        __threadfence();  // publish partials before claiming "done"
-        if (atomicAdd(flag, 1) == gridDim.x - 1) {
-            float S = 0.0f, Q = 0.0f;
-            for (int b = 0; b < gridDim.x; b++) {
-                S += partial[b];
-                Q += partial[b + gridDim.x];
-            }
-            float mean = S / (float)n;
-            *mean_out = mean;
-            *var_out = fmaxf(0.0f, (Q - S * mean) / (float)(n - 1));
-            *flag = 0;  // ready for next launch (graphs re-run this kernel)
-        }
-    }
-}
-
-// This is a huge kernel for a relatively cheap operation. But without this,
-// it's death by a thousand cuts with repeated kernel launches. Even graphed, you
-// blow up the memory bandwidth.
 __global__ void puf_float_to_precision_kernel(
         precision_t* __restrict__ dst, const float* __restrict__ src, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) dst[idx] = from_float(src[idx]);
 }
 
+// Sum the COND_STRIPE_COUNT row-striped condition-gradient staging copies.
 __global__ void cond_parts_sum(
         float* __restrict__ dst, const float* __restrict__ parts,
         int stripes, int n) {
@@ -2524,6 +2197,7 @@ __global__ void cond_parts_sum(
     for (int k = 0; k < stripes; ++k) sum += parts[k * n + idx];
     dst[idx] = sum;
 }
+
 
 void ppo_loss_fwd_bwd(
         Prec& dec_out,    // (N, T, fused_cols) - fused logits+value from decoder
@@ -2537,21 +2211,7 @@ void ppo_loss_fwd_bwd(
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
     int A_total = fused_cols - 1;  // last column is value
     int total = N * T;
-
-    float* adv_var = bufs.adv_scratch;
-    float* adv_mean = adv_var + 1;
-    float* adv_partials = adv_var + 2;
-    int* adv_flag = (int*)(adv_var + 2 + 2 * PPO_VM_MAX_BLOCKS);
-    int adv_n = (int)numel(graph.mb_advantages.shape);
-    int adv_blocks = min((adv_n + PPO_VM_THREADS - 1) / PPO_VM_THREADS, PPO_VM_MAX_BLOCKS);
-    ppo_adv_mean_var<<<adv_blocks, PPO_VM_THREADS, 0, stream>>>(
-        graph.mb_advantages.data, adv_partials, adv_var, adv_mean, adv_flag, adv_n);
-
-#ifdef POLICY_MASK_SIZE
-    int ppo_grid = (total + PPO_ROWS_PER_BLOCK - 1) / PPO_ROWS_PER_BLOCK;
-#else
     int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
-#endif
     if (condition_accum.data) {
         cudaMemsetAsync(condition_accum.data, 0,
             numel(condition_accum.shape) * sizeof(float), stream);
@@ -2562,18 +2222,14 @@ void ppo_loss_fwd_bwd(
     }
 
     PPOGraphArgs graph_args = {
-        .out_ratio = graph.mb_ratio.data,
-        .out_newvalue = graph.mb_newvalue.data,
+        .imp = graph.mb_imp.data,
         .actions = graph.mb_actions.data,
         .old_logprobs = graph.mb_logprobs.data,
         .advantages = graph.mb_advantages.data,
-        .prio = graph.mb_prio.data,
         .values = graph.mb_values.data,
         .returns = graph.mb_returns.data,
     };
 
-    int hc_stride_l = 0;
-    const signed char* hc_dev_l = get_head_consume_dev(&hc_stride_l);
     PPOKernelArgs args = {
         .grad_logits = bufs.grad_logits.data,
         .grad_logstd = is_continuous ? bufs.grad_logstd.data : NULL,
@@ -2581,18 +2237,15 @@ void ppo_loss_fwd_bwd(
         .logits = dec_out.data,
         .logstd = is_continuous ? logstd.data : NULL,
         .values_pred = dec_out.data + A_total,
-        .adv_mean = adv_mean,
-        .adv_var = adv_var,
         .act_sizes = act_sizes,
         .action_mask = graph.mb_action_mask.data,
         .condition = condition.data,
         .grad_condition = condition_parts.data,
-        .head_consume = hc_dev_l,
-        .hc_stride = hc_stride_l,
-        .mask_stride = graph.mb_action_mask.shape[2],
+        .mask_stride = (int)graph.mb_action_mask.shape[2],
         .num_atns = NUM_ATNS,
         .clip_coef = clip_coef, .vf_clip_coef = vf_clip_coef,
-        .vf_coef = vf_coef, .ent_coef = ent_coef,
+        .vf_coef = vf_coef,
+        .ent_coef = ent_coef,
         .T_seq = T, .A_total = A_total, .N = N,
         .is_continuous = is_continuous,
     };
@@ -2644,6 +2297,7 @@ __device__ __forceinline__ void adv_st(precision_t* p, const float* o) {
 __global__ void puff_advantage(const precision_t* values,
         const precision_t* rewards, const precision_t* dones,
         const precision_t* importance, precision_t* advantages,
+        precision_t* returns,
         float gamma, float lambda, float rho_clip, float c_clip,
         int num_steps, int horizon) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2658,10 +2312,19 @@ __global__ void puff_advantage(const precision_t* values,
         int base = off + seg * ADV_VEC_WIDTH;
         float v[ADV_VEC_WIDTH], r[ADV_VEC_WIDTH], d[ADV_VEC_WIDTH], imp[ADV_VEC_WIDTH];
         float adv[ADV_VEC_WIDTH] = {};
+        float ret[ADV_VEC_WIDTH];
         adv_ld(values + base, v);
         adv_ld(rewards + base, r);
         adv_ld(dones + base, d);
-        adv_ld(importance + base, imp);
+        if (importance) {
+            adv_ld(importance + base, imp);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < ADV_VEC_WIDTH; i++) {
+                imp[i] = 1.f;
+            }
+        }
+        // Last index H-1 left 0. First seg starts at width-2.
         int i0 = (seg + 1 == horizon / ADV_VEC_WIDTH) ? ADV_VEC_WIDTH - 2 : ADV_VEC_WIDTH - 1;
         // This is the simple puffer_advantage function. All the
         // vec load/stores are minor perf optimizations
@@ -2674,6 +2337,11 @@ __global__ void puff_advantage(const precision_t* values,
             adv[i] = lastlam;
             next_v = v[i]; next_d = d[i]; next_r = r[i];
         }
+        #pragma unroll
+        for (int i = 0; i < ADV_VEC_WIDTH; i++) {
+            ret[i] = v[i] + adv[i];
+        }
         adv_st(advantages + base, adv);
+        adv_st(returns + base, ret);
     }
 }
