@@ -32,6 +32,47 @@ static constexpr int BA_TAG_FEATURES = 1 + OBS_MAX_TAGS * (BA_TAG_EMBED + 2);
 static constexpr int BA_FIXED = BA_OFF_TAGS + BA_TAG_FEATURES;
 static constexpr int BA_POOL_SECTIONS = 2 + BA_ZONES; // variants, hand, 6 card zones
 static constexpr int BA_POOLED = BA_FIXED + BA_POOL_SECTIONS * BA_TOKEN_W;
+
+// Per-slot sidecar: each live token's 32-dim embedding exposed per slot for
+// the zones the AR heads target by index (hand, jokers, consumables, shop,
+// vouchers, boosters, pack). The pooled sections stay permutation-invariant;
+// the sidecar restores 1-to-1 slot identity so sell/use/play/reorder heads
+// can ground their targets. Caps sized to the game's realistic slot maxima
+// (hand 8 + growth, jokers 5 + negative-edition slot, consumables 2, shop 4,
+// vouchers 2, boosters 2, pack 5); live slots beyond a cap are zero-padded
+// (the pooled stats still cover them).
+static constexpr int BA_SLOT_HAND = 10;
+static constexpr int BA_SLOT_JOKERS = 6;
+static constexpr int BA_SLOT_CONSUMABLES = 2;
+static constexpr int BA_SLOT_SHOP = 4;
+static constexpr int BA_SLOT_VOUCHERS = 2;
+static constexpr int BA_SLOT_BOOSTERS = 2;
+static constexpr int BA_SLOT_PACK = 5;
+// Section -> sidecar slot cap / cumulative slot offset. Section 0 (variants)
+// has no sidecar; hand is section 1, then the six card zones.
+static constexpr int BA_SLOT_CAPS[BA_POOL_SECTIONS] = {
+    0, BA_SLOT_HAND, BA_SLOT_JOKERS, BA_SLOT_CONSUMABLES,
+    BA_SLOT_SHOP, BA_SLOT_VOUCHERS, BA_SLOT_BOOSTERS, BA_SLOT_PACK};
+static constexpr int BA_SLOT_OFFSET[BA_POOL_SECTIONS] = {
+    0, 0, BA_SLOT_HAND,
+    BA_SLOT_HAND + BA_SLOT_JOKERS,
+    BA_SLOT_HAND + BA_SLOT_JOKERS + BA_SLOT_CONSUMABLES,
+    BA_SLOT_HAND + BA_SLOT_JOKERS + BA_SLOT_CONSUMABLES + BA_SLOT_SHOP,
+    BA_SLOT_HAND + BA_SLOT_JOKERS + BA_SLOT_CONSUMABLES + BA_SLOT_SHOP
+        + BA_SLOT_VOUCHERS,
+    BA_SLOT_HAND + BA_SLOT_JOKERS + BA_SLOT_CONSUMABLES + BA_SLOT_SHOP
+        + BA_SLOT_VOUCHERS + BA_SLOT_BOOSTERS};
+// Sidecar width: 16 of the token MLP's 32 outputs. The pool still sums all
+// 32, but only dims 0-15 get per-slot gradient pressure, so the shared MLP
+// learns to put per-slot discriminative signal there. Halves the sidecar's
+// write volume and projection cost vs a full 32-dim slot.
+static constexpr int BA_SLOT_W = 16;
+static constexpr int BA_SLOT_FEATURES =
+    (BA_SLOT_HAND + BA_SLOT_JOKERS + BA_SLOT_CONSUMABLES + BA_SLOT_SHOP
+        + BA_SLOT_VOUCHERS + BA_SLOT_BOOSTERS + BA_SLOT_PACK) * BA_SLOT_W;
+// Full encoder output: pooled sections + per-slot sidecar.
+static constexpr int BA_TOTAL = BA_POOLED + BA_SLOT_FEATURES;
+
 static constexpr int BA_BLOCK_AGENTS = 4; // agents per backward-kernel block
 // Token-MLP wgrad cells: 3 sections of (in_dim x BA_TOKEN_W) plus 3 biases.
 static constexpr int BA_CELLS_W = BA_TOKEN_W * BA_VARIANT_IN; // 352
@@ -42,7 +83,7 @@ static constexpr int BA_TOKEN_CELLS =
 
 static_assert(sizeof(Observation) == 8120,
     "Balatro encoder must be updated for the Observation layout");
-static_assert(BA_FIXED == 253 && BA_POOLED == 509,
+static_assert(BA_FIXED == 253 && BA_POOLED == 509 && BA_TOTAL == 1005,
     "Balatro encoder pooled layout mismatch");
 
 struct BalatroEncoderWeights {
@@ -50,7 +91,7 @@ struct BalatroEncoderWeights {
     Prec v_w, v_b;  // variant token MLP (64,11) + bias (64)
     Prec h_w, h_b;  // hand token MLP (64,9) + bias
     Prec c_w, c_b;  // card token MLP (64,28) + bias
-    Prec proj_w;    // (hidden, BA_POOLED)
+    Prec proj_w;    // (hidden, BA_TOTAL)
     int obs_size, hidden;
 };
 
@@ -243,6 +284,7 @@ __global__ void ba_encode_kernel(
     __shared__ float s_pool[BA_POOL_SECTIONS * BA_TOKEN_W];
     __shared__ float s_x[64][BA_CARD_IN];
     __shared__ int s_section[64];
+    __shared__ int s_local[64];
     int b = blockIdx.x;
     int64_t in = (int64_t)b * obs_size;
     int base = offsetof(Observation, globals);
@@ -368,7 +410,7 @@ __global__ void ba_encode_kernel(
                 }
             }
         }
-        pooled[b * BA_POOLED + feature] = from_float(value);
+        pooled[b * BA_TOTAL + feature] = from_float(value);
     }
     for (int i = threadIdx.x; i < BA_POOL_SECTIONS * BA_TOKEN_W; i += blockDim.x)
         s_pool[i] = 0.0f;
@@ -389,7 +431,10 @@ __global__ void ba_encode_kernel(
             float x[BA_CARD_IN];
             int center, in_dim;
             ba_token_input(obs, in, section, local, center_embed, x, &center, &in_dim);
-            if (part == 0) s_section[slot] = section;
+            if (part == 0) {
+                s_section[slot] = section;
+                s_local[slot] = local;
+            }
             int per = (in_dim + 3) >> 2;
             int k = part * per;
             int k_end = k + per < in_dim ? k + per : in_dim;
@@ -412,6 +457,19 @@ __global__ void ba_encode_kernel(
             }
         }
         __syncthreads();
+        // Per-slot sidecar: expose each live slot's first BA_SLOT_W embedding
+        // dims so the AR heads can ground index targeting. Slots beyond a
+        // zone cap stay zero.
+        for (int i = threadIdx.x; i < n * BA_SLOT_W; i += blockDim.x) {
+            int slot = i >> 4;
+            int d = i & (BA_SLOT_W - 1);
+            int sec = s_section[slot];
+            int local = s_local[slot];
+            if (local >= BA_SLOT_CAPS[sec]) continue;
+            pooled[b * BA_TOTAL + BA_POOLED
+                + (BA_SLOT_OFFSET[sec] + local) * BA_SLOT_W + d]
+                = from_float(s_tok[slot][d]);
+        }
         for (int c = threadIdx.x; c < BA_POOL_SECTIONS * BA_TOKEN_W; c += blockDim.x) {
             int sec = c / BA_TOKEN_W;
             int d = c % BA_TOKEN_W;
@@ -427,9 +485,25 @@ __global__ void ba_encode_kernel(
             }
         }
     }
+    // Tail zeroing: the sidecar pass overwrote the live slots; only the
+    // [count, cap) tail of each zone can hold stale embeddings from a
+    // previous step, so clear just that (typically a couple of slots).
+    for (int i = threadIdx.x; i < BA_SLOT_FEATURES; i += blockDim.x) {
+        int f = i / BA_SLOT_W;
+        int d = i % BA_SLOT_W;
+        int z = 1, acc = 0;
+        for (; z < BA_POOL_SECTIONS; ++z) {
+            if (f < acc + BA_SLOT_CAPS[z]) break;
+            acc += BA_SLOT_CAPS[z];
+        }
+        if (z >= BA_POOL_SECTIONS) continue;
+        int local = f - acc;
+        if (local >= counts[z])
+            pooled[b * BA_TOTAL + BA_POOLED + i] = from_float(0.0f);
+    }
     __syncthreads();
     for (int i = threadIdx.x; i < BA_POOL_SECTIONS * BA_TOKEN_W; i += blockDim.x)
-        pooled[b * BA_POOLED + BA_FIXED + i] = from_float(s_pool[i]);
+        pooled[b * BA_TOTAL + BA_FIXED + i] = from_float(s_pool[i]);
 }
 
 // Backward through the token MLPs and the fixed-section embeddings.
@@ -458,6 +532,7 @@ __global__ void ba_token_backward_kernel(
     __shared__ float s_dh[64][BA_TOKEN_W];
     __shared__ int s_section[64];
     __shared__ int s_center[64];
+    __shared__ int s_local[64];
     int b0 = blockIdx.x * BA_BLOCK_AGENTS;
     // Per-thread cell accumulators, accumulated across all agents in the
     // block; flushed to global once per block instead of once per agent.
@@ -470,7 +545,7 @@ __global__ void ba_token_backward_kernel(
         int b = b0 + g;
         if (b >= B) break;
         int64_t in = (int64_t)b * obs_size;
-        const precision_t* dp = d_pooled + (int64_t)b * BA_POOLED;
+        const precision_t* dp = d_pooled + (int64_t)b * BA_TOTAL;
         if (threadIdx.x == 0) {
             // Fixed-section embedding gradients (globals ids + tag ids).
             int base = offsetof(Observation, globals);
@@ -524,6 +599,7 @@ __global__ void ba_token_backward_kernel(
                 if (part == 0) {
                     s_section[slot] = section;
                     s_center[slot] = center;
+                    s_local[slot] = local;
                 }
                 int per = (in_dim + 3) >> 2;
                 int k = part * per;
@@ -545,8 +621,14 @@ __global__ void ba_token_backward_kernel(
                     float accv = to_float(bias[dim]);
                     for (int k = 0; k < in_dim; ++k)
                         accv += s_x[slot][k] * to_float(w[dim * in_dim + k]);
-                    s_dh[slot][dim] =
-                        to_float(dp[BA_FIXED + section * BA_TOKEN_W + dim]) * ba_gelu_deriv(accv);
+                    // Gradient of the slot's embedding: the pooled-section term
+                    // plus, for sidecar zones, the per-slot term.
+                    float dh = to_float(dp[BA_FIXED + section * BA_TOKEN_W + dim]);
+                    int local = s_local[slot];
+                    if (dim < BA_SLOT_W && local < BA_SLOT_CAPS[section])
+                        dh += to_float(dp[BA_POOLED
+                            + (BA_SLOT_OFFSET[section] + local) * BA_SLOT_W + dim]);
+                    s_dh[slot][dim] = dh * ba_gelu_deriv(accv);
                 }
                 if (section >= 2 && center >= 0 && center < CENTER_COUNT) {
                     float dxe[BA_CENTER_EMBED] = {0};
@@ -756,7 +838,7 @@ static void ba_encoder_init_weights(
     puf_kaiming_init(&c_w, sqrtf(2.0f), (*seed)++, stream);
     Prec projection = {
         .data = ew->proj_w.data,
-        .shape = {ew->hidden, BA_POOLED},
+        .shape = {ew->hidden, BA_TOTAL},
     };
     puf_kaiming_init(&projection, sqrtf(2.0f), (*seed)++, stream);
     cudaMemsetAsync(ew->v_b.data, 0, BA_TOKEN_W * sizeof(precision_t), stream);
@@ -775,7 +857,7 @@ static void ba_encoder_reg_params(void* w, Allocator* alloc) {
     ew->h_b = {.shape = {BA_TOKEN_W}};
     ew->c_w = {.shape = {BA_TOKEN_W, BA_CARD_IN}};
     ew->c_b = {.shape = {BA_TOKEN_W}};
-    ew->proj_w = {.shape = {ew->hidden, BA_POOLED}};
+    ew->proj_w = {.shape = {ew->hidden, BA_TOTAL}};
     alloc_register(alloc, &ew->center_embed);
     alloc_register(alloc, &ew->blind_embed);
     alloc_register(alloc, &ew->tag_embed);
@@ -794,10 +876,10 @@ static void ba_encoder_reg_train(
     BalatroEncoderWeights* ew = (BalatroEncoderWeights*)w;
     BalatroEncoderActivations* a = (BalatroEncoderActivations*)activations;
     *a = {};
-    a->pooled = {.shape = {B_TT, BA_POOLED}};
+    a->pooled = {.shape = {B_TT, BA_TOTAL}};
     a->out = {.shape = {B_TT, ew->hidden}};
-    a->d_pooled = {.shape = {B_TT, BA_POOLED}};
-    a->proj_wgrad = {.shape = {ew->hidden, BA_POOLED}};
+    a->d_pooled = {.shape = {B_TT, BA_TOTAL}};
+    a->proj_wgrad = {.shape = {ew->hidden, BA_TOTAL}};
     a->center_wgrad_f = {.shape = {CENTER_COUNT, BA_CENTER_EMBED}};
     a->blind_wgrad_f = {.shape = {BLIND_COUNT, BA_BLIND_EMBED}};
     a->tag_wgrad_f = {.shape = {TAG_COUNT, BA_TAG_EMBED}};
@@ -838,7 +920,7 @@ static void ba_encoder_reg_rollout(
     BalatroEncoderWeights* ew = (BalatroEncoderWeights*)w;
     BalatroEncoderActivations* a = (BalatroEncoderActivations*)activations;
     *a = {};
-    a->pooled = {.shape = {B, BA_POOLED}};
+    a->pooled = {.shape = {B, BA_TOTAL}};
     a->out = {.shape = {B, ew->hidden}};
     alloc_register(alloc, &a->pooled);
     alloc_register(alloc, &a->out);
