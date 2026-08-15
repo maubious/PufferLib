@@ -13,8 +13,8 @@
 #include "policy.h"
 
 #define OBS_SIZE ((int)sizeof(Observation))
-#define NUM_ATNS 9
-#define ACT_SIZES {23, 64, 6, 64, 64, 64, 64, 64, 64}
+#define NUM_ATNS 8
+#define ACT_SIZES {23, 64, 6, 64, 64, 64, 64, 64}
 #define ACTION_MASK_SIZE POLICY_MASK_SIZE
 #define INVALID_ACTION_REWARD (-0.002f)
 #define TIMEOUT_REWARD (-1.0f)

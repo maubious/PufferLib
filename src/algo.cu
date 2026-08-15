@@ -1408,15 +1408,6 @@ static const signed char* get_head_consume_dev(int* stride) {
 
 constexpr int PPO_THREADS = 256;
 
-#ifdef POLICY_MASK_SIZE
-// Head-parallel ppo_loss: one thread per (row, head). PPO_HEADS is the number
-// of active AR heads; the trailing NUM_ATNS slot is a dead head whose logits
-// the kernel zeroes. Requires PPO_THREADS % PPO_HEADS == 0.
-constexpr int PPO_HEADS = 8;
-static_assert(PPO_THREADS % PPO_HEADS == 0, "PPO_THREADS must divide PPO_HEADS");
-constexpr int PPO_ROWS_PER_BLOCK = PPO_THREADS / PPO_HEADS;
-#endif
-
 // Per-env from ENV_HEADER (ocean/<env>/<env>.h).
 #ifndef NUM_ATNS
 #error "ENV_HEADER must #define NUM_ATNS (number of action heads)"
@@ -1476,11 +1467,7 @@ struct PPOBufs {
 
 void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_total, bool is_continuous) {
     long total = (long)N * T;
-#ifdef POLICY_MASK_SIZE
-    int ppo_grid = ((int)total + PPO_ROWS_PER_BLOCK - 1) / PPO_ROWS_PER_BLOCK;
-#else
     int ppo_grid = ((int)total + PPO_THREADS - 1) / PPO_THREADS;
-#endif
     bufs = (PPOBufs){
         .grad_logits = {.shape = {N, T, A_total}},
         .grad_values = {.shape = {N, T, 1}},
@@ -1702,7 +1689,7 @@ __device__ __forceinline__ int ar_cond_idx(
 
 __device__ __forceinline__ float ar_cond_bias(
         const ARContext* c, const precision_t* cond, int head, int opt) {
-    if (!cond || head == 0 || head == 8) return 0.0f;
+    if (!cond || head == 0) return 0.0f;
     int n = head == 1 ? 1 : head == 2 ? 2 : 4;
     float v = 0.0f;
     for (int i = 0; i < n; ++i) {
@@ -1714,7 +1701,7 @@ __device__ __forceinline__ float ar_cond_bias(
 
 __device__ __forceinline__ void ar_cond_add(
         float* g, const ARContext* c, int head, int opt, float v) {
-    if (!g || v == 0.0f || head == 0 || head == 8) return;
+    if (!g || v == 0.0f || head == 0) return;
     int n = head == 1 ? 1 : head == 2 ? 2 : 4;
     for (int i = 0; i < n; ++i) {
         int j = ar_cond_idx(c, head, opt, i);
@@ -1815,7 +1802,7 @@ __device__ __forceinline__ int cond_idx(
 __device__ __forceinline__ float cond_bias(
         const precision_t* c, const precision_t* act,
         int ab, int head, int opt) {
-    if (!c || head == 0 || head == 8) return 0.0f;
+    if (!c || head == 0) return 0.0f;
     int n = head == 1 ? 1 : head == 2 ? 2 : 4;
     float v = 0.0f;
     for (int i = 0; i < n; ++i) {
@@ -1828,7 +1815,7 @@ __device__ __forceinline__ float cond_bias(
 __device__ __forceinline__ void cond_add(
         float* g, const precision_t* act, int ab,
         int head, int opt, float v) {
-    if (!g || v == 0.0f || head == 0 || head == 8) return;
+    if (!g || v == 0.0f || head == 0) return;
     int n = head == 1 ? 1 : head == 2 ? 2 : 4;
     for (int i = 0; i < n; ++i) {
         int j = cond_idx(act, ab, head, opt, i);
