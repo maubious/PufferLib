@@ -2,6 +2,9 @@
 #ifndef AR_CONDITION_SIZE
 #define AR_CONDITION_SIZE 0
 #endif
+// Row-striped condition-gradient staging: atomics spread across this many
+// copies of the condition tensor to cut per-address contention, then summed.
+constexpr int COND_STRIPE_COUNT = 8;
 // Writing custom nets in 4.0+ requires a fair bit of code because you are
 // responsible for defining your own activation and gradient buffers.
 // You usually only ever need a custom Encoder.
@@ -70,6 +73,7 @@ struct DecoderActivations {
     Prec out, grad_out, saved_input, grad_input, wgrad_scratch, logstd_scratch,
         condition_scratch;
     Float condition_accum;
+    Float cond_accum_parts;  // (COND_STRIPE_COUNT, AR_CONDITION_SIZE) atomic staging
 };
 
 struct Network {
@@ -92,6 +96,9 @@ thread_local cudaEvent_t g_main_ready = NULL;
 thread_local void* g_cublas_dw_workspace = NULL;
 thread_local cudaStream_t g_dw_stream = NULL;
 thread_local cudaEvent_t g_dw_done = NULL;
+#ifdef USE_ROCM
+thread_local rocblas_handle g_rocblas_handle = NULL;
+#endif
 
 static void cublas_init_one(cublasHandle_t* handle, void** workspace) {
     const size_t ws_bytes = 32 * 1024 * 1024;
@@ -112,6 +119,14 @@ void cublas_init_handle() {
     cudaEventCreateWithFlags(&g_dw_done, cudaEventDisableTiming);
     cudaEventCreateWithFlags(&g_main_ready, cudaEventDisableTiming);
 }
+
+#ifdef USE_ROCM
+void rocblas_init_handle() {
+    assert(rocblas_create_handle(&g_rocblas_handle) == rocblas_status_success);
+    assert(rocblas_set_workspace(g_rocblas_handle, g_cublas_workspace,
+        32 * 1024 * 1024) == rocblas_status_success);
+}
+#endif
 
 // Dense row-major GEMM: C = alpha * op_a(A) @ op_b(B) + beta * C
 static void cublasGemmExDense(cublasHandle_t handle,
@@ -161,6 +176,33 @@ void puf_mm_nn(Prec* a, Prec* b, Prec* out, cudaStream_t stream,
     cublasGemmExDense(g_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
         a->data, b->data, out->data, stream, alpha, beta);
 }
+
+#ifdef USE_ROCM
+// ROCm GEMM with distinct residual and output:
+// out = alpha * a @ b + beta * residual.
+void puf_mm_nn_residual(Prec* a, Prec* b, Prec* residual, Prec* out,
+        cudaStream_t stream, float alpha, float beta) {
+    int M = batch_size(a->shape) * a->shape[ndim(a->shape)-2];
+    int K = a->shape[ndim(a->shape)-1];
+    int N = b->shape[ndim(b->shape)-1];
+#ifdef PRECISION_FLOAT
+    rocblas_datatype type = rocblas_datatype_f32_r;
+#else
+    rocblas_datatype type = rocblas_datatype_bf16_r;
+#endif
+    assert(rocblas_set_stream(g_rocblas_handle, stream) == rocblas_status_success);
+    rocblas_status status = rocblas_gemm_ex(
+        g_rocblas_handle, rocblas_operation_none, rocblas_operation_none,
+        N, M, K, &alpha, b->data, type, N, a->data, type, K,
+        &beta, residual->data, type, N, out->data, type, N,
+        rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+    if (status != rocblas_status_success) {
+        fprintf(stderr, "residual GEMM failed: %d (%d x %d x %d)\n",
+            (int)status, M, N, K);
+        abort();
+    }
+}
+#endif
 
 
 // Queue dW (mm_tn) on side stream once inputs are ready on main. Per-layer
@@ -582,8 +624,10 @@ void decoder_reg_train(void* w, void* activations,
     if (dw->ar) {
         a->condition_scratch = {.shape = {AR_CONDITION_SIZE}};
         a->condition_accum = {.shape = {AR_CONDITION_SIZE}};
+        a->cond_accum_parts = {.shape = {COND_STRIPE_COUNT, AR_CONDITION_SIZE}};
         alloc_register(grads, &a->condition_scratch);
         alloc_register(acts, &a->condition_accum);
+        alloc_register(acts, &a->cond_accum_parts);
     }
 }
 
@@ -1232,6 +1276,17 @@ void normuon_step(NorMuon* m, Float weights, Prec grads,
             } else {
                 puf_mm(&src, &src, &gram, stream);
             }
+#ifdef USE_ROCM
+            puf_mm_nn_residual(&gram, &gram, &gram, &gram_buf, stream,
+                (float)ns_coeffs[i][2], (float)ns_coeffs[i][1]);
+            if (tall) {
+                puf_mm_nn_residual(&src, &gram_buf, &src, &dst,
+                    stream, 1.0f, (float)ns_coeffs[i][0]);
+            } else {
+                puf_mm_nn_residual(&gram_buf, &src, &src, &dst,
+                    stream, 1.0f, (float)ns_coeffs[i][0]);
+            }
+#else
             puf_copy(&gram_buf, &gram, stream);
             puf_mm_nn(&gram, &gram, &gram_buf, stream,
                 (float)ns_coeffs[i][2], (float)ns_coeffs[i][1]);
@@ -1243,6 +1298,7 @@ void normuon_step(NorMuon* m, Float weights, Prec grads,
                 puf_mm_nn(&gram_buf, &src, &dst,
                     stream, 1.0f, (float)ns_coeffs[i][0]);
             }
+#endif
         }
         float* row_norm_sums = m->row_norm_sums.data;
         if (C <= 2 * NORMUON_WARP_SIZE) {
@@ -2068,6 +2124,8 @@ __global__ void ppo_loss_compute(
     int idx = blockIdx.x * PPO_ROWS_PER_BLOCK + row_in_block;
     __shared__ float sh_logp[PPO_ROWS_PER_BLOCK * PPO_HEADS];
     __shared__ float sh_ent[PPO_ROWS_PER_BLOCK * PPO_HEADS];
+    __shared__ float sh_d_new_logp[PPO_ROWS_PER_BLOCK];
+    __shared__ float sh_d_entropy_term[PPO_ROWS_PER_BLOCK];
 #else
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 #endif
@@ -2081,6 +2139,7 @@ __global__ void ppo_loss_compute(
         int mask_base = nt * a.mask_stride;
         int action_base = nt * a.num_atns;
 
+#ifndef POLICY_MASK_SIZE
         float old_logp = to_float(g.old_logprobs[nt]);
         float adv = to_float(g.advantages[nt]);
         float w = to_float(g.prio[n]);
@@ -2103,6 +2162,7 @@ __global__ void ppo_loss_compute(
         float v_loss = 0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
         float d_val_pred = (v_loss_clipped > v_loss_unclipped) ? 0.0f : (val_pred - ret);
         a.grad_values_pred[nt] = inv_NT * a.vf_coef * d_val_pred;
+#endif
 
 #ifdef POLICY_MASK_SIZE
         {
@@ -2115,26 +2175,31 @@ __global__ void ppo_loss_compute(
             int A = a.act_sizes[head];
             int raw_act = (int)to_float(g.actions[action_base + head]);
             int act = (unsigned)raw_act < (unsigned)A ? raw_act : 0;
-            int used = head_active(
-                a.action_mask, mask_base, g.actions, action_base, head);
+            // Hoisted AR context: type/primary/selection/prefix read once per
+            // thread instead of being recomputed for every option in each pass
+            // (the non-context helpers rescanned the mask per option).
+            ARContext c = ar_ctx_init(
+                a.action_mask, mask_base, g.actions, action_base);
+            if (head >= 2) ar_ctx_set_count(&c, g.actions, action_base);
+            for (int i = 0; i < head - 3; ++i)
+                ar_ctx_advance(&c, g.actions, action_base);
+            int used = ar_head_active(&c, head);
             float lse = 0.0f, ent = 0.0f, act_l = 0.0f;
             if (used) {
                 // Cache-free two passes; all state in registers.
                 float max_l = -INFINITY;
                 for (int j = 0; j < A; ++j) {
-                    float l = option_legal(a.action_mask, mask_base,
-                        g.actions, action_base, head, j)
+                    float l = ar_option_legal(&c, a.action_mask, mask_base, head, j)
                         ? to_float(a.logits[logits_base + head_offset + j]) +
-                            cond_bias(a.condition, g.actions, action_base, head, j)
+                            ar_cond_bias(&c, a.condition, head, j)
                         : -1e4f;
                     if (l > max_l) max_l = l;
                 }
                 float sum = 0.0f, sum_le = 0.0f;
                 for (int j = 0; j < A; ++j) {
-                    float l = option_legal(a.action_mask, mask_base,
-                        g.actions, action_base, head, j)
+                    float l = ar_option_legal(&c, a.action_mask, mask_base, head, j)
                         ? to_float(a.logits[logits_base + head_offset + j]) +
-                            cond_bias(a.condition, g.actions, action_base, head, j)
+                            ar_cond_bias(&c, a.condition, head, j)
                         : -1e4f;
                     float e = __expf(l - max_l);
                     sum += e;
@@ -2147,26 +2212,76 @@ __global__ void ppo_loss_compute(
             sh_logp[row_in_block * PPO_HEADS + head] = used ? act_l - lse : 0.0f;
             sh_ent[row_in_block * PPO_HEADS + head] = used ? ent : 0.0f;
             __syncthreads();
-            float total_log_prob = 0.0f, total_entropy = 0.0f;
-            for (int hh = 0; hh < PPO_HEADS; ++hh) {
-                total_log_prob += sh_logp[row_in_block * PPO_HEADS + hh];
-                total_entropy += sh_ent[row_in_block * PPO_HEADS + hh];
+            if (head == 0) {
+                float total_log_prob = 0.0f;
+                float total_entropy = 0.0f;
+                for (int hh = 0; hh < PPO_HEADS; ++hh) {
+                    total_log_prob += sh_logp[row_in_block * PPO_HEADS + hh];
+                    total_entropy += sh_ent[row_in_block * PPO_HEADS + hh];
+                }
+
+                float old_logp = to_float(g.old_logprobs[nt]);
+                float adv = to_float(g.advantages[nt]);
+                float w = to_float(g.prio[n]);
+                float val = to_float(g.values[nt]);
+                float ret = to_float(g.returns[nt]);
+                float val_pred = to_float(a.values_pred[logits_base]);
+                g.out_newvalue[nt] = from_float(val_pred);
+
+                float adv_std = sqrtf(a.adv_var[0]);
+                float adv_normalized =
+                    (adv - a.adv_mean[0]) / (adv_std + 1e-8f);
+                float ent_coef = *a.ent_coef;
+
+                float v_error = val_pred - val;
+                float v_clipped = val + fmaxf(-a.vf_clip_coef,
+                    fminf(a.vf_clip_coef, v_error));
+                float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
+                float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
+                float v_loss =
+                    0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
+                float d_val_pred = v_loss_clipped > v_loss_unclipped
+                    ? 0.0f : val_pred - ret;
+                a.grad_values_pred[nt] =
+                    inv_NT * a.vf_coef * d_val_pred;
+
+                float logratio = total_log_prob - old_logp;
+                float ratio = __expf(logratio);
+                g.out_ratio[nt] = from_float(ratio);
+                float clip_lo = 1.0f - a.clip_coef;
+                float clip_hi = 1.0f + a.clip_coef;
+                float ratio_clipped =
+                    fmaxf(clip_lo, fminf(clip_hi, ratio));
+                float wa = -w * adv_normalized;
+                float pg_loss1 = wa * ratio;
+                float pg_loss2 = wa * ratio_clipped;
+                float pg_loss = fmaxf(pg_loss1, pg_loss2);
+                float d_ratio = wa * inv_NT;
+                if (pg_loss2 > pg_loss1 &&
+                        (ratio <= clip_lo || ratio >= clip_hi)) {
+                    d_ratio = 0.0f;
+                }
+                sh_d_new_logp[row_in_block] = d_ratio * ratio;
+                sh_d_entropy_term[row_in_block] =
+                    inv_NT * (-ent_coef);
+
+                float thread_loss = (pg_loss + a.vf_coef * v_loss
+                    - ent_coef * total_entropy) * inv_NT;
+                block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
+                block_losses[LOSS_VF][tid] = v_loss * inv_NT;
+                block_losses[LOSS_ENT][tid] = total_entropy * inv_NT;
+                block_losses[LOSS_TOTAL][tid] = thread_loss;
+                block_losses[LOSS_OLD_APPROX_KL][tid] =
+                    (-logratio) * inv_NT;
+                block_losses[LOSS_APPROX_KL][tid] =
+                    ((ratio - 1.0f) - logratio) * inv_NT;
+                block_losses[LOSS_CLIPFRAC][tid] =
+                    (fabsf(ratio - 1.0f) > a.clip_coef
+                        ? 1.0f : 0.0f) * inv_NT;
             }
-            float logratio = total_log_prob - old_logp;
-            float ratio = __expf(logratio);
-            g.out_ratio[nt] = from_float(ratio);
-            float clip_lo = 1.0f - a.clip_coef;
-            float clip_hi = 1.0f + a.clip_coef;
-            float ratio_clipped = fmaxf(clip_lo, fminf(clip_hi, ratio));
-            float wa = -w * adv_normalized;
-            float pg_loss1 = wa * ratio;
-            float pg_loss2 = wa * ratio_clipped;
-            float pg_loss = fmaxf(pg_loss1, pg_loss2);
-            float d_ratio = wa * inv_NT;
-            if (pg_loss2 > pg_loss1 && (ratio <= clip_lo || ratio >= clip_hi)) {
-                d_ratio = 0.0f;
-            }
-            float d_new_logp = d_ratio * ratio;
+            __syncthreads();
+            float d_new_logp = sh_d_new_logp[row_in_block];
+            float d_entropy_term = sh_d_entropy_term[row_in_block];
 
             if (!used) {
                 for (int j = 0; j < A; ++j) {
@@ -2174,19 +2289,17 @@ __global__ void ppo_loss_compute(
                 }
             } else {
                 for (int j = 0; j < A; ++j) {
-                    if (!option_legal(a.action_mask, mask_base,
-                            g.actions, action_base, head, j)) {
+                    if (!ar_option_legal(&c, a.action_mask, mask_base, head, j)) {
                         a.grad_logits[at_base + head_offset + j] = 0.0f;
                         continue;
                     }
                     float logp = to_float(a.logits[logits_base + head_offset + j])
-                        + cond_bias(a.condition, g.actions, action_base, head, j)
-                        - lse;
+                        + ar_cond_bias(&c, a.condition, head, j) - lse;
                     float p = __expf(logp);
                     a.grad_logits[at_base + head_offset + j] =
                         ((j == act ? 1.0f : 0.0f) - p) * d_new_logp
                         + d_entropy_term * p * (-ent - logp);
-                    cond_add(a.grad_condition, g.actions, action_base, head, j,
+                    ar_cond_add(a.grad_condition + (nt & 7) * AR_CONDITION_SIZE, &c, head, j,
                         a.grad_logits[at_base + head_offset + j]);
                 }
             }
@@ -2197,18 +2310,6 @@ __global__ void ppo_loss_compute(
                 for (int j = active; j < a.A_total; ++j) {
                     a.grad_logits[at_base + j] = 0.0f;
                 }
-            }
-            if (head == 0) {
-                float thread_loss = (pg_loss + a.vf_coef * v_loss
-                    - ent_coef * total_entropy) * inv_NT;
-                block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
-                block_losses[LOSS_VF][tid] = v_loss * inv_NT;
-                block_losses[LOSS_ENT][tid] = total_entropy * inv_NT;
-                block_losses[LOSS_TOTAL][tid] = thread_loss;
-                block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_NT;
-                block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_NT;
-                block_losses[LOSS_CLIPFRAC][tid] =
-                    (fabsf(ratio - 1.0f) > a.clip_coef ? 1.0f : 0.0f) * inv_NT;
             }
         }
 #else
@@ -2414,6 +2515,16 @@ __global__ void puf_float_to_precision_kernel(
     if (idx < n) dst[idx] = from_float(src[idx]);
 }
 
+__global__ void cond_parts_sum(
+        float* __restrict__ dst, const float* __restrict__ parts,
+        int stripes, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float sum = 0.0f;
+    for (int k = 0; k < stripes; ++k) sum += parts[k * n + idx];
+    dst[idx] = sum;
+}
+
 void ppo_loss_fwd_bwd(
         Prec& dec_out,    // (N, T, fused_cols) - fused logits+value from decoder
         Prec& logstd,     // continuous logstd or empty
@@ -2422,7 +2533,7 @@ void ppo_loss_fwd_bwd(
         float clip_coef, float vf_clip_coef, float vf_coef, const float* ent_coef,
         PPOBufs& bufs, bool is_continuous,
         Prec condition, Float condition_accum, Prec condition_grad,
-        cudaStream_t stream) {
+        Float condition_parts, cudaStream_t stream) {
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
     int A_total = fused_cols - 1;  // last column is value
     int total = N * T;
@@ -2444,6 +2555,10 @@ void ppo_loss_fwd_bwd(
     if (condition_accum.data) {
         cudaMemsetAsync(condition_accum.data, 0,
             numel(condition_accum.shape) * sizeof(float), stream);
+    }
+    if (condition_parts.data) {
+        cudaMemsetAsync(condition_parts.data, 0,
+            numel(condition_parts.shape) * sizeof(float), stream);
     }
 
     PPOGraphArgs graph_args = {
@@ -2471,7 +2586,7 @@ void ppo_loss_fwd_bwd(
         .act_sizes = act_sizes,
         .action_mask = graph.mb_action_mask.data,
         .condition = condition.data,
-        .grad_condition = condition_accum.data,
+        .grad_condition = condition_parts.data,
         .head_consume = hc_dev_l,
         .hc_stride = hc_stride_l,
         .mask_stride = graph.mb_action_mask.shape[2],
@@ -2483,6 +2598,13 @@ void ppo_loss_fwd_bwd(
     };
     ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(
             bufs.ppo_partials.data, args, graph_args);
+    if (condition_parts.data) {
+        // Sum the row-striped condition-gradient staging copies (contention
+        // reduced by spreading atomics across COND_STRIPE_COUNT tensors).
+        int cn = (int)numel(condition_accum.shape);
+        cond_parts_sum<<<grid_size(cn), BLOCK_SIZE, 0, stream>>>(
+            condition_accum.data, condition_parts.data, COND_STRIPE_COUNT, cn);
+    }
     if (condition_accum.data) {
         int n = numel(condition_accum.shape);
         puf_float_to_precision_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(

@@ -1,6 +1,9 @@
 // CUDA
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#ifdef USE_ROCM
+#include <rocblas/rocblas.h>
+#endif
 #ifndef USE_ROCM
 #include <cuda_profiler_api.h>
 #endif
@@ -1678,14 +1681,31 @@ __global__ void transpose_102(precision_t* dst,
 
 __global__ void transpose_102_bytes(unsigned char* dst,
         const unsigned char* src, int A, int B, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = A * B * C;
-    if (idx >= total) return;
-    int a = idx / (B * C);
-    int rem = idx % (B * C);
-    int b = rem / C;
-    int c = rem % C;
-    dst[b * A * C + a * C + c] = src[idx];
+    // 2D grid (blockIdx.x = a, blockIdx.y = b): one block streams one
+    // (a, b) row as 8-byte words when C is divisible by 8 (packed obs is
+    // 8120 bytes). No per-element div/mod and full-width coalescing on both
+    // sides. Byte-scalar fallback keeps non-multiple C correct.
+    if ((C & 7) == 0) {
+        int a = blockIdx.x;
+        int b = blockIdx.y;
+        int C8 = C >> 3;
+        const unsigned long long* s =
+            (const unsigned long long*)(src + ((long)a * B + b) * C);
+        unsigned long long* d =
+            (unsigned long long*)(dst + ((long)b * A + a) * C);
+        for (int c8 = threadIdx.x; c8 < C8; c8 += blockDim.x) d[c8] = s[c8];
+        return;
+    }
+    long idx = ((long)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x
+        + threadIdx.x;
+    long total = (long)A * B * C;
+    for (; idx < total; idx += (long)gridDim.x * gridDim.y * blockDim.x) {
+        int a = (int)(idx / (B * C));
+        int rem = (int)(idx % (B * C));
+        int b = rem / C;
+        int c = rem % C;
+        dst[b * A * C + a * C + c] = src[idx];
+    }
 }
 
 // Sparse row scatter: dst[idx[i], :] = src[i, :]. One thread per element.
@@ -1740,7 +1760,7 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     int num_atns = (int)src.actions.shape[2];
 
 #ifdef PUFFER_PACKED_OBS
-    transpose_102_bytes<<<grid_size(T * B * obs_size), BLOCK_SIZE, 0, train_stream>>>(
+    transpose_102_bytes<<<dim3(T, B), BLOCK_SIZE, 0, train_stream>>>(
         rollouts->observations.data, src.observations.data, T, B, obs_size);
 #else
     transpose_102<<<grid_size(T * B * obs_size), BLOCK_SIZE, 0, train_stream>>>(
@@ -1918,7 +1938,7 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
                 pufferl->ppo_bufs.ent_coef,
                 pufferl->ppo_bufs, pufferl->is_continuous,
                 dw_train->condition, da_train->condition_accum,
-                da_train->condition_scratch, stream);
+                da_train->condition_scratch, da_train->cond_accum_parts, stream);
 
             Float grad_logits = pufferl->ppo_bufs.grad_logits;
             Float grad_logstd = pufferl->is_continuous ? pufferl->ppo_bufs.grad_logstd : Float();
@@ -2175,6 +2195,9 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 
     cudaSetDevice(hypers.gpu_id);
     cublas_init_handle();
+#ifdef USE_ROCM
+    rocblas_init_handle();
+#endif
 
     if (hypers.world_size > 1) {
         ncclCommInitRank(&pufferl->nccl_comm, hypers.world_size, *nccl_id, hypers.rank);

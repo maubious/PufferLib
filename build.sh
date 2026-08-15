@@ -388,7 +388,7 @@ if [ "$MODE" = "native" ]; then
             "$HIPIFY_DIR/pufferl.hip" \
             -x none "${LINK_ARCHIVES[@]}" \
             "$RAYLIB_A" "${EXTRA_LDFLAGS[@]}" \
-            -lrccl -lhipblas -lhipsolver -lhiprand \
+            -lrccl -lhipblas -lrocblas -lhipsolver -lhiprand \
             -lm -lpthread -lomp "${STANDALONE_LDFLAGS[@]}" \
             -o puffer
         echo "Built: ./puffer"
