@@ -41,9 +41,12 @@ static constexpr int BA_POOLED = BA_FIXED + BA_POOL_SECTIONS * BA_TOKEN_W;
 // (hand 8 + growth, jokers 5 + negative-edition slot, consumables 2, shop 4,
 // vouchers 2, boosters 2, pack 5); live slots beyond a cap are zero-padded
 // (the pooled stats still cover them).
-static constexpr int BA_SLOT_HAND = 10;
-static constexpr int BA_SLOT_JOKERS = 6;
-static constexpr int BA_SLOT_CONSUMABLES = 2;
+// Caps cover the game's growth mechanics: hand size can reach ~16 (base 8 +
+// Juggler +1, Troubadour +2, Turtle Bean +5), joker slots grow past 5 with
+// negative-edition jokers (+1 each), consumables likewise.
+static constexpr int BA_SLOT_HAND = 16;
+static constexpr int BA_SLOT_JOKERS = 8;
+static constexpr int BA_SLOT_CONSUMABLES = 4;
 static constexpr int BA_SLOT_SHOP = 4;
 static constexpr int BA_SLOT_VOUCHERS = 2;
 static constexpr int BA_SLOT_BOOSTERS = 2;
@@ -83,7 +86,7 @@ static constexpr int BA_TOKEN_CELLS =
 
 static_assert(sizeof(Observation) == 8120,
     "Balatro encoder must be updated for the Observation layout");
-static_assert(BA_FIXED == 253 && BA_POOLED == 509 && BA_TOTAL == 1005,
+static_assert(BA_FIXED == 253 && BA_POOLED == 509 && BA_TOTAL == 1165,
     "Balatro encoder pooled layout mismatch");
 
 struct BalatroEncoderWeights {
