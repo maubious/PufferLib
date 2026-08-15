@@ -1321,7 +1321,7 @@ struct TrainGraph {
     Prec mb_state;       // view into train_state (L, A, H); read with agent_off
     PolicyObs mb_obs;    // view (B, T, packed bytes or precision values)
     Prec mb_actions;     // view (B, T, num_atns)
-    Float mb_logprobs;   // view (B, T) fp32 — bf16 would distort the ratio
+    Prec mb_logprobs;    // view (B, T)
     Prec mb_terminals;   // view (B, T)
     Prec mb_rewards;     // view (B, T)
     Prec mb_advantages;  // scratch
@@ -1434,7 +1434,7 @@ constexpr int PPO_MAX_HEAD_A = ppo_max_head_classes();
 struct PPOGraphArgs {
     precision_t* imp;
     const precision_t* actions;
-    const float* old_logprobs;
+    const precision_t* old_logprobs;
     const precision_t* advantages;
     const precision_t* values;
     const precision_t* returns;
@@ -1842,7 +1842,7 @@ __device__ __forceinline__ void ppo_continuous_head(
 __global__ void cache_imp_and_v(
         Prec dec_out,
         const precision_t* __restrict__ actions,
-        const float* __restrict__ old_logprobs,
+        const precision_t* __restrict__ old_logprobs,
         const precision_t* __restrict__ action_mask,
         Prec logstd,
         const int* __restrict__ act_sizes,
@@ -1958,7 +1958,7 @@ __global__ void cache_imp_and_v(
         }
     }
     new_lp_out[idx] = new_lp;
-    imp_out[idx] = from_float(__expf(new_lp - old_logprobs[idx]));
+    imp_out[idx] = from_float(__expf(new_lp - to_float(old_logprobs[idx])));
 }
 
 Prec arch_forward_train(Arch* p, Weights& w,
@@ -2008,7 +2008,7 @@ __global__ void ppo_loss_compute(
         float val_pred = to_float(a.values_pred[logits_base]);
         float ent_coef = *a.ent_coef;
         float d_entropy_term = inv_NT * (-ent_coef);
-        float logratio = a.grad_values_pred[nt] - g.old_logprobs[nt];
+        float logratio = a.grad_values_pred[nt] - to_float(g.old_logprobs[nt]);
         float ratio = __expf(logratio);
 
         // Value loss + gradient: 0.5 * max((v-r)^2, (v_clip-r)^2).

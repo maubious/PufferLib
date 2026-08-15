@@ -398,9 +398,7 @@ struct RolloutBuf {
     Prec initial_states;
     Prec actions;       // (horizon, agents, num_atns)
     Prec values;        // (horizon, agents)
-    Float logprobs;     // (horizon, agents) fp32: 8-head logp is ~-30, where
-                        // bf16 quantization would distort the PPO ratio by
-                        // up to ~12% (see the new_lp - old_lp logratio).
+    Prec logprobs;      // ...
     Prec rewards;
     Prec terminals;
     Prec action_mask;   // (horizon, agents, mask_size)
@@ -420,9 +418,8 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
     bufs->terminals    = {.shape = {T, B}};
     bufs->action_mask  = {.shape = {T, B, mask_size}};
     alloc_register(alloc, &bufs->observations);
-    alloc_register(alloc, &bufs->logprobs);
     Prec* fields[] = {
-        &bufs->actions, &bufs->values,
+        &bufs->actions, &bufs->values, &bufs->logprobs,
         &bufs->rewards, &bufs->terminals, &bufs->action_mask,
     };
     for (int i = 0; i < (int)(sizeof(fields) / sizeof(fields[0])); i++) {
@@ -432,21 +429,14 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
 
 // Rank-2 or rank-3 time-major tensor. F==0 means rank-2 (zero-terminated shape);
 // stride still multiplies by max(F, 1).
-template <typename T>
-static T puf_time_view_t(T p, int start_t, int steps) {
+Prec puf_time_view(Prec p, int start_t, int T) {
     long B = p.shape[1];
     long F = p.shape[2];
     long stride_f = F > 1 ? F : 1;
     return {
         .data = p.data + (long)start_t * B * stride_f,
-        .shape = {steps, B, F},
+        .shape = {T, B, F},
     };
-}
-Prec puf_time_view(Prec p, int start_t, int T) {
-    return puf_time_view_t(p, start_t, T);
-}
-Float puf_time_view(Float p, int start_t, int T) {
-    return puf_time_view_t(p, start_t, T);
 }
 
 RolloutBuf rollout_time_view(RolloutBuf* base, int start_t, int T) {
@@ -658,7 +648,7 @@ __global__ void sample_logits(
         Prec logstd,           // (1, od) continuous only; .data null if discrete
         int* act_sizes,            // (NUM_ATNS,)
         precision_t* actions,                 // (B, num_atns)
-        float* logprobs,                      // (B,) fp32 — 8-head logp ~ -30
+        precision_t* logprobs,                // (B,)
         precision_t* value_out,               // (B,)
         curandStatePhilox4_32_10_t* rng_states,
         precision_t* action_mask,             // (B, A_total); always allocated
@@ -888,7 +878,7 @@ __global__ void sample_logits(
 #endif
     }
 
-    logprobs[idx] = total_log_prob;
+    logprobs[idx] = from_float(total_log_prob);
     value_out[idx] = logits[logits_base + fused_cols - 1];
     rng_states[idx] = state;
 }
@@ -951,8 +941,7 @@ __global__ void zero_term_state(Prec state, Float terminals,
 
 // Select time t, then agents [start, start+count). Rank-2 has F==0 (zero-term shape);
 // stride uses max(F, 1). Out shape {count, F} keeps ndim 1 when F==0.
-template <typename T>
-static T puf_slice_t(T p, int t, int start, int count) {
+Prec puf_slice(Prec p, int t, int start, int count) {
     long B = p.shape[1];
     long F = p.shape[2];
     long stride_f = F > 1 ? F : 1;
@@ -960,12 +949,6 @@ static T puf_slice_t(T p, int t, int start, int count) {
         .data = p.data + (long)(t * B + start) * stride_f,
         .shape = {count, F},
     };
-}
-Prec puf_slice(Prec p, int t, int start, int count) {
-    return puf_slice_t(p, t, start, count);
-}
-Float puf_slice(Float p, int t, int start, int count) {
-    return puf_slice_t(p, t, start, count);
 }
 
 #ifdef PUFFER_PACKED_OBS
@@ -1063,7 +1046,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         int sub = start + off;
         PolicyObs obs_b = puf_obs_slice(rollouts.observations, t, sub, n);
         Prec act_b  = puf_slice(rollouts.actions,      t, sub, n);
-        Float lp_b  = puf_slice(rollouts.logprobs,     t, sub, n);
+        Prec lp_b   = puf_slice(rollouts.logprobs,     t, sub, n);
         Prec val_b  = puf_slice(rollouts.values,       t, sub, n);
         Prec mask_b = puf_slice(rollouts.action_mask,  t, sub, n);
 
