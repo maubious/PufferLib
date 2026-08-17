@@ -375,8 +375,8 @@ typedef struct {
     int num_threads;
     int seed;
     // Best-trajectory state curriculum (see src/curriculum.cu). Disabled when
-    // state_buffer_size == 0 or cl_frac + fresh_frac == 0.
-    int state_buffer_size;
+    // num_start_states == 0 or cl_frac + fresh_frac == 0.
+    int num_start_states;
     float cl_frac;
     float fresh_frac;
     bool anneal_cl;
@@ -2143,7 +2143,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .gpu_id = ctx->gpu_id,
         .num_threads = puf_ini_get(ini, "vec", "num_threads"),
         .seed = puf_ini_get(ini, "base", "seed"),
-        .state_buffer_size = puf_ini_get(ini, "train", "state_buffer_size"),
+        .num_start_states = puf_ini_get(ini, "train", "num_start_states"),
         .cl_frac = (float)puf_ini_get(ini, "train", "cl_frac"),
         .fresh_frac = (float)puf_ini_get(ini, "train", "fresh_frac"),
         .anneal_cl = puf_ini_get(ini, "train", "anneal_cl") != 0,
@@ -2247,7 +2247,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     env_setup(pufferl, vec, &vec_kwargs, env_kwargs);
     pufferl->vec = vec;
 
-    // Best-trajectory state curriculum. Gated on config (state_buffer_size>0
+    // Best-trajectory state curriculum. Gated on config (num_start_states>0
     // plus a nonzero fresh/CL share) and env support (PUFFER_CURRICULUM).
     assert(hypers.cl_frac >= 0.0f && hypers.cl_frac <= 1.0f
         && "train.cl_frac must be in [0, 1]");
@@ -2255,7 +2255,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         && "train.fresh_frac must be in [0, 1]");
     int initial_num_cl_envs = (int)(hypers.cl_frac * (float)vec->size);
     int initial_num_fresh_envs = (int)(hypers.fresh_frac * (float)vec->size);
-    pufferl->curriculum_enabled = hypers.state_buffer_size > 0
+    pufferl->curriculum_enabled = hypers.num_start_states > 0
         && initial_num_cl_envs + initial_num_fresh_envs > 0;
     if (pufferl->curriculum_enabled) {
 #ifndef PUFFER_CURRICULUM
@@ -2282,7 +2282,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         }
         register_state_buffer(pufferl->state_buf,
             vec->size, agents_per_env, max_active_envs,
-            hypers.state_buffer_size, hypers.state_trajectory_max_len,
+            hypers.num_start_states, hypers.state_trajectory_max_len,
             hypers.state_checkpoint_interval);
         if (!init_state_buffer(pufferl->state_buf)) {
             fprintf(stderr, "create_pufferl: failed to allocate curriculum "
@@ -3401,7 +3401,7 @@ static PuffeRL* eval_make(Ini* ini, TrainContext* ctx, int mode) {
     puf_ini_put(ini, "base.reset_every_horizon", "0");
     // Evals run fixed episodes from reset; the state curriculum must not
     // hijack env starts or filter env logs.
-    puf_ini_put(ini, "train.state_buffer_size", "0");
+    puf_ini_put(ini, "train.num_start_states", "0");
     if (render) {
         puf_ini_put(ini, "train.horizon", "1");
     }
