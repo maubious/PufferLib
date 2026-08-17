@@ -130,7 +130,8 @@ static inline void store_selection(
     store_u64(out + 10, selection->required_hand);
 }
 
-static void puffer_mask(const LegalMasks *legal, unsigned char *mask) {
+static void puffer_mask(const LegalMasks *legal, unsigned char *mask,
+        const State *state) {
     memset(mask, 0, ACTION_MASK_SIZE);
 
     for (int type = 0; type < ACTION_TYPE_COUNT; ++type) {
@@ -138,6 +139,16 @@ static void puffer_mask(const LegalMasks *legal, unsigned char *mask) {
         mask[type] = 1;
         store_u64(mask + POLICY_PRIMARY_OFFSET +
             type * POLICY_PRIMARY_BYTES, legal->primary[type]);
+    }
+
+    /* Per-option card attrs for the AR selection heads: (suit << 4) | rank per
+       hand slot. Zero past hand_count; options are masked illegal there. */
+    int attr_n = state->hand_count < POLICY_CARD_ATTR_BYTES
+        ? state->hand_count : POLICY_CARD_ATTR_BYTES;
+    for (int i = 0; i < attr_n; ++i) {
+        mask[POLICY_CARD_ATTR_OFFSET + i] =
+            (unsigned char)((state->hand[i].suit << POLICY_CARD_ATTR_SUIT_SHIFT)
+                | (state->hand[i].rank & POLICY_CARD_ATTR_RANK_MASK));
     }
 
     store_selection(mask,
@@ -166,7 +177,8 @@ static int puffer_observe(Env *env) {
     if (error == OK) {
         disable_move_actions(&env->legal_masks);
         if (env->agents[0].action_mask)
-            puffer_mask(&env->legal_masks, env->agents[0].action_mask);
+            puffer_mask(&env->legal_masks, env->agents[0].action_mask,
+                &env->state);
     } else {
         memset(out, 0, OBS_SIZE * sizeof(*out));
     }

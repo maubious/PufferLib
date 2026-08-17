@@ -1575,6 +1575,15 @@ typedef struct ARContext {
     uint64_t required_left;  // required & ~selected
     int allowed_left;        // popcount(allowed & ~selected)
     int pos;                 // current card position (head - 3)
+    // Set-synergy stats over `selected` (incremental in ar_ctx_advance):
+    // per-suit and per-rank counts plus a rank bitset (ace at bits 1 and 14).
+    // The AR heads use them to condition scores on flush / pair / straight
+    // completion instead of only the previous card.
+    const precision_t* m;    // mask base (card-attr lookups)
+    int base;                // per-agent mask offset
+    int suit_counts[4];
+    int rank_counts[15];
+    int rmask;
 } ARContext;
 
 // Reads act[0..1] (type, primary) and the selection entry from the mask.
@@ -1605,6 +1614,11 @@ __device__ __forceinline__ ARContext ar_ctx_init(
     c.required_left = c.required;
     c.allowed_left = __popcll(c.allowed);
     c.pos = 0;
+    c.m = m;
+    c.base = base;
+    for (int i = 0; i < 4; ++i) c.suit_counts[i] = 0;
+    for (int i = 0; i < 15; ++i) c.rank_counts[i] = 0;
+    c.rmask = 0;
     return c;
 }
 
@@ -1612,6 +1626,37 @@ __device__ __forceinline__ ARContext ar_ctx_init(
 __device__ __forceinline__ void ar_ctx_set_count(
         ARContext* c, const precision_t* act, int ab) {
     c->count = ar_action_value(act, ab, 2, 6);
+}
+
+// Per-option card attribute ((suit << 4) | rank) from the env-written mask
+// table. Zero for out-of-range options (masked illegal anyway).
+__device__ __forceinline__ int ar_opt_attr(const ARContext* c, int opt) {
+    if (opt < 0 || opt >= POLICY_CARD_ATTR_BYTES) return 0;
+    return mask_byte(c->m, c->base, POLICY_CARD_ATTR_OFFSET + opt);
+}
+
+// Longest consecutive run of set rank bits containing position p (1..14).
+// Ace dual is handled by the caller trying both p=1 and p=14.
+__device__ __forceinline__ int ar_run_len(int rmask, int p) {
+    int left = 0, right = 0;
+    while (rmask & (1 << (p + right + 1))) right++;
+    while ((p - left - 1) >= 1 && (rmask & (1 << (p - left - 1)))) left++;
+    return left + right + 1;
+}
+
+// Straight-completion signal: longest consecutive run through opt's rank
+// among the selected cards plus opt itself.
+__device__ __forceinline__ int ar_run_through(const ARContext* c, int opt) {
+    int rank = ar_opt_attr(c, opt) & POLICY_CARD_ATTR_RANK_MASK;
+    if (rank < 1 || rank > 14) return 1;
+    int bit = (rank == 14) ? ((1 << 1) | (1 << 14)) : (1 << rank);
+    int rmask = c->rmask | bit;
+    int best = ar_run_len(rmask, rank == 14 ? 1 : rank);
+    if (rank == 14) {
+        int hi = ar_run_len(rmask, 14);
+        if (hi > best) best = hi;
+    }
+    return best;
 }
 
 // Advance the card-selection prefix by one position (call after heads 3..6).
@@ -1624,6 +1669,14 @@ __device__ __forceinline__ void ar_ctx_advance(
         c->pos++;
         c->required_left = c->required & ~c->selected;
         c->allowed_left = __popcll(c->allowed & ~c->selected);
+        int attr = ar_opt_attr(c, card);
+        int suit = attr >> POLICY_CARD_ATTR_SUIT_SHIFT;
+        int rank = attr & POLICY_CARD_ATTR_RANK_MASK;
+        if (suit >= 0 && suit < 4) c->suit_counts[suit]++;
+        if (rank >= 1 && rank <= 14) {
+            c->rank_counts[rank]++;
+            c->rmask |= (rank == 14) ? (1 << 1) | (1 << 14) : (1 << rank);
+        }
     }
 }
 
@@ -1680,9 +1733,26 @@ __device__ __forceinline__ int ar_cond_idx(
             (c->primary * 5 + pos) * 64 + opt;
         if (part == 2) return AR_COUNT_CARD_OFFSET +
             (c->count * 5 + pos) * 64 + opt;
-        if (pos > 0)
+        if (part == 3 && pos > 0)
             return AR_PREVIOUS_CARD_OFFSET +
                 (c->prev * 4 + pos - 1) * 64 + opt;
+        if (part == 4) {
+            int suit = ar_opt_attr(c, opt) >> POLICY_CARD_ATTR_SUIT_SHIFT;
+            int cnt = suit >= 0 && suit < 4 ? c->suit_counts[suit] : 0;
+            if (cnt > 4) cnt = 4;
+            return AR_SUIT_CARD_OFFSET + (cnt * 5 + pos) * 64 + opt;
+        }
+        if (part == 5) {
+            int rank = ar_opt_attr(c, opt) & POLICY_CARD_ATTR_RANK_MASK;
+            int cnt = rank >= 1 && rank <= 14 ? c->rank_counts[rank] : 0;
+            if (cnt > 4) cnt = 4;
+            return AR_RANK_CARD_OFFSET + (cnt * 5 + pos) * 64 + opt;
+        }
+        if (part == 6) {
+            int run = ar_run_through(c, opt);
+            if (run > 5) run = 5;
+            return AR_RUN_CARD_OFFSET + ((run - 1) * 5 + pos) * 64 + opt;
+        }
     }
     return -1;
 }
@@ -1690,7 +1760,7 @@ __device__ __forceinline__ int ar_cond_idx(
 __device__ __forceinline__ float ar_cond_bias(
         const ARContext* c, const precision_t* cond, int head, int opt) {
     if (!cond || head == 0) return 0.0f;
-    int n = head == 1 ? 1 : head == 2 ? 2 : 4;
+    int n = head == 1 ? 1 : head == 2 ? 2 : 7;
     float v = 0.0f;
     for (int i = 0; i < n; ++i) {
         int j = ar_cond_idx(c, head, opt, i);
@@ -1702,7 +1772,7 @@ __device__ __forceinline__ float ar_cond_bias(
 __device__ __forceinline__ void ar_cond_add(
         float* g, const ARContext* c, int head, int opt, float v) {
     if (!g || v == 0.0f || head == 0) return;
-    int n = head == 1 ? 1 : head == 2 ? 2 : 4;
+    int n = head == 1 ? 1 : head == 2 ? 2 : 7;
     for (int i = 0; i < n; ++i) {
         int j = ar_cond_idx(c, head, opt, i);
         if (j >= 0) atomicAdd(g + j, v);
@@ -1803,7 +1873,7 @@ __device__ __forceinline__ float cond_bias(
         const precision_t* c, const precision_t* act,
         int ab, int head, int opt) {
     if (!c || head == 0) return 0.0f;
-    int n = head == 1 ? 1 : head == 2 ? 2 : 4;
+    int n = head == 1 ? 1 : head == 2 ? 2 : 7;
     float v = 0.0f;
     for (int i = 0; i < n; ++i) {
         int j = cond_idx(act, ab, head, opt, i);
@@ -1816,7 +1886,7 @@ __device__ __forceinline__ void cond_add(
         float* g, const precision_t* act, int ab,
         int head, int opt, float v) {
     if (!g || v == 0.0f || head == 0) return;
-    int n = head == 1 ? 1 : head == 2 ? 2 : 4;
+    int n = head == 1 ? 1 : head == 2 ? 2 : 7;
     for (int i = 0; i < n; ++i) {
         int j = cond_idx(act, ab, head, opt, i);
         if (j >= 0) atomicAdd(g + j, v);
@@ -1899,11 +1969,17 @@ __global__ void cache_imp_and_v(
                 continue;
             }
             int act = ar_action_value(actions, action_base, h, A);
+            // Per-option condition bias cached per head: the three passes
+            // below would otherwise recompute the (heavier) set-synergy
+            // parts for every option.
+            float bias_cache[PPO_MAX_HEAD_A];
+            for (int a = 0; a < A; ++a)
+                bias_cache[a] = ar_cond_bias(&c, condition, h, a);
             float max_l = -INFINITY;
             for (int a = 0; a < A; ++a) {
                 float l = ar_option_legal(&c, action_mask, mask_base, h, a)
                     ? to_float(logits[logits_base + logits_offset + a]) +
-                        ar_cond_bias(&c, condition, h, a)
+                        bias_cache[a]
                     : -1e4f;
                 if (l > max_l) max_l = l;
             }
@@ -1911,7 +1987,7 @@ __global__ void cache_imp_and_v(
             for (int a = 0; a < A; ++a) {
                 float l = ar_option_legal(&c, action_mask, mask_base, h, a)
                     ? to_float(logits[logits_base + logits_offset + a]) +
-                        ar_cond_bias(&c, condition, h, a)
+                        bias_cache[a]
                     : -1e4f;
                 float e = __expf(l - max_l);
                 sum += e;
@@ -1921,7 +1997,7 @@ __global__ void cache_imp_and_v(
             for (int a = 0; a < A; ++a) {
                 float l = ar_option_legal(&c, action_mask, mask_base, h, a)
                     ? to_float(logits[logits_base + logits_offset + a]) +
-                        ar_cond_bias(&c, condition, h, a)
+                        bias_cache[a]
                     : -1e4f;
                 logps[at_base + logits_offset + a] = l - lse;
             }
