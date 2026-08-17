@@ -24,13 +24,20 @@ typedef unsigned char obs_t;
 typedef struct Log {
 	float score;
 	float perf;
-	float reward;
-    float wins;
-    float ante;
-    float invalid_actions;
-    float truncations;
-    float n;
-    float action_counts[ACTION_TYPE_COUNT];
+	float wins;
+	float ante;
+	float invalid_actions;
+	float truncations;
+	float n;
+	/* Episode-end state snapshots (autopsy), summed at terminal. */
+	float end_dollars;
+	float end_dollars_won;
+	float end_jokers;
+	float end_consumables;
+	float end_hand_levels;
+	float end_deck;
+	float ep_length;
+	float action_counts[ACTION_TYPE_COUNT];
 } Log;
 
 static const char *const action_log_names[ACTION_TYPE_COUNT] = {
@@ -75,10 +82,21 @@ typedef struct Env {
     float invalid_action_reward;
 } Env;
 
-static inline float action_sum(const Log *log, const int *types, int count) {
-    float total = 0.0f;
-    for (int i = 0; i < count; ++i) total += log->action_counts[types[i]];
-    return total;
+static inline float hand_level_sum(const State *state) {
+    float levels = 0.0f;
+    for (int i = 0; i < HAND_COUNT; ++i) levels += (float)state->hand_levels[i];
+    return levels;
+}
+
+static inline void log_episode_end(Env *env, int won) {
+    const State *state = &env->state;
+    env->log.end_dollars += (float)state->dollars;
+    if (won) env->log.end_dollars_won += (float)state->dollars;
+    env->log.end_jokers += (float)state->joker_count;
+    env->log.end_consumables += (float)state->consumable_count;
+    env->log.end_hand_levels += hand_level_sum(state);
+    env->log.end_deck += (float)state->deck_count;
+    env->log.ep_length += (float)env->episode_steps;
 }
 
 static inline void disable_move_actions(LegalMasks *legal) {
@@ -326,7 +344,7 @@ static void truncate_episode(Env *env) {
     env->episode_reward += TIMEOUT_REWARD;
     env->log.score += env->episode_reward;
     env->log.perf += episode_perf(env);
-    env->log.reward += env->episode_reward;
+    log_episode_end(env, 0);
     puf_reset(env);
     /* puf_reset clears the reward slot; restore the boundary transition's
        reward after resetting the next episode's state. */
@@ -385,7 +403,7 @@ void puf_step(Env *env) {
         env->log.perf += episode_perf(env);
         env->log.ante += result.ante;
         env->log.n += 1.0f;
-        env->log.reward += env->episode_reward;
+        log_episode_end(env, result.won);
         puf_reset(env);
         env->agents[0].rewards[0] = result.reward;
         env->agents[0].terminals[0] = 1.0f;
@@ -406,50 +424,14 @@ void puf_log(Log *log, Dict *out) {
     dict_set(out, "ante", log->ante);
 	dict_set(out, "invalid_actions", log->invalid_actions);
 	dict_set(out, "truncations", log->truncations);
-	dict_set(out, "reward", log->reward);
+    dict_set(out, "end_dollars", log->end_dollars);
+    dict_set(out, "end_dollars_won", log->end_dollars_won);
+    dict_set(out, "end_jokers", log->end_jokers);
+    dict_set(out, "end_consumables", log->end_consumables);
+    dict_set(out, "end_hand_levels", log->end_hand_levels);
+    dict_set(out, "end_deck", log->end_deck);
+    dict_set(out, "ep_length", log->ep_length);
 
-    static const int play[] = {ACTION_PLAY_HAND};
-    static const int discard[] = {ACTION_DISCARD};
-    static const int card_move[] = {
-        ACTION_SWAP_HAND_LEFT, ACTION_SWAP_HAND_RIGHT,
-        ACTION_SORT_HAND_RANK, ACTION_SORT_HAND_SUIT,
-    };
-    static const int joker_move[] = {
-        ACTION_SWAP_JOKERS_LEFT, ACTION_SWAP_JOKERS_RIGHT,
-    };
-    static const int consumable[] = {
-        ACTION_SELL_CONSUMABLE, ACTION_USE_CONSUMABLE,
-    };
-    static const int shop[] = {
-        ACTION_REROLL, ACTION_BUY_CARD,
-        ACTION_REDEEM_VOUCHER, ACTION_OPEN_BOOSTER,
-        ACTION_BUY_AND_USE,
-    };
-    static const int pack[] = {
-        ACTION_SKIP_PACK, ACTION_PICK_PACK_CARD,
-    };
-    static const int blind[] = {
-        ACTION_SELECT_BLIND, ACTION_SKIP_BLIND,
-        ACTION_REROLL_BOSS,
-    };
-    static const int round[] = {
-        ACTION_CASH_OUT, ACTION_NEXT_ROUND,
-    };
-    static const int joker[] = {ACTION_SELL_JOKER};
-    /* These grouped counters are emitted first so they appear beside ante,
-       invalid_actions, reward, and truncations in Puffer's User Stats panel. */
-    dict_set(out, "play_actions", action_sum(log, play, 1));
-    dict_set(out, "discard_actions", action_sum(log, discard, 1));
-    dict_set(out, "card_move_actions", action_sum(log, card_move, 4));
-    dict_set(out, "joker_move_actions", action_sum(log, joker_move, 2));
-    dict_set(out, "consumable_actions", action_sum(log, consumable, 2));
-    dict_set(out, "shop_actions", action_sum(log, shop, 5));
-    dict_set(out, "pack_actions", action_sum(log, pack, 2));
-    dict_set(out, "blind_actions", action_sum(log, blind, 3));
-    dict_set(out, "round_actions", action_sum(log, round, 2));
-    dict_set(out, "joker_actions", action_sum(log, joker, 1));
-
-    /* Keep per-action detail in the environment log as well. */
     for (int i = 0; i < ACTION_TYPE_COUNT; ++i)
         dict_set(out, action_log_names[i], log->action_counts[i]);
 }

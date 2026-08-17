@@ -8,6 +8,8 @@
 // (the voucher vocabulary is the contiguous center range 268..299), and the
 // redundant deck summaries are not decoded at all.
 
+#include <joker_signatures.h>
+
 static constexpr int BA_CENTER_EMBED = 8;
 static constexpr int BA_BLIND_EMBED = 4;
 static constexpr int BA_TAG_EMBED = 4;
@@ -73,8 +75,28 @@ static constexpr int BA_SLOT_W = 16;
 static constexpr int BA_SLOT_FEATURES =
     (BA_SLOT_HAND + BA_SLOT_JOKERS + BA_SLOT_CONSUMABLES + BA_SLOT_SHOP
         + BA_SLOT_VOUCHERS + BA_SLOT_BOOSTERS + BA_SLOT_PACK) * BA_SLOT_W;
-// Full encoder output: pooled sections + per-slot sidecar.
-static constexpr int BA_TOTAL = BA_POOLED + BA_SLOT_FEATURES;
+// Per-slot joker signature sidecar: typed effect vectors from the
+// JOKER_SIGNATURES table, appended after the token sidecar for the 6
+// center-bearing zones. Constant table lookup — no gradient flows into the
+// token MLPs; the projection consumes these features directly.
+static constexpr int SIG_W = 16;
+static constexpr int SIG_ZONE_CAPS[BA_ZONES] = {
+    BA_SLOT_JOKERS, BA_SLOT_CONSUMABLES,
+    BA_SLOT_SHOP, BA_SLOT_VOUCHERS, BA_SLOT_BOOSTERS, BA_SLOT_PACK};
+static constexpr int SIG_ZONE_OFFSET[BA_ZONES] = {
+    0, BA_SLOT_JOKERS,
+    BA_SLOT_JOKERS + BA_SLOT_CONSUMABLES,
+    BA_SLOT_JOKERS + BA_SLOT_CONSUMABLES + BA_SLOT_SHOP,
+    BA_SLOT_JOKERS + BA_SLOT_CONSUMABLES + BA_SLOT_SHOP + BA_SLOT_VOUCHERS,
+    BA_SLOT_JOKERS + BA_SLOT_CONSUMABLES + BA_SLOT_SHOP + BA_SLOT_VOUCHERS
+        + BA_SLOT_BOOSTERS};
+static constexpr int SIG_SLOTS =
+    BA_SLOT_JOKERS + BA_SLOT_CONSUMABLES + BA_SLOT_SHOP
+    + BA_SLOT_VOUCHERS + BA_SLOT_BOOSTERS + BA_SLOT_PACK;
+static constexpr int SIG_OFFSET = BA_POOLED + BA_SLOT_FEATURES;
+// Full encoder output: pooled sections + per-slot token sidecar + signature
+// sidecar.
+static constexpr int BA_TOTAL = SIG_OFFSET + SIG_SLOTS * SIG_W;
 
 static constexpr int BA_BLOCK_AGENTS = 4; // agents per backward-kernel block
 // Token-MLP wgrad cells: 3 sections of (in_dim x BA_TOKEN_W) plus 3 biases.
@@ -86,8 +108,32 @@ static constexpr int BA_TOKEN_CELLS =
 
 static_assert(sizeof(Observation) == 8120,
     "Balatro encoder must be updated for the Observation layout");
-static_assert(BA_FIXED == 253 && BA_POOLED == 509 && BA_TOTAL == 1165,
+
+// Signature feature vector: SIG_W normalized floats from a table row.
+__device__ __forceinline__ float sig_value(const JokerSignature* sig, int d) {
+    switch (d) {
+    case 0: return sig->trigger / 6.0f;
+    case 1: return sig->condition / 10.0f;
+    case 2: return sig->cond_value / 14.0f;
+    case 3: return (sig->rank_mask & 0xFF) / 255.0f;
+    case 4: return ((sig->rank_mask >> 8) & 0xFF) / 255.0f;
+    case 5: return sig->chips / 500.0f;
+    case 6: return sig->mult / 64.0f;
+    case 7: return sig->xmult_pct / 400.0f;
+    case 8: return sig->dollars / 16.0f;
+    case 9: return sig->scale / 16.0f;
+    case 10: return sig->growth / 32.0f;
+    case 11: return sig->chance_pct / 100.0f;
+    case 12: return sig->retriggers / 4.0f;
+    case 13: return sig->levels / 8.0f;
+    case 14: return sig->rule / 5.0f;
+    default: return (float)sig->opaque;
+    }
+}
+static_assert(BA_FIXED == 253 && BA_POOLED == 509 && BA_TOTAL == 1565,
     "Balatro encoder pooled layout mismatch");
+
+
 
 struct BalatroEncoderWeights {
     Prec center_embed, blind_embed, tag_embed; // (CENTER,8) (BLIND,4) (TAG,4)
@@ -101,8 +147,8 @@ struct BalatroEncoderWeights {
 struct BalatroEncoderActivations {
     Prec pooled, out, d_pooled, proj_wgrad;
     Float center_wgrad_f, blind_wgrad_f, tag_wgrad_f;
-    Prec v_wgrad, v_bgrad, h_wgrad, h_bgrad, c_wgrad, c_bgrad;
     Prec center_wgrad, blind_wgrad, tag_wgrad;
+    Prec v_wgrad, v_bgrad, h_wgrad, h_bgrad, c_wgrad, c_bgrad;
     // Block-private token-MLP wgrad partials: (ceil(B_TT / BA_BLOCK_AGENTS),
     // BA_TOKEN_CELLS). Every block writes every cell; ba_grad_finalize_kernel
     // reduces the rows to the bf16 wgrads without atomics or memset.
@@ -111,6 +157,8 @@ struct BalatroEncoderActivations {
     const unsigned char* obs_data; // forward stashes the packed-obs tensor for backward
     int obs_batch;
 };
+
+
 
 __device__ __forceinline__ int ba_byte(
         const unsigned char* obs, int64_t base, int offset) {
@@ -288,6 +336,7 @@ __global__ void ba_encode_kernel(
     __shared__ float s_x[64][BA_CARD_IN];
     __shared__ int s_section[64];
     __shared__ int s_local[64];
+    __shared__ int s_center[64];
     int b = blockIdx.x;
     int64_t in = (int64_t)b * obs_size;
     int base = offsetof(Observation, globals);
@@ -437,6 +486,7 @@ __global__ void ba_encode_kernel(
             if (part == 0) {
                 s_section[slot] = section;
                 s_local[slot] = local;
+                s_center[slot] = center;
             }
             int per = (in_dim + 3) >> 2;
             int k = part * per;
@@ -473,6 +523,23 @@ __global__ void ba_encode_kernel(
                 + (BA_SLOT_OFFSET[sec] + local) * BA_SLOT_W + d]
                 = from_float(s_tok[slot][d]);
         }
+        // Signature sidecar: typed effect vector per center-bearing slot.
+        // Sections 2-7 map to SIG_ZONE_*; variants/hand have no signature.
+        for (int i = threadIdx.x; i < n * SIG_W; i += blockDim.x) {
+            int slot = i / SIG_W;
+            int d = i % SIG_W;
+            int sec = s_section[slot];
+            if (sec < 2) continue;
+            int zone = sec - 2;
+            int local = s_local[slot];
+            if (local >= SIG_ZONE_CAPS[zone]) continue;
+            int center = s_center[slot];
+            float v = (center >= 0 && center < CENTER_COUNT)
+                ? sig_value(&JOKER_SIGNATURES[center], d) : 0.0f;
+            pooled[b * BA_TOTAL + SIG_OFFSET
+                + (SIG_ZONE_OFFSET[zone] + local) * SIG_W + d]
+                = from_float(v);
+        }
         for (int c = threadIdx.x; c < BA_POOL_SECTIONS * BA_TOKEN_W; c += blockDim.x) {
             int sec = c / BA_TOKEN_W;
             int d = c % BA_TOKEN_W;
@@ -487,6 +554,19 @@ __global__ void ba_encode_kernel(
                 s_pool[c] += sum;
             }
         }
+    }
+    // Signature region tail: [count, cap) slots per zone hold stale table
+    // lookups from the previous step; clear them the same way.
+    for (int i = threadIdx.x; i < SIG_SLOTS * SIG_W; i += blockDim.x) {
+        int f = i / SIG_W;
+        int z = 0, acc = 0;
+        for (; z < BA_ZONES; ++z) {
+            if (f < acc + SIG_ZONE_CAPS[z]) break;
+            acc += SIG_ZONE_CAPS[z];
+        }
+        if (z >= BA_ZONES) continue;
+        if (f - acc >= counts[z + 2])
+            pooled[b * BA_TOTAL + SIG_OFFSET + i] = from_float(0.0f);
     }
     // Tail zeroing: the sidecar pass overwrote the live slots; only the
     // [count, cap) tail of each zone can hold stale embeddings from a
@@ -794,6 +874,7 @@ static Prec ba_encoder_forward(
     puf_mm(&a->pooled, &ew->proj_w, &a->out, stream);
     return a->out;
 }
+
 
 static void ba_encoder_backward(
         void* w, void* activations, Prec grad, cudaStream_t stream) {
