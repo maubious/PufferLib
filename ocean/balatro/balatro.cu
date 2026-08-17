@@ -33,7 +33,14 @@ static constexpr int BA_OFF_TAGS = BA_OFF_POKER + BA_POKER_FEATURES;
 static constexpr int BA_TAG_FEATURES = 1 + OBS_MAX_TAGS * (BA_TAG_EMBED + 2);
 static constexpr int BA_FIXED = BA_OFF_TAGS + BA_TAG_FEATURES;
 static constexpr int BA_POOL_SECTIONS = 2 + BA_ZONES; // variants, hand, 6 card zones
-static constexpr int BA_POOLED = BA_FIXED + BA_POOL_SECTIONS * BA_TOKEN_W;
+// Sum-pooled per-zone token features (composition / magnitude view).
+static constexpr int BA_MAX_OFFSET = BA_FIXED + BA_POOL_SECTIONS * BA_TOKEN_W;
+// Max-pooled per-zone token features (dominant-entity view), argmax kept for
+// the backward. Gated by ba_use_max_pool (env.max_pool); zeroed when off.
+// Inserted before the sidecar so the sidecar base shifts by one pool width.
+static constexpr int BA_POOLED = BA_MAX_OFFSET + BA_POOL_SECTIONS * BA_TOKEN_W;
+// Max-pool argmax width: one argmax per (section, token dim).
+static constexpr int BA_ARGS = BA_POOL_SECTIONS * BA_TOKEN_W;
 
 // Per-slot sidecar: each live token's 32-dim embedding exposed per slot for
 // the zones the AR heads target by index (hand, jokers, consumables, shop,
@@ -130,8 +137,15 @@ __device__ __forceinline__ float sig_value(const JokerSignature* sig, int d) {
     default: return (float)sig->opaque;
     }
 }
-static_assert(BA_FIXED == 253 && BA_POOLED == 509 && BA_TOTAL == 1565,
+static_assert(BA_FIXED == 253 && BA_POOLED == 765 && BA_TOTAL == 1821,
     "Balatro encoder pooled layout mismatch");
+
+// Runtime gate for the max-pooled section (env.max_pool). Set once at
+// create_pufferl before any forward; kernel-launch-arg so graphs capture it.
+static int ba_use_max_pool = 0;
+extern "C" void ba_set_use_max_pool(int use) {
+    ba_use_max_pool = use ? 1 : 0;
+}
 
 
 
@@ -146,6 +160,7 @@ struct BalatroEncoderWeights {
 
 struct BalatroEncoderActivations {
     Prec pooled, out, d_pooled, proj_wgrad;
+    Int argmax;  // max-pool argmax per (batch, section, token dim)
     Float center_wgrad_f, blind_wgrad_f, tag_wgrad_f;
     Prec center_wgrad, blind_wgrad, tag_wgrad;
     Prec v_wgrad, v_bgrad, h_wgrad, h_bgrad, c_wgrad, c_bgrad;
@@ -330,9 +345,12 @@ __global__ void ba_encode_kernel(
         const precision_t* __restrict__ v_w, const precision_t* __restrict__ v_b,
         const precision_t* __restrict__ h_w, const precision_t* __restrict__ h_b,
         const precision_t* __restrict__ c_w, const precision_t* __restrict__ c_b,
+        int* __restrict__ argmax_out, int use_max,
         int B, int obs_size) {
     __shared__ float s_tok[64][BA_TOKEN_W];
     __shared__ float s_pool[BA_POOL_SECTIONS * BA_TOKEN_W];
+    __shared__ float s_max[BA_POOL_SECTIONS * BA_TOKEN_W];
+    __shared__ int s_argmax[BA_POOL_SECTIONS * BA_TOKEN_W];
     __shared__ float s_x[64][BA_CARD_IN];
     __shared__ int s_section[64];
     __shared__ int s_local[64];
@@ -464,8 +482,11 @@ __global__ void ba_encode_kernel(
         }
         pooled[b * BA_TOTAL + feature] = from_float(value);
     }
-    for (int i = threadIdx.x; i < BA_POOL_SECTIONS * BA_TOKEN_W; i += blockDim.x)
+    for (int i = threadIdx.x; i < BA_POOL_SECTIONS * BA_TOKEN_W; i += blockDim.x) {
         s_pool[i] = 0.0f;
+        s_max[i] = 0.0f;
+        s_argmax[i] = 0;
+    }
     __syncthreads();
     int counts[8];
     ba_live_counts(obs, in, counts);
@@ -550,8 +571,21 @@ __global__ void ba_encode_kernel(
                 int lo = start > chunk_base ? start - chunk_base : 0;
                 int hi = end < chunk_base + n ? end - chunk_base : n;
                 float sum = 0.0f;
-                for (int slot = lo; slot < hi; ++slot) sum += s_tok[slot][d];
+                float mx = s_max[c];
+                int arg = s_argmax[c];
+                for (int slot = lo; slot < hi; ++slot) {
+                    float v = s_tok[slot][d];
+                    sum += v;
+                    if (use_max && v > mx) {
+                        mx = v;
+                        arg = chunk_base + slot - start;
+                    }
+                }
                 s_pool[c] += sum;
+                if (use_max) {
+                    s_max[c] = mx;
+                    s_argmax[c] = arg;
+                }
             }
         }
     }
@@ -587,6 +621,15 @@ __global__ void ba_encode_kernel(
     __syncthreads();
     for (int i = threadIdx.x; i < BA_POOL_SECTIONS * BA_TOKEN_W; i += blockDim.x)
         pooled[b * BA_TOTAL + BA_FIXED + i] = from_float(s_pool[i]);
+    // Max-pooled section: dominant-entity view per (section, dim). Zeroed when
+    // off so the projection's extra columns stay silent (and get no gradient).
+    for (int i = threadIdx.x; i < BA_POOL_SECTIONS * BA_TOKEN_W; i += blockDim.x) {
+        int64_t off = (int64_t)b * BA_TOTAL + BA_MAX_OFFSET + i;
+        pooled[off] = use_max ? from_float(s_max[i]) : from_float(0.0f);
+        if (use_max) {
+            argmax_out[(int64_t)b * BA_ARGS + i] = s_argmax[i];
+        }
+    }
 }
 
 // Backward through the token MLPs and the fixed-section embeddings.
@@ -605,6 +648,7 @@ __global__ void ba_token_backward_kernel(
         const precision_t* __restrict__ v_w, const precision_t* __restrict__ v_b,
         const precision_t* __restrict__ h_w, const precision_t* __restrict__ h_b,
         const precision_t* __restrict__ c_w, const precision_t* __restrict__ c_b,
+        const int* __restrict__ argmax, int use_max,
         int B, int obs_size) {
     static constexpr int CELLS_W = BA_CELLS_W;
     static constexpr int CELLS_H = BA_CELLS_H;
@@ -616,6 +660,7 @@ __global__ void ba_token_backward_kernel(
     __shared__ int s_section[64];
     __shared__ int s_center[64];
     __shared__ int s_local[64];
+    __shared__ int s_argmax[BA_POOL_SECTIONS * BA_TOKEN_W];
     int b0 = blockIdx.x * BA_BLOCK_AGENTS;
     // Per-thread cell accumulators, accumulated across all agents in the
     // block; flushed to global once per block instead of once per agent.
@@ -666,6 +711,12 @@ __global__ void ba_token_backward_kernel(
         ba_live_counts(obs, in, counts);
         int total = 0;
         for (int s = 0; s < 8; ++s) total += counts[s];
+        // Max-pool argmax per (section, dim); read by the dh pass below.
+        // Ordered by the first decode-pass __syncthreads before pass 1.
+        if (use_max) {
+            for (int i = threadIdx.x; i < BA_POOL_SECTIONS * BA_TOKEN_W; i += blockDim.x)
+                s_argmax[i] = argmax[(int64_t)b * BA_ARGS + i];
+        }
         for (int base = 0; base < total; base += 64) {
             int n = total - base < 64 ? total - base : 64;
             for (int slot = threadIdx.x >> 2; slot < n; slot += blockDim.x >> 2) {
@@ -705,12 +756,15 @@ __global__ void ba_token_backward_kernel(
                     for (int k = 0; k < in_dim; ++k)
                         accv += s_x[slot][k] * to_float(w[dim * in_dim + k]);
                     // Gradient of the slot's embedding: the pooled-section term
-                    // plus, for sidecar zones, the per-slot term.
+                    // plus, for sidecar zones, the per-slot term plus, when max
+                    // pooling is on, the max term routed to the argmax slot.
                     float dh = to_float(dp[BA_FIXED + section * BA_TOKEN_W + dim]);
                     int local = s_local[slot];
                     if (dim < BA_SLOT_W && local < BA_SLOT_CAPS[section])
                         dh += to_float(dp[BA_POOLED
                             + (BA_SLOT_OFFSET[section] + local) * BA_SLOT_W + dim]);
+                    if (use_max && local == s_argmax[section * BA_TOKEN_W + dim])
+                        dh += to_float(dp[BA_MAX_OFFSET + section * BA_TOKEN_W + dim]);
                     s_dh[slot][dim] = dh * ba_gelu_deriv(accv);
                 }
                 if (section >= 2 && center >= 0 && center < CENTER_COUNT) {
@@ -870,7 +924,8 @@ static Prec ba_encoder_forward(
     ba_encode_kernel<<<B, BLOCK_SIZE, 0, stream>>>(
         a->pooled.data, input.data, ew->center_embed.data, ew->blind_embed.data,
         ew->tag_embed.data, ew->v_w.data, ew->v_b.data, ew->h_w.data, ew->h_b.data,
-        ew->c_w.data, ew->c_b.data, B, ew->obs_size);
+        ew->c_w.data, ew->c_b.data, a->argmax.data, ba_use_max_pool,
+        B, ew->obs_size);
     puf_mm(&a->pooled, &ew->proj_w, &a->out, stream);
     return a->out;
 }
@@ -896,7 +951,8 @@ static void ba_encoder_backward(
         a->token_partials.data,
         a->d_pooled.data, a->obs_data, ew->center_embed.data,
         ew->v_w.data, ew->v_b.data, ew->h_w.data, ew->h_b.data,
-        ew->c_w.data, ew->c_b.data, B, ew->obs_size);
+        ew->c_w.data, ew->c_b.data, a->argmax.data, ba_use_max_pool,
+        B, ew->obs_size);
     ba_grad_finalize_kernel<<<grid_size(BA_TOKEN_CELLS), BLOCK_SIZE, 0, stream>>>(
         a->v_wgrad.data, a->v_bgrad.data, a->h_wgrad.data, a->h_bgrad.data,
         a->c_wgrad.data, a->c_bgrad.data, a->token_partials.data, blocks);
@@ -963,6 +1019,7 @@ static void ba_encoder_reg_train(
     a->pooled = {.shape = {B_TT, BA_TOTAL}};
     a->out = {.shape = {B_TT, ew->hidden}};
     a->d_pooled = {.shape = {B_TT, BA_TOTAL}};
+    a->argmax = {.shape = {B_TT, BA_ARGS}};
     a->proj_wgrad = {.shape = {ew->hidden, BA_TOTAL}};
     a->center_wgrad_f = {.shape = {CENTER_COUNT, BA_CENTER_EMBED}};
     a->blind_wgrad_f = {.shape = {BLIND_COUNT, BA_BLIND_EMBED}};
@@ -981,6 +1038,7 @@ static void ba_encoder_reg_train(
     alloc_register(acts, &a->pooled);
     alloc_register(acts, &a->out);
     alloc_register(acts, &a->d_pooled);
+    alloc_register(acts, &a->argmax);
     alloc_register(acts, &a->center_wgrad_f);
     alloc_register(acts, &a->blind_wgrad_f);
     alloc_register(acts, &a->tag_wgrad_f);
@@ -1006,8 +1064,10 @@ static void ba_encoder_reg_rollout(
     *a = {};
     a->pooled = {.shape = {B, BA_TOTAL}};
     a->out = {.shape = {B, ew->hidden}};
+    a->argmax = {.shape = {B, BA_ARGS}};
     alloc_register(alloc, &a->pooled);
     alloc_register(alloc, &a->out);
+    alloc_register(alloc, &a->argmax);
 }
 
 static void* ba_encoder_create_weights(void* self) {

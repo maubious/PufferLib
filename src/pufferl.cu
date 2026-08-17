@@ -2254,6 +2254,13 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     env_setup(pufferl, vec, &vec_kwargs, env_kwargs);
     pufferl->vec = vec;
 
+#ifdef PUFFER_BALATRO
+    // Max-pooled dominant-entity features in the balatro encoder
+    // (env.max_pool; 0 = sums only). Must be set before any forward.
+    DictItem* max_pool = dict_find(env_kwargs, "max_pool");
+    ba_set_use_max_pool(max_pool ? (max_pool->value != 0.0) : 0);
+#endif
+
     // Best-trajectory state curriculum. Gated on config (num_start_states>0
     // plus a nonzero fresh/CL share) and env support (PUFFER_CURRICULUM).
     assert(hypers.cl_frac >= 0.0f && hypers.cl_frac <= 1.0f
