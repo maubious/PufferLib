@@ -382,6 +382,11 @@ typedef struct {
     bool anneal_cl;
     int state_trajectory_max_len;
     int state_checkpoint_interval;
+    // Admission floor: trajectories below this return never enter the pool and
+    // CL envs stay vanilla until a qualifying trajectory exists (0 = off).
+    float curriculum_min_admit;
+    // CL checkpoint sampling: 1 = tail-weighted (accumulated setups), 0 = uniform.
+    int curriculum_cl_tail_bias;
 } Hypers;
 
 // Rank / device context for one process in a multi-GPU train job.
@@ -2149,6 +2154,8 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .anneal_cl = puf_ini_get(ini, "train", "anneal_cl") != 0,
         .state_trajectory_max_len = puf_ini_get(ini, "train", "state_trajectory_max_len"),
         .state_checkpoint_interval = puf_ini_get(ini, "train", "state_checkpoint_interval"),
+        .curriculum_min_admit = (float)puf_ini_get(ini, "train", "curriculum_min_admit"),
+        .curriculum_cl_tail_bias = puf_ini_get(ini, "train", "curriculum_cl_tail_bias") != 0,
     };
 
     Dict vec_kwargs = {0};

@@ -278,14 +278,22 @@ static inline void curriculum_seed_best(PuffeRL* pufferl) {
     buf->seeded = 1;
 }
 
-static inline int curriculum_sample_best_slot(StateBuffer* buf, unsigned int salt) {
-    int valid = curriculum_count_valid(buf);
+// Sample a pool slot whose best_return is at least min_return (admission
+// floor). Returns -1 when none qualify. min_return <= 0 admits any valid slot.
+static inline int curriculum_sample_best_slot(StateBuffer* buf, unsigned int salt,
+        float min_return) {
+    int valid = 0;
+    for (int slot = 0; slot < buf->num_start_states; slot++) {
+        if (buf->best_valid[slot] && buf->best_return[slot] >= min_return) {
+            valid++;
+        }
+    }
     if (valid <= 0) {
         return -1;
     }
     int pick = (int)(curriculum_mix32(salt) % (unsigned int)valid);
     for (int slot = 0; slot < buf->num_start_states; slot++) {
-        if (!buf->best_valid[slot]) {
+        if (!buf->best_valid[slot] || buf->best_return[slot] < min_return) {
             continue;
         }
         if (pick == 0) {
@@ -296,12 +304,37 @@ static inline int curriculum_sample_best_slot(StateBuffer* buf, unsigned int sal
     return -1;
 }
 
-static inline int curriculum_sample_offset(StateBuffer* buf, int slot, unsigned int salt) {
+static inline int curriculum_count_qualified(StateBuffer* buf, float min_return) {
+    int count = 0;
+    for (int i = 0; i < buf->num_start_states; i++) {
+        if (buf->best_valid[i] && buf->best_return[i] >= min_return) {
+            count++;
+        }
+    }
+    return count;
+}
+
+// Checkpoint offset for a resumed episode. Uniform when tail_bias is off;
+// otherwise weighted toward the trajectory tail (sqrt of a uniform draw),
+// where accumulated setup (jokers / money / hand levels) lives.
+static inline int curriculum_sample_offset(StateBuffer* buf, int slot,
+        unsigned int salt, int tail_bias) {
     int len = slot >= 0 && slot < buf->num_start_states ? buf->best_len[slot] : 0;
     if (len <= 1) {
         return 0;
     }
-    return (int)(curriculum_mix32(salt) % (unsigned int)len);
+    if (!tail_bias) {
+        return (int)(curriculum_mix32(salt) % (unsigned int)len);
+    }
+    float u = (float)curriculum_mix32(salt ^ 0x9e3779b9U) / 4294967296.0f;
+    int offset = (int)(sqrtf(u) * (float)len);
+    if (offset >= len) {
+        offset = len - 1;
+    }
+    if (offset < 0) {
+        offset = 0;
+    }
+    return offset;
 }
 
 // Push the restored env's obs/rewards/terminals/mask to the device. t >= 0 is
@@ -434,14 +467,20 @@ static inline int curriculum_start_env(PuffeRL* pufferl, int env_idx,
     long long generation = -1;
     PufferState start_state;
 
+    float min_admit = pufferl->hypers.curriculum_min_admit;
+    int tail_bias = pufferl->hypers.curriculum_cl_tail_bias;
+
     curriculum_host_lock(buf);
-    slot = curriculum_sample_best_slot(buf, salt);
+    // Fresh envs are the pool's searchers: they may start from any valid slot.
+    // CL envs only resume from trajectories that cleared the admission floor.
+    slot = curriculum_sample_best_slot(buf, salt,
+        role == CURRICULUM_ROLE_CL ? min_admit : 0.0f);
     if (slot < 0 || !buf->best_valid[slot]) {
         curriculum_host_unlock(buf);
         return 0;
     }
     offset = role == CURRICULUM_ROLE_CL
-        ? curriculum_sample_offset(buf, slot, salt ^ 0xa511e9b3U)
+        ? curriculum_sample_offset(buf, slot, salt ^ 0xa511e9b3U, tail_bias)
         : 0;
     int best_base = curriculum_best_base(buf, slot);
     start_state = buf->best_states[best_base + offset];
@@ -504,9 +543,12 @@ static inline int curriculum_replace_full(PuffeRL* pufferl, int slot, int env_id
     }
 
     int active_base = row * buf->trajectory_max_len;
+    float min_admit = pufferl->hypers.curriculum_min_admit;
     curriculum_host_lock(buf);
     int replace = 0;
-    if (!buf->best_valid[slot]) {
+    if (terminal_return < min_admit) {
+        replace = 0;  // below admission floor: keep the current best
+    } else if (!buf->best_valid[slot]) {
         replace = 1;
     } else if (terminal_return > buf->best_return[slot] + 1e-6f) {
         replace = 1;
@@ -569,7 +611,8 @@ static inline int curriculum_replace_tail(PuffeRL* pufferl, int slot, int env_id
 
     curriculum_host_lock(buf);
     if (terminal_return <= buf->best_return[slot] + 1e-6f
-            || buf->env_best_generation[env_idx] != buf->best_generation[slot]) {
+            || buf->env_best_generation[env_idx] != buf->best_generation[slot]
+            || terminal_return < pufferl->hypers.curriculum_min_admit) {
         curriculum_host_unlock(buf);
         return 0;
     }
@@ -712,6 +755,12 @@ void curriculum_rollout_begin(PuffeRL* pufferl) {
         (int)(current_cl_frac * (float)total_envs), 0, total_envs);
     int num_fresh_envs = curriculum_clamp_int(
         (int)(h->fresh_frac * (float)total_envs), 0, total_envs);
+    // CL envs only resume from trajectories that cleared the admission floor;
+    // until one exists they stay vanilla (still logged, still exploring).
+    if (h->curriculum_min_admit > 0.0f
+            && curriculum_count_qualified(buf, h->curriculum_min_admit) <= 0) {
+        num_cl_envs = 0;
+    }
     if (num_cl_envs + num_fresh_envs > total_envs) {
         num_cl_envs = total_envs - num_fresh_envs;
     }
