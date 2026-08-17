@@ -374,6 +374,14 @@ typedef struct {
     int gpu_id;
     int num_threads;
     int seed;
+    // Best-trajectory state curriculum (see src/curriculum.cu). Disabled when
+    // state_buffer_size == 0 or cl_frac + fresh_frac == 0.
+    int state_buffer_size;
+    float cl_frac;
+    float fresh_frac;
+    bool anneal_cl;
+    int state_trajectory_max_len;
+    int state_checkpoint_interval;
 } Hypers;
 
 // Rank / device context for one process in a multi-GPU train job.
@@ -485,6 +493,9 @@ struct VecEnv {
     pthread_t* threads;
     float* accum;
     int num_workers;
+    // 0 = aggregate logs from all envs. Curriculum sets this to the vanilla
+    // env prefix count so sampled (fresh/CL) envs do not report training logs.
+    int log_env_limit;
     // GPU log reduce scratch (unused on CPU)
     float* log_scratch;
 };
@@ -576,6 +587,8 @@ typedef struct PuffeRL {
     Allocator grads_alloc;
     Allocator activ_alloc;       // train + primary rollout (shared)
     VecEnv* vec;
+    struct StateBuffer* state_buf;  // Best-trajectory state curriculum (host)
+    int curriculum_enabled;
     NorMuon normuon;
     ncclComm_t nccl_comm;  // NCCL communicator for multi-GPU
     Hypers hypers;
@@ -1174,7 +1187,8 @@ static void env_log_sum(VecEnv* vec, Log* out, int clear) {
         return;
     }
     float* acc = (float*)out;
-    for (int i = 0; i < vec->size; i++) {
+    int limit = vec->log_env_limit > 0 ? vec->log_env_limit : vec->size;
+    for (int i = 0; i < limit; i++) {
         log_accum(acc, &vec->envs[i].log, clear);
     }
 }
@@ -1356,6 +1370,11 @@ enum {
     BUF_RUNNING,
 };
 
+// Best-trajectory state curriculum (upstream 5.0-simplecl port; no prio
+// buffers). Needs cpu_upload / rollout_time_view / EnvBuf above. Gated by
+// PUFFER_CURRICULUM, defined by envs that expose State state + refresh.
+#include "curriculum.cu"
+
 typedef struct {
     PuffeRL* pufferl;
     int buf;
@@ -1396,6 +1415,14 @@ static void* vec_thread_main(void* arg) {
         int h2d_pending = 0;
         for (int t = 0; t < horizon; t++) {
             cudaEventRecord(ev[MODEL_START], stream);
+#ifdef PUFFER_CURRICULUM
+            if (pufferl->curriculum_enabled) {
+                // Observe the t-1 -> t transition, splice terminals into the
+                // best pool, and restart sampled envs (restores obs into
+                // rollout slice t, which the forward below reads).
+                capture_curriculum_checkpoint(pufferl, buf, t);
+            }
+#endif
             pufferl_forward(pufferl, buf, t, stream);
             cudaEventRecord(ev[MODEL_END], stream);
             cudaMemcpyAsync(
@@ -1525,6 +1552,22 @@ static void rollout_start(PuffeRL* p) {
         }
         return;
     }
+#ifdef PUFFER_CURRICULUM
+    if (p->curriculum_enabled) {
+        // Seed/rebalance the best pool and (re)start fresh/CL envs. Restored
+        // obs land in env.obs on default_stream; each worker's t=0 forward
+        // folds that handoff into slice 0, so order worker streams after the
+        // upload without a full device sync (keeps async training overlapped).
+        curriculum_rollout_begin(p);
+        cudaEvent_t ev;
+        cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+        cudaEventRecord(ev, p->default_stream);
+        for (int buf = 0; buf < p->vec->buffers; buf++) {
+            cudaStreamWaitEvent(p->streams[buf], ev, 0);
+        }
+        cudaEventDestroy(ev);
+    }
+#endif
     for (int buf = 0; buf < p->vec->buffers; buf++) {
         int* state = &p->vec->worker_state[buf];
         __atomic_store_n(state, BUF_RUNNING, __ATOMIC_SEQ_CST);
@@ -2100,6 +2143,12 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .gpu_id = ctx->gpu_id,
         .num_threads = puf_ini_get(ini, "vec", "num_threads"),
         .seed = puf_ini_get(ini, "base", "seed"),
+        .state_buffer_size = puf_ini_get(ini, "train", "state_buffer_size"),
+        .cl_frac = (float)puf_ini_get(ini, "train", "cl_frac"),
+        .fresh_frac = (float)puf_ini_get(ini, "train", "fresh_frac"),
+        .anneal_cl = puf_ini_get(ini, "train", "anneal_cl") != 0,
+        .state_trajectory_max_len = puf_ini_get(ini, "train", "state_trajectory_max_len"),
+        .state_checkpoint_interval = puf_ini_get(ini, "train", "state_checkpoint_interval"),
     };
 
     Dict vec_kwargs = {0};
@@ -2197,6 +2246,51 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 
     env_setup(pufferl, vec, &vec_kwargs, env_kwargs);
     pufferl->vec = vec;
+
+    // Best-trajectory state curriculum. Gated on config (state_buffer_size>0
+    // plus a nonzero fresh/CL share) and env support (PUFFER_CURRICULUM).
+    assert(hypers.cl_frac >= 0.0f && hypers.cl_frac <= 1.0f
+        && "train.cl_frac must be in [0, 1]");
+    assert(hypers.fresh_frac >= 0.0f && hypers.fresh_frac <= 1.0f
+        && "train.fresh_frac must be in [0, 1]");
+    int initial_num_cl_envs = (int)(hypers.cl_frac * (float)vec->size);
+    int initial_num_fresh_envs = (int)(hypers.fresh_frac * (float)vec->size);
+    pufferl->curriculum_enabled = hypers.state_buffer_size > 0
+        && initial_num_cl_envs + initial_num_fresh_envs > 0;
+    if (pufferl->curriculum_enabled) {
+#ifndef PUFFER_CURRICULUM
+        fprintf(stderr,
+            "state curriculum requested but env '%s' does not define "
+            "PUFFER_CURRICULUM (needs State state + puffer_state_refresh)\n",
+            PUFFER_ENV_NAME);
+        abort();
+#endif
+        assert(PUF_BACKEND == PUF_CPU
+            && "state curriculum requires the CPU env backend");
+        assert(hypers.state_trajectory_max_len > 0
+            && "train.state_trajectory_max_len must be positive");
+        assert(hypers.state_checkpoint_interval > 0
+            && "train.state_checkpoint_interval must be positive");
+#ifdef PUFFER_CURRICULUM
+        int agents_per_env = curriculum_fixed_agents_per_env(vec);
+        int max_active_envs = initial_num_cl_envs + initial_num_fresh_envs;
+        pufferl->state_buf = (StateBuffer*)calloc(1, sizeof(StateBuffer));
+        if (pufferl->state_buf == NULL) {
+            fprintf(stderr, "create_pufferl: failed to allocate curriculum "
+                "state buffer\n");
+            abort();
+        }
+        register_state_buffer(pufferl->state_buf,
+            vec->size, agents_per_env, max_active_envs,
+            hypers.state_buffer_size, hypers.state_trajectory_max_len,
+            hypers.state_checkpoint_interval);
+        if (!init_state_buffer(pufferl->state_buf)) {
+            fprintf(stderr, "create_pufferl: failed to allocate curriculum "
+                "state buffer\n");
+            abort();
+        }
+#endif  // PUFFER_CURRICULUM
+    }
 
     for (int s = 0; s < 2; s++) {
         for (int i = 0; i < NUM_TE; i++) {
@@ -2414,6 +2508,11 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 // All memory is allocated up front and static across training.
 void close_pufferl(PuffeRL* p) {
     cudaDeviceSynchronize();
+#ifdef PUFFER_CURRICULUM
+    if (p->curriculum_enabled) {
+        close_state_buffer(p->state_buf);
+    }
+#endif
     if (p->hypers.profile) {
 #ifndef USE_ROCM
         cudaProfilerStop();
@@ -3300,6 +3399,9 @@ static PuffeRL* eval_make(Ini* ini, TrainContext* ctx, int mode) {
         puf_ini_put(ini, "selfplay.enabled", "0");
     }
     puf_ini_put(ini, "base.reset_every_horizon", "0");
+    // Evals run fixed episodes from reset; the state curriculum must not
+    // hijack env starts or filter env logs.
+    puf_ini_put(ini, "train.state_buffer_size", "0");
     if (render) {
         puf_ini_put(ini, "train.horizon", "1");
     }
@@ -3501,6 +3603,12 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         cudaMemset(pufferl->losses, 0, NUM_LOSSES * sizeof(float));
 
         log_util(pufferl, &new_log);
+
+#ifdef PUFFER_CURRICULUM
+        if (pufferl->curriculum_enabled) {
+            curriculum_log(pufferl, &new_log);
+        }
+#endif
 
         float train_total = 0;
         for (int i = 0; i < NUM_PROF; i++) {

@@ -3,6 +3,9 @@
 
 #define PUFFER_BALATRO
 #define PUFFER_PACKED_OBS
+/* State curriculum support: by-value State state member + refresh hook
+   (src/curriculum.cu is compiled in when this is defined). */
+#define PUFFER_CURRICULUM
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -168,6 +171,16 @@ static int puffer_observe(Env *env) {
         memset(out, 0, OBS_SIZE * sizeof(*out));
     }
     return error;
+}
+
+/* State-curriculum restore hook (src/curriculum.cu): rebuild the observation
+   and legal/action masks from env->state after a state restore, and reset the
+   episode bookkeeping so the restored episode starts a fresh accounting. */
+static inline void puffer_state_refresh(Env *env) {
+    puffer_observe(env);
+    env->episode_steps = 0;
+    env->episode_reward = 0.0f;
+    env->boundary_reached = 0;
 }
 
 static inline const ObservedSelection *cached_selection(
