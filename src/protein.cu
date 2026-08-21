@@ -111,6 +111,10 @@ __host__ __device__ __forceinline__ float norm_cdf(float x) {
 __host__ __device__ __forceinline__ float norm_pdf(float x) {
     return expf(-0.5f * x * x) * 0.3989422804014327f;
 }
+static int float_cmp(const void *a, const void *b) {
+    float fa = *(const float *)a, fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
 
 typedef struct {
     int n_params;
@@ -231,7 +235,7 @@ __global__ void matern32lin_mll_grad_fuse(const float *__restrict__ X,
 }
 
 typedef struct {
-    int dim, n, cap;
+    int dim, n, cap, initialized;
     float *d_X, *d_y, *d_L, *d_alpha, *d_work;
     int lwork;
     int *d_info;
@@ -361,6 +365,33 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
     cudaMemcpyAsync(gp->d_y, y, n_data * sizeof(float),
         cudaMemcpyHostToDevice, stream);
     gp->n = n_data;
+    if (!gp->initialized) {
+        int sample_n = n_data < 256 ? n_data : 256;
+        assert(sample_n > 1);
+        int pair_n = sample_n * (sample_n - 1) / 2;
+        float *distances = (float *)malloc(pair_n * sizeof(float));
+        for (int d = 0; d < gp->dim; d++) {
+            int count = 0;
+            for (int i = 0; i < sample_n; i++) {
+                int row_i = i * n_data / sample_n;
+                for (int j = i + 1; j < sample_n; j++) {
+                    int row_j = j * n_data / sample_n;
+                    distances[count++] =
+                        fabsf(X[row_i * gp->dim + d] - X[row_j * gp->dim + d]);
+                }
+            }
+            assert(count == pair_n);
+            qsort(distances, pair_n, sizeof(float), float_cmp);
+            float median = distances[pair_n / 2];
+            if (pair_n % 2 == 0) {
+                median = 0.5f * (distances[pair_n / 2 - 1] + median);
+            }
+            gp->kernel->raw_params[d] =
+                inv_softplus(fmaxf(median, 0.05f));
+        }
+        free(distances);
+        gp->initialized = 1;
+    }
     if (gp_recompute(gp, stream) != 0) {
         return 0.0f;
     }
@@ -856,10 +887,6 @@ static int filter_near_duplicates(ProteinSweep *sw, const float *X,
     return count;
 }
 
-static int float_cmp(const void *a, const void *b) {
-    float fa = *(const float *)a, fb = *(const float *)b;
-    return (fa > fb) - (fa < fb);
-}
 
 static float pinball(float a, float b, const float *x,
         const float *y, int n, float q) {
