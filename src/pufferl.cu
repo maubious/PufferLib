@@ -2999,9 +2999,7 @@ extern char** environ;
 typedef struct {
     char run_id[128];
     int run;
-    int random;
-    int gp_obs;
-    int pareto;
+    ProteinSweepInfo info;
     int fd;
     pid_t pid;
     float* sample;
@@ -3175,9 +3173,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
 
             SweepJob job = {
                 .run = next_run_id++,
-                .random = info.is_random,
-                .gp_obs = info.n_gp_obs,
-                .pareto = info.n_pareto,
+                .info = info,
                 .sample = samples + (size_t)(i + 1) * space->num,
             };
             memcpy(job.sample, samples, space->num * sizeof(float));
@@ -3327,9 +3323,17 @@ void run_sweep(Ini* ini, const char* exe_path) {
             protein_sweep_observe(protein, observed,
                 job->result.scores[pi], job->result.costs[pi], 0);
         }
-        printf("sweep run=%d score=%.4f cost=%.2f steps=%.0f random=%d gp_obs=%d pareto=%d\n",
-            job->run, job->result.score, job->result.cost, job->result.steps,
-            job->random, job->gp_obs, job->pareto);
+        if (job->info.n_candidates > 0) {
+            printf("sweep run=%d score=%.4f pred_score=%.4f score_err=%+.4f "
+                   "cost=%.2f pred_cost=%.2f cost_ratio=%.3f steps=%.0f\n",
+                job->run, job->result.score, job->info.predicted_score,
+                job->result.score - job->info.predicted_score,
+                job->result.cost, job->info.predicted_cost,
+                job->result.cost / job->info.predicted_cost, job->result.steps);
+        } else {
+            printf("sweep run=%d score=%.4f cost=%.2f steps=%.0f\n",
+                job->run, job->result.score, job->result.cost, job->result.steps);
+        }
         completed++;
     }
 }
