@@ -23,6 +23,7 @@
 #define PROTEIN_ACQ_MAX_CAP 65536
 #define PROTEIN_COST_QUANTILE 0.97f
 #define PROTEIN_COST_GROWTH 1.01f
+#define PROTEIN_COST_SIGMA 0.15f
 #define PROTEIN_CLF_ITERS 100
 #define PROTEIN_THRESHOLD_COST_CAP 1.2f
 #define PROTEIN_THRESHOLD_FALLBACK 0.9f
@@ -102,6 +103,14 @@ __host__ __device__ __forceinline__ float softplus_grad(float x) {
     return 1.0 / (1.0 + exp(-x));
 }
 
+__host__ __device__ __forceinline__ float norm_cdf(float x) {
+    return 0.5f * (1.0f + erff(x * 0.7071067811865475f));
+}
+
+__host__ __device__ __forceinline__ float norm_pdf(float x) {
+    return expf(-0.5f * x * x) * 0.3989422804014327f;
+}
+
 typedef struct {
     int n_params;
     float *raw_params;
@@ -137,6 +146,27 @@ __global__ void matern32lin_k_kernel(const float *__restrict__ X1,
         val += diag_noise;
     }
     K[col * n + row] = val;
+}
+
+__global__ void gp_k_diag_var(const float *__restrict__ V,
+        const float *__restrict__ Xte, float *__restrict__ stds, int n, int m,
+        int d, float sigma_f, float offset, const float *inv_ells) {
+    int col = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    if (col >= m) {
+        return;
+    }
+    (void)inv_ells;
+    float dot = 0.0f;
+    for (int k = 0; k < d; k++) {
+        float x = Xte[col * d + k];
+        dot += x * x;
+    }
+    float var = sigma_f * (dot + offset + 1.0f);
+    for (int k = 0; k < n; k++) {
+        float v = V[col * n + k];
+        var -= v * v;
+    }
+    stds[col] = sqrtf(fmaxf(var, PROTEIN_EPSILON));
 }
 
 // Write constant onto diagonal (stride n+1). Used to form I for spotrs → K^{-1}.
@@ -208,7 +238,7 @@ typedef struct {
     cublasHandle_t cublas;
     cusolverDnHandle_t cusolver;
     GPKernel *kernel;
-    float *d_inv_ells, *d_diag, *d_Kinv, *d_partials, *d_Ks;
+    float *d_inv_ells, *d_diag, *d_Kinv, *d_partials, *d_Ks, *d_stds;
     float *h_kg, *h_diag, *h_partials;
 } GaussianProcess;
 
@@ -257,6 +287,7 @@ static void gp_init(GaussianProcess *gp, int dim, int cap, int pred_m, float noi
     cudaMalloc(&gp->d_partials, nblocks * nsum * sizeof(float));
     // Dominant device buffer: cap × acq_cap floats (×2 GPs)
     assert(cudaMalloc(&gp->d_Ks, cap * pred_m * sizeof(float)) == cudaSuccess);
+    assert(cudaMalloc(&gp->d_stds, pred_m * sizeof(float)) == cudaSuccess);
     gp->h_kg = (float *)malloc(n_params * sizeof(float));
     gp->h_diag = (float *)malloc(cap * sizeof(float));
     gp->h_partials = (float *)malloc(nblocks * nsum * sizeof(float));
@@ -298,14 +329,26 @@ static int gp_recompute(GaussianProcess *gp, cudaStream_t stream) {
     return 0;
 }
 
-static void gp_predict(GaussianProcess *gp, const float *d_Xte, float *d_means, int m,
-        cudaStream_t stream) {
+static void gp_predict(GaussianProcess *gp, const float *d_Xte, float *d_means,
+        float *d_stds, int m, cudaStream_t stream) {
     int n = gp->n;
-    const float one = 1.0, zero = 0.0;
+    const float one = 1.0f, zero = 0.0f;
     cublasSetStream(gp->cublas, stream);
     matern32lin_build_K(gp, gp->d_X, d_Xte, n, m, 0.0f, gp->d_Ks, stream);
-    cublasSgemv(gp->cublas, CUBLAS_OP_T, n, m, &one, gp->d_Ks, n, gp->d_alpha, 1,
-        &zero, d_means, 1);
+    cublasSgemv(gp->cublas, CUBLAS_OP_T, n, m, &one, gp->d_Ks, n,
+        gp->d_alpha, 1, &zero, d_means, 1);
+    if (d_stds == NULL) {
+        return;
+    }
+    cublasStrsm(gp->cublas, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER,
+        CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, n, m, &one, gp->d_L, n,
+        gp->d_Ks, n);
+    int np = gp->kernel->n_params;
+    float sigma_f = softplus(gp->kernel->raw_params[SF_IDX(np)]);
+    float offset = softplus(gp->kernel->raw_params[OFF_IDX(np)]);
+    gp_k_diag_var<<<(m + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        gp->d_Ks, d_Xte, d_stds, n, m, gp->dim, sigma_f, offset,
+        gp->d_inv_ells);
 }
 
 // Train kernel hyperparameters with Adam (score GP and cost GP).
@@ -592,7 +635,7 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     sw->ext_buf = (float *)malloc(max_ext * (dim + 2) * sizeof(float));
     sw->kept_buf = (int *)malloc(kd_cap * sizeof(int));
     sw->h_cands = (float *)malloc(acq_cap * dim * sizeof(float));
-    sw->h_pred = (float *)malloc(2 * acq_cap * sizeof(float));
+    sw->h_pred = (float *)malloc(3 * acq_cap * sizeof(float));
     sw->kd_idx = (int *)malloc(kd_cap * sizeof(int));
     sw->kd_nodes = (KDNode *)malloc(2 * kd_cap * sizeof(KDNode));
     sw->kd_keep = (int *)malloc(kd_cap * sizeof(int));
@@ -1206,31 +1249,44 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     }
 
     // GP predict + score/argmax
-    gp_predict(&sw->gp_score, sw->d_candidates, sw->d_pred_y, n_cands, sw->stream);
-    gp_predict(&sw->gp_cost, sw->d_candidates, sw->d_pred_c, n_cands, sw->stream);
+    gp_predict(&sw->gp_score, sw->d_candidates, sw->d_pred_y,
+        sw->gp_score.d_stds, n_cands, sw->stream);
+    gp_predict(&sw->gp_cost, sw->d_candidates, sw->d_pred_c, NULL,
+        n_cands, sw->stream);
     cudaMemcpyAsync(sw->h_pred, sw->d_pred_y, n_cands * sizeof(float),
         cudaMemcpyDeviceToHost, sw->stream);
     cudaMemcpyAsync(sw->h_pred + n_cands, sw->d_pred_c, n_cands * sizeof(float),
         cudaMemcpyDeviceToHost, sw->stream);
+    cudaMemcpyAsync(sw->h_pred + 2 * n_cands, sw->gp_score.d_stds,
+        n_cands * sizeof(float), cudaMemcpyDeviceToHost, sw->stream);
     cudaStreamSynchronize(sw->stream);
 
     int best = 0;
     float best_s = -FLT_MAX;
     int opt_dir = sw->space->optimize_direction;
+    float best_norm = (max_score - min_score) > PROTEIN_EPSILON
+        ? (opt_dir * sw->succ_scores[sw->top_idx[0]] - min_score)
+            / (max_score - min_score)
+        : 0.0f;
     for (int i = 0; i < n_cands; i++) {
-        float s = opt_dir * sw->h_pred[i];
+        float mu = opt_dir * sw->h_pred[i];
+        float sd = sw->h_pred[2 * n_cands + i];
+        float z = mu - best_norm;
+        float t = z / sd;
+        float s = z * norm_cdf(t) + sd * norm_pdf(t);
         if (!is_fixed_cost) {
             float cn = sw->h_pred[n_cands + i];
             float c = expf(cn * (log_c_max - log_c_min) + log_c_min);
+            float cost_delta = (cn - target_cost) / PROTEIN_COST_SIGMA;
             s *= (c < sw->max_suggestion_cost ? 1.0f : 0.0f)
-                * (1.0f - fabsf(target_cost - cn));
+                * expf(-0.5f * cost_delta * cost_delta);
         }
         if (sw->clf_fitted) {
-            float z = sw->clf_bias;
+            float clf_z = sw->clf_bias;
             for (int d = 0; d < dim; d++) {
-                z += sw->h_cands[i * dim + d] * sw->clf_w[d];
+                clf_z += sw->h_cands[i * dim + d] * sw->clf_w[d];
             }
-            s *= 1.0f / (1.0f + expf(-z));
+            s *= 1.0f / (1.0f + expf(-clf_z));
         }
         if (s > best_s) {
             best_s = s;
