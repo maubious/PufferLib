@@ -22,7 +22,6 @@
 #define PROTEIN_NUM_COST_RATIOS 6
 #define PROTEIN_ACQ_MAX_CAP 65536
 #define PROTEIN_COST_QUANTILE 0.97f
-#define PROTEIN_MIN_OBS_NO_FAIL 100
 #define PROTEIN_COST_GROWTH 1.01f
 #define PROTEIN_CLF_ITERS 100
 #define PROTEIN_THRESHOLD_COST_CAP 1.2f
@@ -865,19 +864,9 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     float qfrac = qidx - qlo;
     sw->log_c_max = sw->log_c_buf[qlo] * (1.0f - qfrac) + sw->log_c_buf[qhi] * qfrac;
 
-    int use_failures = (sw->succ_n < PROTEIN_MIN_OBS_NO_FAIL && sw->fail_n > 0);
-    int combined_n = use_failures ? sw->fail_n + sw->succ_n : sw->succ_n;
+    int combined_n = sw->succ_n;
     int ext_dim = dim + 2;
     int ci = 0;
-    if (use_failures) {
-        for (int i = 0; i < sw->fail_n; i++) {
-            memcpy(&sw->ext_buf[ci * ext_dim], &sw->fail_params[i * dim],
-                dim * sizeof(float));
-            sw->ext_buf[ci * ext_dim + dim] = sw->min_score;
-            sw->ext_buf[ci * ext_dim + dim + 1] = sw->fail_costs[i];
-            ci++;
-        }
-    }
     for (int i = 0; i < sw->succ_n; i++) {
         memcpy(&sw->ext_buf[ci * ext_dim], &sw->succ_params[i * dim],
             dim * sizeof(float));
