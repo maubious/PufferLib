@@ -1020,6 +1020,9 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
             sw->upper_cost_threshold = pruned_max_cost;
         } else if (pruned_max_cost > sw->upper_cost_threshold) {
             sw->upper_cost_threshold *= PROTEIN_COST_GROWTH;
+        } else {
+            sw->upper_cost_threshold +=
+                0.05f * (pruned_max_cost - sw->upper_cost_threshold);
         }
     }
 
