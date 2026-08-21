@@ -24,7 +24,6 @@
 #define PROTEIN_COST_QUANTILE 0.97f
 #define PROTEIN_COST_GROWTH 1.01f
 #define PROTEIN_COST_SIGMA 0.15f
-#define PROTEIN_TARGET_RAMP 300
 #define PROTEIN_CLF_ITERS 100
 #define PROTEIN_THRESHOLD_COST_CAP 1.2f
 #define PROTEIN_THRESHOLD_FALLBACK 0.9f
@@ -1192,9 +1191,6 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         }
         float ratio = sw->ratio_pool[--sw->pool_remaining];
         ratio = fmaxf(0.0f, fminf(1.0f, ratio + noise01()));
-        float progress = fminf(1.0f,
-            (float)sw->suggestion_idx / PROTEIN_TARGET_RAMP);
-        ratio *= 0.25f + 0.75f * progress;
         target_cost = (1.0f + sw->expansion_rate) * ratio;
     }
 
