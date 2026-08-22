@@ -3324,9 +3324,11 @@ void run_sweep(Ini* ini, const char* exe_path) {
                 job->result.scores[pi], job->result.costs[pi], 0);
         }
         if (job->info.n_candidates > 0) {
-            printf("sweep run=%d score=%.4f pred_score=%.4f score_err=%+.4f "
-                   "cost=%.2f pred_cost=%.2f cost_ratio=%.3f steps=%.0f\n",
+            printf("sweep run=%d score=%.4f pred_score=%.4f pred_std=%.4f "
+                   "score_err=%+.4f cost=%.2f pred_cost=%.2f "
+                   "cost_ratio=%.3f steps=%.0f\n",
                 job->run, job->result.score, job->info.predicted_score,
+                job->info.predicted_std,
                 job->result.score - job->info.predicted_score,
                 job->result.cost, job->info.predicted_cost,
                 job->result.cost / job->info.predicted_cost, job->result.steps);

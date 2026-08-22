@@ -532,7 +532,7 @@ __global__ void protein_k_sample(float *__restrict__ candidates,
 }
 
 typedef struct {
-    float score_loss, cost_loss, predicted_score, predicted_cost, rating;
+    float score_loss, cost_loss, predicted_score, predicted_std, predicted_cost, rating;
     int n_pareto, n_gp_obs, n_candidates, is_random;
 } ProteinSweepInfo;
 
@@ -1329,6 +1329,8 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     info.score_loss = score_loss;
     info.cost_loss = cost_loss;
     info.predicted_score = y_norm * (max_score - min_score) + min_score;
+    info.predicted_std =
+        sw->h_pred[2 * n_cands + best] * (max_score - min_score);
     info.predicted_cost = expf(c_norm * (log_c_max - log_c_min) + log_c_min);
     info.rating = best_s;
     info.n_pareto = n_use;
