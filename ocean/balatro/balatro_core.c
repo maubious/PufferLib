@@ -1,4 +1,5 @@
 #include "balatro_core.h"
+#include "joker_signatures.h"
 #include <assert.h>
 #include <math.h>
 #include <stddef.h>
@@ -140,130 +141,6 @@ typedef struct KeyBuilder {
     size_t capacity;
     size_t length;
 } KeyBuilder;
-
-typedef struct HandEffect {
-    uint8_t hand;
-    int16_t chips;
-    int16_t mult;
-    uint16_t xmult;
-} HandEffect;
-
-static const HandEffect hand_effects[CENTER_COUNT] = {
-    [CENTER_J_JOLLY] = {PAIR + 1, 0, 8, 0},
-    [CENTER_J_ZANY] = {THREE_OF_A_KIND + 1, 0, 12, 0},
-    [CENTER_J_MAD] = {TWO_PAIR + 1, 0, 10, 0},
-    [CENTER_J_CRAZY] = {STRAIGHT + 1, 0, 12, 0},
-    [CENTER_J_DROLL] = {FLUSH + 1, 0, 10, 0},
-    [CENTER_J_SLY] = {PAIR + 1, 50, 0, 0},
-    [CENTER_J_WILY] = {THREE_OF_A_KIND + 1, 100, 0, 0},
-    [CENTER_J_CLEVER] = {TWO_PAIR + 1, 80, 0, 0},
-    [CENTER_J_DEVIOUS] = {STRAIGHT + 1, 100, 0, 0},
-    [CENTER_J_CRAFTY] = {FLUSH + 1, 80, 0, 0},
-    [CENTER_J_DUO] = {PAIR + 1, 0, 0, 200},
-    [CENTER_J_TRIO] = {THREE_OF_A_KIND + 1, 0, 0, 300},
-    [CENTER_J_FAMILY] = {FOUR_OF_A_KIND + 1, 0, 0, 400},
-    [CENTER_J_ORDER] = {STRAIGHT + 1, 0, 0, 300},
-    [CENTER_J_TRIBE] = {FLUSH + 1, 0, 0, 200},
-};
-
-enum CardEffectCondition {
-    CARD_EFFECT_SUIT = 1,
-    CARD_EFFECT_RANK_SET,
-    CARD_EFFECT_FACE,
-    CARD_EFFECT_EVEN,
-    CARD_EFFECT_ODD,
-};
-
-typedef struct CardEffect {
-    uint8_t condition;
-    uint8_t suit;
-    uint16_t rank_mask;
-    int16_t chips;
-    int16_t mult;
-    int16_t dollars;
-    uint16_t xmult;
-} CardEffect;
-
-static const CardEffect card_effects[CENTER_COUNT] = {
-    [CENTER_J_GREEDY_JOKER] = {CARD_EFFECT_SUIT, DIAMONDS, 0, 0, 3, 0, 0},
-    [CENTER_J_LUSTY_JOKER] = {CARD_EFFECT_SUIT, HEARTS, 0, 0, 3, 0, 0},
-    [CENTER_J_WRATHFUL_JOKER] = {CARD_EFFECT_SUIT, SPADES, 0, 0, 3, 0, 0},
-    [CENTER_J_GLUTTENOUS_JOKER] = {CARD_EFFECT_SUIT, CLUBS, 0, 0, 3, 0, 0},
-    [CENTER_J_ARROWHEAD] = {CARD_EFFECT_SUIT, SPADES, 0, 50, 0, 0, 0},
-    [CENTER_J_ONYX_AGATE] = {CARD_EFFECT_SUIT, CLUBS, 0, 0, 7, 0, 0},
-    [CENTER_J_ROUGH_GEM] = {CARD_EFFECT_SUIT, DIAMONDS, 0, 0, 0, 1, 0},
-    [CENTER_J_FIBONACCI] = {CARD_EFFECT_RANK_SET, 0, (1u << 2) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 14), 0, 8, 0, 0},
-    [CENTER_J_SCHOLAR] = {CARD_EFFECT_RANK_SET, 0, 1u << 14, 20, 4, 0, 0},
-    [CENTER_J_WALKIE_TALKIE] = {CARD_EFFECT_RANK_SET, 0, (1u << 4) | (1u << 10), 10, 4, 0, 0},
-    [CENTER_J_EVEN_STEVEN] = {CARD_EFFECT_EVEN, 0, 0, 0, 4, 0, 0},
-    [CENTER_J_ODD_TODD] = {CARD_EFFECT_ODD, 0, 0, 31, 0, 0, 0},
-    [CENTER_J_SCARY_FACE] = {CARD_EFFECT_FACE, 0, 0, 30, 0, 0, 0},
-    [CENTER_J_SMILEY] = {CARD_EFFECT_FACE, 0, 0, 0, 5, 0, 0},
-    [CENTER_J_TRIBOULET] = {CARD_EFFECT_RANK_SET, 0, (1u << 12) | (1u << 13), 0, 0, 0, 200},
-};
-
-enum MainEffectCondition {
-    MAIN_ALWAYS = 1,
-    MAIN_MAX3,
-    MAIN_LAST_HAND,
-    MAIN_REPEAT_HAND,
-    MAIN_NO_DISCARDS,
-    MAIN_POSITIVE_DOLLARS,
-    MAIN_ENHANCED16,
-    MAIN_DECK_LOST,
-};
-
-enum MainEffectScale {
-    MAIN_UNIT,
-    MAIN_JOKERS,
-    MAIN_DISCARDS,
-    MAIN_DECK,
-    MAIN_DOLLARS,
-    MAIN_DOLLARS_5,
-    MAIN_HAND_PLAYS,
-    MAIN_TAROTS,
-    MAIN_STONES,
-    MAIN_STEELS,
-    MAIN_SKIPS,
-};
-
-typedef struct MainEffect {
-    uint8_t condition;
-    uint8_t scale;
-    int16_t chips;
-    int16_t mult;
-    uint16_t xmult;
-} MainEffect;
-
-static const MainEffect main_effects[CENTER_COUNT] = {
-    [CENTER_J_JOKER] = {MAIN_ALWAYS, MAIN_UNIT, 0, 4, 0},
-    [CENTER_J_STUNTMAN] = {MAIN_ALWAYS, MAIN_UNIT, 250, 0, 0},
-    [CENTER_J_HALF] = {MAIN_MAX3, MAIN_UNIT, 0, 20, 0},
-    [CENTER_J_ABSTRACT] = {MAIN_ALWAYS, MAIN_JOKERS, 0, 3, 0},
-    [CENTER_J_ACROBAT] = {MAIN_LAST_HAND, MAIN_UNIT, 0, 0, 300},
-    [CENTER_J_MYSTIC_SUMMIT] = {MAIN_NO_DISCARDS, MAIN_UNIT, 0, 15, 0},
-    [CENTER_J_BANNER] = {MAIN_ALWAYS, MAIN_DISCARDS, 30, 0, 0},
-    [CENTER_J_BLUE_JOKER] = {MAIN_ALWAYS, MAIN_DECK, 2, 0, 0},
-    [CENTER_J_BULL] = {MAIN_POSITIVE_DOLLARS, MAIN_DOLLARS, 2, 0, 0},
-    [CENTER_J_BOOTSTRAPS] = {MAIN_ALWAYS, MAIN_DOLLARS_5, 0, 2, 0},
-    [CENTER_J_SUPERNOVA] = {MAIN_ALWAYS, MAIN_HAND_PLAYS, 0, 1, 0},
-    [CENTER_J_CARD_SHARP] = {MAIN_REPEAT_HAND, MAIN_UNIT, 0, 0, 300},
-    [CENTER_J_FORTUNE_TELLER] = {MAIN_ALWAYS, MAIN_TAROTS, 0, 1, 0},
-    [CENTER_J_EROSION] = {MAIN_DECK_LOST, MAIN_UNIT, 0, 4, 0},
-    [CENTER_J_STONE] = {MAIN_ALWAYS, MAIN_STONES, 25, 0, 0},
-    [CENTER_J_STEEL_JOKER] = {MAIN_ALWAYS, MAIN_STEELS, 0, 0, 120},
-    [CENTER_J_DRIVERS_LICENSE] = {MAIN_ENHANCED16, MAIN_UNIT, 0, 0, 300},
-    [CENTER_J_THROWBACK] = {MAIN_ALWAYS, MAIN_SKIPS, 0, 0, 125},
-    [CENTER_J_GROS_MICHEL] = {MAIN_ALWAYS, MAIN_UNIT, 0, 15, 0},
-    [CENTER_J_CAVENDISH] = {MAIN_ALWAYS, MAIN_UNIT, 0, 0, 300},
-};
-
-static const uint8_t state_xmult[CENTER_COUNT] = {
-    [CENTER_J_LUCKY_CAT] = 1, [CENTER_J_CAMPFIRE] = 1, [CENTER_J_HOLOGRAM] = 1,
-    [CENTER_J_CONSTELLATION] = 1, [CENTER_J_GLASS] = 1, [CENTER_J_CAINO] = 1,
-    [CENTER_J_MADNESS] = 1, [CENTER_J_HIT_THE_ROAD] = 1, [CENTER_J_YORICK] = 1,
-    [CENTER_J_VAMPIRE] = 1,
-};
 
 typedef struct ScoreContext {
     int playing_count;
@@ -799,25 +676,6 @@ static int blind_debuffs_card(const State *state, const Card *card) {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 int action_is_legal_masks(const LegalMasks *masks, const Action *action) {
     assert(masks && action);
     if (action->selection_count > MAX_SELECTION) return 0;
@@ -923,9 +781,6 @@ static int consumable_no_target_legal(const State *state, uint16_t center_id) {
         return 1;
     }
 }
-
-
-
 
 static void joker_on_joker_effects(const State *state, uint8_t target_index, double *mult) {
     if (target_index >= state->joker_count) return;
@@ -1418,7 +1273,6 @@ static void remove_hand_index(State *state, uint8_t index) {
     notify_removed_playing_cards(state, &state->hand[index], 1, 0);
     ZONE_REMOVE(state->hand, state->hand_count, index);
 }
-
 
 // ---- Jokers ----
 
@@ -2823,23 +2677,25 @@ static void individual_jokers(State *state, const ScoreContext *context, const C
     for (size_t source_index = 0; source_index < context->source_count; ++source_index) {
         Card *joker = &state->jokers[context->sources[source_index]];
         int copied = context->copied[source_index];
-        const CardEffect effect = card_effects[joker->center_id];
-        int trigger = effect.condition == CARD_EFFECT_SUIT
-            ? is_suit_state(state, card, effect.suit)
-            : effect.condition == CARD_EFFECT_RANK_SET
-            ? (card->rank < 16 && (effect.rank_mask & (1u << card->rank)))
-            : effect.condition == CARD_EFFECT_FACE
-            ? is_face(card, pareidolia)
-            : effect.condition == CARD_EFFECT_EVEN
-            ? card->rank <= 10 && !(card->rank & 1u)
-            : effect.condition == CARD_EFFECT_ODD
-            ? (card->rank <= 10 && (card->rank & 1u)) || card->rank == 14
-            : 0;
-        if (trigger) {
-            *chips += effect.chips;
-            *mult += effect.mult;
-            *dollars += effect.dollars;
-            if (effect.xmult) *mult *= effect.xmult / 100.0;
+        const JokerSignature *sig = &JOKER_SIGNATURES[joker->center_id];
+        if (sig->trigger == SIG_TRIG_SCORED_CARD) {
+            int trigger = 0;
+            switch (sig->condition) {
+            case SIG_COND_NONE: trigger = 1; break;
+            case SIG_COND_SUIT: trigger = is_suit_state(state, card, sig->cond_value); break;
+            case SIG_COND_RANK: trigger = card->rank == sig->cond_value; break;
+            case SIG_COND_RANK_SET:
+                trigger = (card->rank >= 2 && card->rank <= 14 && (sig->rank_mask & (1u << (card->rank - 2))));
+                break;
+            case SIG_COND_FACE: trigger = is_face(card, pareidolia); break;
+            default: break;
+            }
+            if (trigger) {
+                *chips += sig->chips;
+                *mult += sig->mult;
+                *dollars += sig->dollars;
+                if (sig->xmult_pct) *mult *= (double)sig->xmult_pct / 100.0;
+            }
         }
         switch (joker->center_id) {
         case CENTER_J_BLOODSTONE:
@@ -2996,52 +2852,71 @@ static void main_jokers(State *state, const ScoreContext *context, HandType hand
             *chips += 50;
         else if (physical->edition == EDITION_HOLO)
             *mult += 10;
-        const MainEffect main_effect = main_effects[joker->center_id];
-        int trigger = 0;
-        double units = 1.0;
-        switch (main_effect.condition) {
-        case MAIN_ALWAYS: trigger = 1; break;
-        case MAIN_MAX3: trigger = played_count <= 3; break;
-        case MAIN_LAST_HAND: trigger = state->hands_left == 0; break;
-        case MAIN_REPEAT_HAND: trigger = state->hand_plays_round[hand] > 1; break;
-        case MAIN_NO_DISCARDS: trigger = state->discards_left == 0; break;
-        case MAIN_POSITIVE_DOLLARS: trigger = state->dollars > 0; break;
-        case MAIN_ENHANCED16: trigger = context->enhanced >= 16; break;
-        case MAIN_DECK_LOST: {
-            int starting = state->config.deck == CENTER_B_ABANDONED ? 40 : 52;
-            units = starting - context->playing_count;
-            trigger = units > 0;
-            break;
-        }
-        default: break;
-        }
-        if (trigger) {
-            switch (main_effect.scale) {
-            case MAIN_JOKERS: units = state->joker_count; break;
-            case MAIN_DISCARDS: units = state->discards_left; break;
-            case MAIN_DECK: units = state->deck_count; break;
-            case MAIN_DOLLARS: units = state->dollars; break;
-            case MAIN_DOLLARS_5: units = state->dollars / 5; break;
-            case MAIN_HAND_PLAYS: units = state->hand_plays[hand]; break;
-            case MAIN_TAROTS: units = state->tarots_used; break;
-            case MAIN_STONES: units = context->stones; break;
-            case MAIN_STEELS: units = context->steels; break;
-            case MAIN_SKIPS: units = state->skips; break;
+        const JokerSignature *sig = &JOKER_SIGNATURES[joker->center_id];
+        if (sig->trigger == SIG_TRIG_HAND_PLAYED) {
+            int trigger = 0;
+            double units = 1.0;
+            switch (sig->condition) {
+            case SIG_COND_NONE: trigger = 1; break;
+            case SIG_COND_MAX3: trigger = played_count <= 3; break;
+            case SIG_COND_LAST_HAND: trigger = state->hands_left == 0; break;
+            case SIG_COND_REPEAT_HAND: trigger = state->hand_plays_round[hand] > 1; break;
+            case SIG_COND_NO_DISCARDS: trigger = state->discards_left == 0; break;
+            case SIG_COND_HAND_TYPE: trigger = context->hand_has[sig->cond_value]; break;
             default: break;
             }
-            *chips += main_effect.chips * units;
-            *mult += main_effect.mult * units;
-            if (main_effect.xmult) *mult *= 1.0 + (main_effect.xmult - 100) / 100.0 * units;
+            if (sig->scale == SIG_SCALE_DECK_LOST) {
+                int starting = state->config.deck == CENTER_B_ABANDONED ? 40 : 52;
+                units = starting - context->playing_count;
+                trigger = units > 0;
+            } else if (trigger) {
+                switch (sig->scale) {
+                case SIG_SCALE_JOKERS: units = state->joker_count; break;
+                case SIG_SCALE_DISCARD_LEFT: units = state->discards_left; break;
+                case SIG_SCALE_DECK: units = state->deck_count; break;
+                case SIG_SCALE_DOLLARS: units = state->dollars > 0 ? state->dollars : 0; trigger = state->dollars > 0; break;
+                case SIG_SCALE_DOLLARS_5: units = state->dollars > 0 ? state->dollars / 5 : 0; trigger = state->dollars > 0; break;
+                case SIG_SCALE_HAND_PLAYS: units = state->hand_plays[hand]; break;
+                case SIG_SCALE_TAROTS: units = state->tarots_used; break;
+                case SIG_SCALE_STONES: units = context->stones; break;
+                case SIG_SCALE_STEELS: units = context->steels; break;
+                case SIG_SCALE_SKIPS: units = state->skips; break;
+                default: break;
+                }
+            }
+            if (trigger && units > 0) {
+                *chips += sig->chips * units;
+                *mult += sig->mult * units;
+                if (sig->xmult_pct) {
+                    if (sig->condition == SIG_COND_HAND_TYPE || sig->scale == SIG_SCALE_NONE) {
+                        *mult *= (double)sig->xmult_pct / 100.0;
+                    } else {
+                        *mult *= 1.0 + (double)(sig->xmult_pct - 100) / 100.0 * units;
+                    }
+                }
+            }
         }
-        const HandEffect hand_effect = hand_effects[joker->center_id];
-        if (hand_effect.hand && context->hand_has[hand_effect.hand - 1]) {
-            *chips += hand_effect.chips;
-            *mult += hand_effect.mult;
-            if (hand_effect.xmult) *mult *= hand_effect.xmult / 100.0;
+        if (joker->state[0] > 100) {
+            switch (joker->center_id) {
+            case CENTER_J_LUCKY_CAT:
+            case CENTER_J_CAMPFIRE:
+            case CENTER_J_HOLOGRAM:
+            case CENTER_J_CONSTELLATION:
+            case CENTER_J_GLASS:
+            case CENTER_J_CAINO:
+            case CENTER_J_MADNESS:
+            case CENTER_J_HIT_THE_ROAD:
+            case CENTER_J_YORICK:
+            case CENTER_J_VAMPIRE:
+                *mult *= (double)joker->state[0] / 100.0;
+                break;
+            default: break;
+            }
         }
-        if (state_xmult[joker->center_id] && joker->state[0] > 100)
-            *mult *= joker->state[0] / 100.0;
         switch (joker->center_id) {
+        case CENTER_J_DRIVERS_LICENSE:
+            if (context->enhanced >= 16) *mult *= 3;
+            break;
         case CENTER_J_MISPRINT:
             *mult += floor(pseudorandom(state, "misprint") * 24);
             break;
