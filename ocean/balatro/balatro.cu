@@ -423,6 +423,9 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
             s_argmax[i] = 0;
         }
     }
+    for (int i = threadIdx.x; i < BA_SLOT_FEATURES + SIG_SLOTS * SIG_W; i += blockDim.x) {
+        pooled[b * BA_TOTAL + BA_POOLED + i] = from_float(0.0f);
+    }
     __syncthreads();
 
     int counts[BA_POOL_SECTIONS];
@@ -542,31 +545,6 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
         }
     }
 
-    for (int i = threadIdx.x; i < SIG_SLOTS * SIG_W; i += blockDim.x) {
-        int f = i / SIG_W;
-        int z = 0, acc = 0;
-        for (; z < SIG_ZONES; ++z) {
-            if (f < acc + SIG_ZONE_CAPS[z]) break;
-            acc += SIG_ZONE_CAPS[z];
-        }
-        if (z >= SIG_ZONES) continue;
-        if (f - acc >= counts[z + 1])
-            pooled[b * BA_TOTAL + SIG_OFFSET + i] = from_float(0.0f);
-    }
-    for (int i = threadIdx.x; i < BA_SLOT_FEATURES; i += blockDim.x) {
-        int f = i / BA_SLOT_W;
-        int d = i % BA_SLOT_W;
-        int z = 0, acc = 0;
-        for (; z < BA_POOL_SECTIONS; ++z) {
-            if (f < acc + BA_SLOT_CAPS[z]) break;
-            acc += BA_SLOT_CAPS[z];
-        }
-        if (z >= BA_POOL_SECTIONS) continue;
-        int local = f - acc;
-        if (local >= counts[z]) {
-            pooled[b * BA_TOTAL + BA_POOLED + i] = from_float(0.0f);
-        }
-    }
     __syncthreads();
     for (int i = threadIdx.x; i < BA_POOL_SECTIONS * BA_TOKEN_W; i += blockDim.x)
         pooled[b * BA_TOTAL + BA_FIXED + i] = from_float(s_pool[i]);
