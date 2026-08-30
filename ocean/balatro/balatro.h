@@ -278,6 +278,39 @@ static void truncate_episode(Env *env) {
     env->agents[0].terminals[0] = 1.0f;
 }
 
+static inline int canonicalize_contract_selection(
+        Action *policy, const SelectionContract *selection, uint8_t hand_count) {
+    if (!selection || !selection->valid) {
+        policy->selection_count = 0;
+        return 1;
+    }
+    uint8_t target = policy->selection_count;
+    if (target < selection->minimum) target = selection->minimum;
+    if (target > selection->maximum) target = selection->maximum;
+    uint8_t required_count = (uint8_t)__builtin_popcountll(selection->required_hand);
+    if (target < required_count) target = required_count;
+    uint64_t chosen = selection->required_hand;
+    for (uint8_t i = 0; i < policy->selection_count && __builtin_popcountll(chosen) < target; ++i) {
+        uint8_t index = policy->selection[i];
+        if (index < hand_count && index < MAX_HAND && (selection->allowed_hand & (UINT64_C(1) << index)))
+            chosen |= UINT64_C(1) << index;
+    }
+    uint64_t allowed = selection->allowed_hand & ~chosen;
+    while (__builtin_popcountll(chosen) < target && allowed) {
+        int index = __builtin_ctzll(allowed);
+        chosen |= UINT64_C(1) << index;
+        allowed &= allowed - 1;
+    }
+    policy->selection_count = 0;
+    for (int index = 0; index < MAX_HAND && policy->selection_count < target; ++index) {
+        if (chosen & (UINT64_C(1) << index))
+            policy->selection[policy->selection_count++] = (uint8_t)index;
+    }
+    return policy->selection_count >= selection->minimum &&
+           policy->selection_count <= selection->maximum &&
+           (chosen & ~selection->allowed_hand) == 0;
+}
+
 void puf_step(Env *env) {
     Action policy = {0};
     policy.type = (uint8_t)env->agents[0].actions[0];
@@ -288,15 +321,11 @@ void puf_step(Env *env) {
         policy.selection[i] = (uint8_t)env->agents[0].actions[3 + i];
     const LegalMasks *legal = &env->legal_masks;
     int action_is_legal = 1;
-    /* Canonicalize the raw action to a legal one (clamping counts, filling
-       the forced set, sorting the selection); reject what cannot satisfy the
-       mask contract. */
     if (policy.type >= ACTION_TYPE_COUNT || policy.selection_count > MAX_SELECTION ||
         !legal->primary[policy.type]) {
         action_is_legal = 0;
     } else {
-        int has_primary = policy.type >= ACTION_BUY_CARD &&
-                          policy.type <= ACTION_SWAP_HAND_RIGHT;
+        int has_primary = policy.type >= ACTION_BUY_CARD && policy.type <= ACTION_SWAP_HAND_RIGHT;
         if (!has_primary) {
             policy.primary = 0;
         } else {
@@ -309,41 +338,7 @@ void puf_step(Env *env) {
         if (action_is_legal) {
             const SelectionContract *selection =
                 cached_selection(legal, policy.type, policy.primary);
-            if (!selection || !selection->valid) {
-                policy.selection_count = 0;
-            } else {
-                uint8_t target = policy.selection_count;
-                if (target < selection->minimum) target = selection->minimum;
-                if (target > selection->maximum) target = selection->maximum;
-                uint8_t required_count = (uint8_t)__builtin_popcountll(selection->required_hand);
-                if (target < required_count) target = required_count;
-                uint64_t chosen = selection->required_hand;
-                for (uint8_t i = 0; i < policy.selection_count &&
-                                    __builtin_popcountll(chosen) < target; ++i) {
-                    uint8_t index = policy.selection[i];
-                    if (index >= env->state.hand_count || index >= MAX_HAND) continue;
-                    uint64_t bit = UINT64_C(1) << index;
-                    if (selection->allowed_hand & bit) chosen |= bit;
-                }
-                uint64_t allowed = selection->allowed_hand & ~chosen;
-                while (__builtin_popcountll(chosen) < target && allowed) {
-                    int index = __builtin_ctzll(allowed);
-                    chosen |= UINT64_C(1) << index;
-                    allowed &= allowed - 1;
-                }
-                policy.selection_count = 0;
-                for (int index = 0; index < MAX_HAND &&
-                                    policy.selection_count < target; ++index) {
-                    if (chosen & (UINT64_C(1) << index))
-                        policy.selection[policy.selection_count++] = (uint8_t)index;
-                }
-                /* The clamp can still violate the contract when the required
-                   set overflows the allowed range; reject those. */
-                if (policy.selection_count < selection->minimum ||
-                    policy.selection_count > selection->maximum ||
-                    (chosen & ~selection->allowed_hand) != 0)
-                    action_is_legal = 0;
-            }
+            action_is_legal = canonicalize_contract_selection(&policy, selection, env->state.hand_count);
         }
     }
     env->agents[0].rewards[0] = 0.0f;
