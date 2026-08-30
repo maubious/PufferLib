@@ -88,11 +88,6 @@ typedef struct CenterDefinition {
     uint8_t voucher_effect;
 } CenterDefinition;
 
-typedef struct PlayingCardDefinition {
-    uint8_t suit;
-    uint8_t rank;
-} PlayingCardDefinition;
-
 typedef struct ScoreResult {
     uint8_t hand_type;
     uint8_t scoring_mask;
@@ -145,12 +140,6 @@ typedef struct KeyBuilder {
     size_t capacity;
     size_t length;
 } KeyBuilder;
-
-typedef struct TargetCard {
-    uint16_t sort_id;
-    uint8_t rank;
-    uint8_t suit;
-} TargetCard;
 
 typedef struct HandEffect {
     uint8_t hand;
@@ -625,10 +614,11 @@ void shuffle(State *state, Card *cards, size_t count, const char *stream) {
 // ------------------------------
 // --- card, center and capacity ---
 
-PlayingCardDefinition playing_card(uint8_t index) {
+static inline void set_playing_card(Card *card, uint8_t index) {
     static const uint8_t suits[] = {2, 1, 0, 3};
     static const uint8_t ranks[] = {2, 3, 4, 5, 6, 7, 8, 9, 14, 11, 13, 12, 10};
-    return (PlayingCardDefinition){suits[index / 13], ranks[index % 13]};
+    card->suit = suits[index / 13];
+    card->rank = ranks[index % 13];
 }
 
 uint8_t card_set(const Card *card) {
@@ -1699,9 +1689,7 @@ Card create_pooled_card(State *state, uint8_t set, const char *append, int pack_
         key_append(&key, append);
         key_append_u64(&key, state->ante);
     size_t front = (size_t)floor(pseudorandom(state, stream) * 52.0);
-        PlayingCardDefinition definition = playing_card((uint8_t)front);
-        card.suit = definition.suit;
-        card.rank = definition.rank;
+        set_playing_card(&card, (uint8_t)front);
         switch (card.center_id) {
         case CENTER_M_BONUS:
             card.enhancement = ENHANCEMENT_BONUS;
@@ -2180,11 +2168,7 @@ static int open_pack_center(State *state, uint16_t center_id) {
             char stream[32];
             key_with_u64(stream, sizeof(stream), "stdset", state->ante);
             int enhanced = pseudorandom(state, stream) > 0.6;
-            key_with_u64(stream, sizeof(stream), "frontsta", state->ante);
-            PlayingCardDefinition playing =
-                playing_card((uint8_t)(pseudorandom(state, stream) * 52.0));
-            card.suit = playing.suit;
-            card.rank = playing.rank;
+            set_playing_card(&card, (uint8_t)(pseudorandom(state, stream) * 52.0));
             card.center_id = CENTER_C_BASE;
             if (enhanced) {
                 size_t count = 0;
@@ -2667,14 +2651,8 @@ void apply_skip_tag(State *state, uint8_t tag) {
 
 
 Card random_playing_card(State *state, const char *stream) {
-    Card card = {0};
-    size_t front = (size_t)floor(pseudorandom(state, stream) * 52.0);
-    card.center_id = CENTER_C_BASE;
-    card.sort_id = ++state->next_sort_id;
-    PlayingCardDefinition definition = playing_card((uint8_t)front);
-    card.suit = definition.suit;
-    card.rank = definition.rank;
-    card.cost = card.sell_cost = 1;
+    Card card = {.center_id = CENTER_C_BASE, .sort_id = ++state->next_sort_id, .cost = 1, .sell_cost = 1};
+    set_playing_card(&card, (uint8_t)(pseudorandom(state, stream) * 52.0));
     return card;
 }
 
@@ -3808,8 +3786,9 @@ int observe(const State *state, Observation *out, LegalMasks *legal) {
 // ---- in blind ------
 
 void reset_round_targets(State *state) {
-    TargetCard candidates[MAX_DECK * 2 + MAX_HAND];
-    TargetCard scratch[MAX_DECK * 2 + MAX_HAND];
+    struct TargetEntry { uint16_t sort_id; uint8_t rank; uint8_t suit; };
+    struct TargetEntry candidates[MAX_DECK * 2 + MAX_HAND];
+    struct TargetEntry scratch[MAX_DECK * 2 + MAX_HAND];
     uint16_t count = 0;
     const Card *zones[] = {state->deck, state->hand, state->discard};
     const uint16_t counts[] = {state->deck_count, state->hand_count, state->discard_count};
@@ -3817,10 +3796,9 @@ void reset_round_targets(State *state) {
         for (uint16_t i = 0; i < counts[zone]; ++i) {
             const Card *card = &zones[zone][i];
             if (card->enhancement != ENHANCEMENT_STONE)
-                candidates[count++] = (TargetCard){card->sort_id, card->rank, card->suit};
+                candidates[count++] = (struct TargetEntry){card->sort_id, card->rank, card->suit};
         }
-    radix_sort(candidates, scratch, count, sizeof(*candidates),
-               offsetof(TargetCard, sort_id), sizeof(uint16_t));
+    radix_sort(candidates, scratch, count, sizeof(*candidates), 0, sizeof(uint16_t));
     uint8_t idol_rank = 14, idol_suit = SPADES;
     if (count) {
         size_t pick = pick_target_index(state, count, "idol");
@@ -4232,20 +4210,17 @@ void default_config(Config *config) {
 static void build_starting_deck(State *state) {
     state->deck_count = 0;
     for (uint8_t front = 0; front < 52; ++front) {
-        PlayingCardDefinition definition = playing_card(front);
+        Card card = {.center_id = CENTER_C_BASE, .sort_id = ++state->next_sort_id};
+        set_playing_card(&card, front);
         if (state->config.deck == CENTER_B_ABANDONED &&
-            (definition.rank == 11 || definition.rank == 12 || definition.rank == 13)) continue;
-        Card card = {.center_id = CENTER_C_BASE, .sort_id = ++state->next_sort_id,
-                     .suit = definition.suit, .rank = definition.rank};
+            (card.rank == 11 || card.rank == 12 || card.rank == 13)) continue;
         if (state->config.deck == CENTER_B_CHECKERED) {
             if (card.suit == CLUBS) card.suit = SPADES;
             else if (card.suit == DIAMONDS) card.suit = HEARTS;
         }
         if (state->config.deck == CENTER_B_ERRATIC) {
             size_t pick = (size_t)floor(pseudorandom(state, "erratic") * 52.0);
-            definition = playing_card((uint8_t)pick);
-            card.suit = definition.suit;
-            card.rank = definition.rank;
+            set_playing_card(&card, (uint8_t)pick);
         }
         state->deck[state->deck_count++] = card;
     }
