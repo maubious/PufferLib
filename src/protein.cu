@@ -16,6 +16,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdlib.h>
+#include <algorithm>
 #include <string.h>
 
 #define PROTEIN_EPSILON 1e-6f
@@ -24,7 +25,9 @@
 #define PROTEIN_COST_QUANTILE 0.97f
 #define PROTEIN_COST_GROWTH 1.01f
 #define PROTEIN_COST_SIGMA 0.15f
+#define PROTEIN_COST_LIMIT_Z 1.6448536f
 #define PROTEIN_CLF_ITERS 100
+#define PROTEIN_NOISE_FLOOR 1e-3f
 #define PROTEIN_THRESHOLD_COST_CAP 1.2f
 #define PROTEIN_THRESHOLD_FALLBACK 0.9f
 #define NOISE_PRIOR_MU (-4.60517f)
@@ -238,7 +241,7 @@ typedef struct {
     float *d_X, *d_y, *d_L, *d_alpha, *d_work;
     int lwork;
     int *d_info;
-    float raw_noise;
+    float raw_noise, target_mean, target_scale;
     cublasHandle_t cublas;
     cusolverDnHandle_t cusolver;
     GPKernel *kernel;
@@ -279,7 +282,9 @@ static void gp_init(GaussianProcess *gp, int dim, int cap, int pred_m, float noi
     k->raw_params[SF_IDX(n_params)] = inv_softplus(1.0f);
     k->raw_params[OFF_IDX(n_params)] = inv_softplus(1.0f);
     gp->kernel = k;
-    gp->raw_noise = inv_softplus(noise);
+    assert(noise > PROTEIN_NOISE_FLOOR);
+    gp->raw_noise = inv_softplus(noise - PROTEIN_NOISE_FLOOR);
+    gp->target_scale = 1.0f;
     cudaMalloc(&gp->d_X, cap * dim * sizeof(float));
     cudaMalloc(&gp->d_y, cap * sizeof(float));
     cudaMalloc(&gp->d_L, cap * cap * sizeof(float));
@@ -314,7 +319,7 @@ static int run_potrf(GaussianProcess *gp, float *d_K, int n, cudaStream_t stream
 
 static int gp_recompute(GaussianProcess *gp, cudaStream_t stream) {
     int n = gp->n;
-    float noise = softplus(gp->raw_noise);
+    float noise = PROTEIN_NOISE_FLOOR + softplus(gp->raw_noise);
     matern32lin_build_K(gp, gp->d_X, gp->d_X, n, n, noise, gp->d_L, stream);
     int info = run_potrf(gp, gp->d_L, n, stream);
     if (info != 0) {
@@ -468,13 +473,14 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
             inv_n * sigma_f * h_sums[d + 1] * softplus_grad(k->raw_params[OFF_IDX(np)]);
 
         float mll = (-0.5f * data_fit - log_det - 0.5f * n * logf(2.0f * M_PI)) / n;
-        float noise_val = softplus(gp->raw_noise);
+        float noise_val = PROTEIN_NOISE_FLOOR + softplus(gp->raw_noise);
         float ln_noise = logf(noise_val);
         float sig = softplus_grad(gp->raw_noise);
         float z = (ln_noise - NOISE_PRIOR_MU) / NOISE_PRIOR_SIGMA;
-        float np_grad = (-z / NOISE_PRIOR_SIGMA - 1.0f) * sig / noise_val + 1.0f - sig;
+        float np_grad = ((-z / NOISE_PRIOR_SIGMA - 1.0f) * sig / noise_val
+            + 1.0f - sig) / n;
         loss = -mll - (-0.5f * z * z - ln_noise - logf(NOISE_PRIOR_SIGMA)
-            - log1pf(expf(-gp->raw_noise)));
+            - log1pf(expf(-gp->raw_noise))) / n;
 
         (*opt_t)++;
         float bc1 = 1.0f - powf(beta1, (*opt_t));
@@ -522,7 +528,14 @@ __global__ void protein_k_sample(float *__restrict__ candidates,
         float s = scales[d] * global_scale;
         float val = s * (2.0f * curand_uniform(&state) - 1.0f)
             + centers[center * dim + d];
-        val = fmaxf(-1.0f, fminf(1.0f, val));
+        float phase = fmodf(val + 1.0f, 4.0f);
+        if (phase < 0.0f) {
+            phase += 4.0f;
+        }
+        if (phase > 2.0f) {
+            phase = 4.0f - phase;
+        }
+        val = phase - 1.0f;
         candidates[i * dim + d] = val;
     }
     if (cost_dim >= 0 && !isnan(fixed_cost)) {
@@ -532,8 +545,11 @@ __global__ void protein_k_sample(float *__restrict__ candidates,
 }
 
 typedef struct {
-    float score_loss, cost_loss, predicted_score, predicted_std, predicted_cost, rating;
-    int n_pareto, n_gp_obs, n_candidates, is_random;
+    float score_loss, cost_loss, predicted_score, predicted_std;
+    float predicted_cost, predicted_cost_std, predicted_cost_upper, rating;
+    float best_score, latent_std, expected_improvement, target_cost;
+    float cost_weight, limit_probability, valid_probability, nearest_distance;
+    int boundary_count, n_pareto, n_gp_obs, n_candidates, is_random;
 } ProteinSweepInfo;
 
 typedef struct {
@@ -554,6 +570,7 @@ typedef struct {
     int use_success_prob;
     int prune_pareto;
     int use_logit;
+    int use_quantile;
     float global_search_scale;
     float max_suggestion_cost;
     float expansion_rate;
@@ -566,9 +583,10 @@ typedef struct {
     // Internal
     float *succ_params, *succ_scores, *succ_costs;
     float *fail_params, *fail_scores, *fail_costs;
-    int succ_n, fail_n, n_top, dim, cost_dim;
+    int succ_n, fail_n, n_top, completed_successes, dim, cost_dim;
     int *top_idx;
     float min_score, max_score, log_c_min, log_c_max;
+    float log_rate_min, log_rate_max;
     int acq_cap;
     float *d_scales, *d_candidates, *d_pred_y, *d_pred_c;
     curandStatePhilox4_32_10_t *d_rng;
@@ -589,7 +607,8 @@ typedef struct {
     int *pareto_buf, *pruned_buf;
     float *centers_buf;
     // suggest scratch (sized to caps; ext_buf/kept_buf also pinball + classifier)
-    float *log_c_buf, *ext_buf, *h_cands, *h_pred;
+    float *log_c_buf, *log_rate_buf, *score_sort_buf;
+    float *gp_observed_costs, *ext_buf, *h_cands, *h_pred;
     int *kept_buf, *kd_idx, *kd_keep;
     KDNode *kd_nodes;
     float *d_centers;
@@ -601,7 +620,8 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     int dim = sw->space->num;
     sw->dim = dim;
     sw->cost_dim = sw->space->cost_idx;
-    sw->succ_n = sw->fail_n = sw->n_top = sw->suggestion_idx = 0;
+    sw->succ_n = sw->fail_n = sw->n_top = sw->completed_successes = 0;
+    sw->suggestion_idx = 0;
     sw->cm_fitted = sw->clf_fitted = sw->pool_remaining = 0;
     sw->opt_t_score = sw->opt_t_cost = 0;
     sw->upper_cost_threshold = -FLT_MAX;
@@ -610,6 +630,8 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     sw->max_score = -FLT_MAX;
     sw->log_c_min = FLT_MAX;
     sw->log_c_max = -FLT_MAX;
+    sw->log_rate_min = FLT_MAX;
+    sw->log_rate_max = -FLT_MAX;
     sw->clf_bias = 0.0f;
     sw->cm_A = sw->cm_B = sw->cm_max_score = sw->cm_upper = 0.0f;
 
@@ -663,10 +685,13 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     sw->pruned_buf = sw->pareto_buf + sw->success_cap;
     sw->centers_buf = (float *)malloc(max_centers * dim * sizeof(float));
     sw->log_c_buf = (float *)malloc(sw->success_cap * sizeof(float));
+    sw->log_rate_buf = (float *)malloc(sw->success_cap * sizeof(float));
+    sw->score_sort_buf = (float *)malloc(sw->success_cap * sizeof(float));
+    sw->gp_observed_costs = (float *)malloc(sw->gp_max_obs * sizeof(float));
     sw->ext_buf = (float *)malloc(max_ext * (dim + 2) * sizeof(float));
     sw->kept_buf = (int *)malloc(kd_cap * sizeof(int));
     sw->h_cands = (float *)malloc(acq_cap * dim * sizeof(float));
-    sw->h_pred = (float *)malloc(3 * acq_cap * sizeof(float));
+    sw->h_pred = (float *)malloc(4 * acq_cap * sizeof(float));
     sw->kd_idx = (int *)malloc(kd_cap * sizeof(int));
     sw->kd_nodes = (KDNode *)malloc(2 * kd_cap * sizeof(KDNode));
     sw->kd_keep = (int *)malloc(kd_cap * sizeof(int));
@@ -680,10 +705,81 @@ static float logit_transform(float value) {
     return fmaxf(-5.0f, fminf(100.0f, logit));
 }
 
-void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
-        float score, float cost, int is_failure) {
+static float transform_score(const ProteinSweep *sw, float score) {
     if (sw->use_logit) {
         score = logit_transform(score);
+    }
+    return score * sw->space->optimize_direction;
+}
+
+static float restore_score(const ProteinSweep *sw, float score) {
+    score *= sw->space->optimize_direction;
+    if (sw->use_logit) {
+        score = 1.0f / (1.0f + expf(-score));
+    }
+    return score;
+}
+
+// Empirical-CDF target warp: maps a score to its (0, 1) rank among the sorted
+// observed scores. Ties get the mid-rank so duplicated scores do not stack at
+// one quantile. The GP then models a near-uniform target where symmetric
+// Gaussian error is plausible even for ceiling-limited right-skewed metrics.
+static float score_to_quantile(int n_sorted, const float *sorted_scores,
+        float score) {
+    int lo = (int)(std::lower_bound(sorted_scores, sorted_scores + n_sorted, score)
+        - sorted_scores);
+    int hi = (int)(std::upper_bound(sorted_scores, sorted_scores + n_sorted, score)
+        - sorted_scores);
+    float mid = 0.5f * (float)(lo + hi);
+    return fminf(fmaxf(mid / (float)n_sorted, PROTEIN_EPSILON), 1.0f - PROTEIN_EPSILON);
+}
+
+// Inverse warp for reporting: quantile -> native score by linear interpolation
+// on the ECDF step function.
+static float quantile_to_score(int n_sorted, const float *sorted_scores,
+        float q) {
+    float pos = fminf(fmaxf(q * (float)n_sorted - 0.5f, 0.0f),
+        (float)(n_sorted - 1));
+    int i = (int)pos;
+    int j = i + 1 < n_sorted ? i + 1 : n_sorted - 1;
+    return sorted_scores[i] + (sorted_scores[j] - sorted_scores[i]) * (pos - (float)i);
+}
+
+static void rebuild_top(ProteinSweep *sw) {
+    sw->n_top = 0;
+    for (int idx = 0; idx < sw->succ_n; idx++) {
+        if (sw->cost_dim >= 0
+                && (sw->succ_params[idx * sw->dim + sw->cost_dim] < -1.0f
+                    || sw->succ_params[idx * sw->dim + sw->cost_dim] > 1.0f)) {
+            continue;
+        }
+        int insert = sw->n_top;
+        while (insert > 0
+                && sw->succ_scores[idx] > sw->succ_scores[sw->top_idx[insert - 1]]) {
+            insert--;
+        }
+        if (insert >= sw->top_k) {
+            continue;
+        }
+        int end = sw->n_top < sw->top_k ? sw->n_top : sw->top_k - 1;
+        for (int j = end; j > insert; j--) {
+            sw->top_idx[j] = sw->top_idx[j - 1];
+        }
+        sw->top_idx[insert] = idx;
+        if (sw->n_top < sw->top_k) {
+            sw->n_top++;
+        }
+    }
+    for (int i = 1; i < sw->n_top; i++) {
+        assert(sw->succ_scores[sw->top_idx[i - 1]]
+            >= sw->succ_scores[sw->top_idx[i]]);
+    }
+}
+
+void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
+        float score, float cost, int is_failure, int is_terminal) {
+    if (isfinite(score)) {
+        score = transform_score(sw, score);
     }
     int dim = sw->dim;
     if (is_failure || !isfinite(score)) {
@@ -696,6 +792,9 @@ void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
         sw->fail_costs[i] = cost;
         return;
     }
+    if (is_terminal) {
+        sw->completed_successes++;
+    }
     for (int i = 0; i < sw->succ_n; i++) {
         float dist2 = 0.0f;
         for (int d = 0; d < dim; d++) {
@@ -706,11 +805,9 @@ void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
             memcpy(&sw->succ_params[i * dim], norm_params, dim * sizeof(float));
             sw->succ_scores[i] = score;
             sw->succ_costs[i] = cost;
+            rebuild_top(sw);
             return;
         }
-    }
-    if (sw->cost_dim >= 0 && norm_params[sw->cost_dim] <= -1.0f) {
-        return;
     }
     if (sw->succ_n >= sw->success_cap) {
         return;
@@ -719,23 +816,7 @@ void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
     memcpy(&sw->succ_params[idx * dim], norm_params, dim * sizeof(float));
     sw->succ_scores[idx] = score;
     sw->succ_costs[idx] = cost;
-    if (sw->n_top >= sw->top_k
-            && score <= sw->succ_scores[sw->top_idx[sw->n_top - 1]]) {
-        return;
-    }
-    if (sw->n_top < sw->top_k) {
-        sw->top_idx[sw->n_top++] = idx;
-    } else {
-        sw->top_idx[sw->n_top - 1] = idx;
-    }
-    for (int j = sw->n_top - 1; j > 0; j--) {
-        if (sw->succ_scores[sw->top_idx[j]] <= sw->succ_scores[sw->top_idx[j - 1]]) {
-            break;
-        }
-        int tmp = sw->top_idx[j];
-        sw->top_idx[j] = sw->top_idx[j - 1];
-        sw->top_idx[j - 1] = tmp;
-    }
+    rebuild_top(sw);
 }
 
 int protein_sweep_should_stop(const ProteinSweep *sw, float score, float cost) {
@@ -750,9 +831,7 @@ int protein_sweep_should_stop(const ProteinSweep *sw, float score, float cost) {
             threshold = sw->cm_A + sw->cm_B * logf(cost);
         }
     }
-    if (sw->use_logit) {
-        score = logit_transform(score);
-    }
+    score = transform_score(sw, score);
     return score < threshold;
 }
 
@@ -911,7 +990,7 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     int dim = sw->dim, cost_dim = sw->cost_dim;
     int is_fixed_cost = !isnan(fixed_cost_norm);
 
-    if (sw->suggestion_idx <= sw->num_random_samples || sw->succ_n == 0) {
+    if (sw->completed_successes < sw->num_random_samples || sw->succ_n == 0) {
         sobol_fallback(sw, out, is_fixed_cost, fixed_cost_norm);
         info.is_random = 1;
         return info;
@@ -919,20 +998,42 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
 
     // sample observations for GP
     sw->min_score = sw->max_score = sw->succ_scores[0];
-    sw->log_c_min = logf(fmaxf(sw->succ_costs[0], PROTEIN_EPSILON));
-    sw->log_c_buf[0] = sw->log_c_min;
-    for (int i = 1; i < sw->succ_n; i++) {
+    int n_sampleable = 0;
+    for (int i = 0; i < sw->succ_n; i++) {
         float s = sw->succ_scores[i];
         sw->min_score = fminf(sw->min_score, s);
         sw->max_score = fmaxf(sw->max_score, s);
-        sw->log_c_buf[i] = logf(fmaxf(sw->succ_costs[i], PROTEIN_EPSILON));
-        sw->log_c_min = fminf(sw->log_c_min, sw->log_c_buf[i]);
+        float log_cost = logf(fmaxf(sw->succ_costs[i], PROTEIN_EPSILON));
+        float log_steps = 0.0f;
+        if (cost_dim >= 0) {
+            float steps = space_unnormalize(&sw->space->spaces[cost_dim],
+                sw->succ_params[i * dim + cost_dim]);
+            log_steps = logf(steps);
+        }
+        if (cost_dim < 0 || (sw->succ_params[i * dim + cost_dim] >= -1.0f
+                && sw->succ_params[i * dim + cost_dim] <= 1.0f)) {
+            sw->log_c_buf[n_sampleable] = log_cost;
+            sw->log_rate_buf[n_sampleable] = log_cost - log_steps;
+            n_sampleable++;
+        }
     }
-    qsort(sw->log_c_buf, sw->succ_n, sizeof(float), float_cmp);
-    float qidx = PROTEIN_COST_QUANTILE * (sw->succ_n - 1);
-    int qlo = (int)qidx, qhi = qlo + 1 < sw->succ_n ? qlo + 1 : sw->succ_n - 1;
+    assert(n_sampleable > 0);
+    qsort(sw->log_c_buf, n_sampleable, sizeof(float), float_cmp);
+    qsort(sw->log_rate_buf, n_sampleable, sizeof(float), float_cmp);
+    float qidx = PROTEIN_COST_QUANTILE * (n_sampleable - 1);
+    int qlo = (int)qidx;
+    int qhi = qlo + 1 < n_sampleable ? qlo + 1 : n_sampleable - 1;
     float qfrac = qidx - qlo;
+    sw->log_c_min = sw->log_c_buf[0];
     sw->log_c_max = sw->log_c_buf[qlo] * (1.0f - qfrac) + sw->log_c_buf[qhi] * qfrac;
+    float low_idx = (1.0f - PROTEIN_COST_QUANTILE) * (n_sampleable - 1);
+    int low_lo = (int)low_idx;
+    int low_hi = low_lo + 1 < n_sampleable ? low_lo + 1 : n_sampleable - 1;
+    float low_frac = low_idx - low_lo;
+    sw->log_rate_min = sw->log_rate_buf[low_lo] * (1.0f - low_frac)
+        + sw->log_rate_buf[low_hi] * low_frac;
+    sw->log_rate_max = sw->log_rate_buf[qlo] * (1.0f - qfrac)
+        + sw->log_rate_buf[qhi] * qfrac;
 
     int combined_n = sw->succ_n;
     int ext_dim = dim + 2;
@@ -966,17 +1067,59 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
             dim * sizeof(float));
         sw->gp_train_y[i] = sw->ext_buf[idx * ext_dim + dim];
         sw->gp_train_c[i] = sw->ext_buf[idx * ext_dim + dim + 1];
+        sw->gp_observed_costs[i] = sw->gp_train_c[i];
     }
     int n_gp = n_kept;
 
     float min_score = sw->min_score, max_score = sw->max_score;
     float log_c_min = sw->log_c_min, log_c_max = sw->log_c_max;
+    float log_rate_min = sw->log_rate_min, log_rate_max = sw->log_rate_max;
     float score_range = fabsf(max_score - min_score) + PROTEIN_EPSILON;
     float cost_range = log_c_max - log_c_min + PROTEIN_EPSILON;
+    float rate_range = log_rate_max - log_rate_min + PROTEIN_EPSILON;
+    memcpy(sw->score_sort_buf, sw->succ_scores, (size_t)sw->succ_n * sizeof(float));
+    qsort(sw->score_sort_buf, sw->succ_n, sizeof(float), float_cmp);
     for (int i = 0; i < n_gp; i++) {
-        sw->gp_train_y[i] = (sw->gp_train_y[i] - min_score) / score_range;
-        float lc = logf(fmaxf(sw->gp_train_c[i], PROTEIN_EPSILON));
-        sw->gp_train_c[i] = (lc - log_c_min) / cost_range;
+        if (sw->use_quantile) {
+            sw->gp_train_y[i] = score_to_quantile(sw->succ_n, sw->score_sort_buf,
+                sw->gp_train_y[i]);
+        } else {
+            sw->gp_train_y[i] = (sw->gp_train_y[i] - min_score) / score_range;
+        }
+        float log_steps = 0.0f;
+        if (cost_dim >= 0) {
+            float steps = space_unnormalize(&sw->space->spaces[cost_dim],
+                sw->gp_train_params[i * dim + cost_dim]);
+            log_steps = logf(steps);
+        }
+        float log_rate = logf(fmaxf(sw->gp_train_c[i], PROTEIN_EPSILON)) - log_steps;
+        sw->gp_train_c[i] = (log_rate - log_rate_min) / rate_range;
+    }
+    float score_mean = 0.0f;
+    float rate_mean = 0.0f;
+    for (int i = 0; i < n_gp; i++) {
+        score_mean += sw->gp_train_y[i];
+        rate_mean += sw->gp_train_c[i];
+    }
+    sw->gp_score.target_mean = score_mean / n_gp;
+    sw->gp_cost.target_mean = rate_mean / n_gp;
+    float score_variance = 0.0f;
+    float rate_variance = 0.0f;
+    for (int i = 0; i < n_gp; i++) {
+        float score_delta = sw->gp_train_y[i] - sw->gp_score.target_mean;
+        float rate_delta = sw->gp_train_c[i] - sw->gp_cost.target_mean;
+        score_variance += score_delta * score_delta;
+        rate_variance += rate_delta * rate_delta;
+    }
+    sw->gp_score.target_scale = fmaxf(sqrtf(score_variance / n_gp),
+        PROTEIN_EPSILON);
+    sw->gp_cost.target_scale = fmaxf(sqrtf(rate_variance / n_gp),
+        PROTEIN_EPSILON);
+    for (int i = 0; i < n_gp; i++) {
+        sw->gp_train_y[i] = (sw->gp_train_y[i] - sw->gp_score.target_mean)
+            / sw->gp_score.target_scale;
+        sw->gp_train_c[i] = (sw->gp_train_c[i] - sw->gp_cost.target_mean)
+            / sw->gp_cost.target_scale;
     }
 
     // Train GPs
@@ -995,14 +1138,19 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     }
 
     // Pareto front + prune
+    n_sampleable = 0;
     for (int i = 0; i < sw->succ_n; i++) {
-        sw->pruned_buf[i] = i;
+        if (cost_dim < 0 || (sw->succ_params[i * dim + cost_dim] >= -1.0f
+                && sw->succ_params[i * dim + cost_dim] <= 1.0f)) {
+            sw->pruned_buf[n_sampleable++] = i;
+        }
     }
+    assert(n_sampleable > 0);
     g_pareto_costs = sw->succ_costs;
-    qsort(sw->pruned_buf, sw->succ_n, sizeof(int), pareto_cmp);
+    qsort(sw->pruned_buf, n_sampleable, sizeof(int), pareto_cmp);
     int n_pareto = 0;
     float max_ps = -FLT_MAX;
-    for (int i = 0; i < sw->succ_n; i++) {
+    for (int i = 0; i < n_sampleable; i++) {
         int idx = sw->pruned_buf[i];
         if (sw->succ_scores[idx] > max_ps + PROTEIN_EPSILON) {
             sw->pareto_buf[n_pareto++] = idx;
@@ -1194,6 +1342,48 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         target_cost = (1.0f + sw->expansion_rate) * ratio;
     }
 
+    gp_predict(&sw->gp_score, sw->gp_score.d_X, sw->d_pred_y, NULL,
+        n_gp, sw->stream);
+    cudaMemcpyAsync(sw->h_pred, sw->d_pred_y, n_gp * sizeof(float),
+        cudaMemcpyDeviceToHost, sw->stream);
+    cudaStreamSynchronize(sw->stream);
+    float best_norm = -FLT_MAX;
+    float nearest_cost = FLT_MAX;
+    float nearest_score = -FLT_MAX;
+    for (int i = 0; i < n_gp; i++) {
+        if (cost_dim >= 0 && (sw->gp_train_params[i * dim + cost_dim] < -1.0f
+                || sw->gp_train_params[i * dim + cost_dim] > 1.0f)) {
+            continue;
+        }
+        float mean = sw->h_pred[i] * sw->gp_score.target_scale
+            + sw->gp_score.target_mean;
+        float distance;
+        int eligible;
+        if (is_fixed_cost && cost_dim >= 0) {
+            distance = fabsf(sw->gp_train_params[i * dim + cost_dim] - fixed_cost_norm);
+            eligible = distance <= 0.1f;
+        } else if (!is_fixed_cost) {
+            float cn = (logf(fmaxf(sw->gp_observed_costs[i], PROTEIN_EPSILON))
+                - log_c_min) / cost_range;
+            distance = fabsf(cn - target_cost);
+            eligible = cn <= target_cost + PROTEIN_COST_SIGMA;
+        } else {
+            distance = 0.0f;
+            eligible = 1;
+        }
+        if (eligible) {
+            best_norm = fmaxf(best_norm, mean);
+        }
+        if (distance < nearest_cost) {
+            nearest_cost = distance;
+            nearest_score = mean;
+        }
+    }
+    if (best_norm == -FLT_MAX) {
+        best_norm = nearest_score;
+    }
+    assert(isfinite(best_norm));
+
     // Sample candidates
     int n_total = n_centers * sw->suggestions_per_pareto;
     if (n_total > sw->acq_cap) {
@@ -1228,7 +1418,7 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
 
     // Success classifier
     sw->clf_fitted = 0;
-    if (sw->use_success_prob && sw->succ_n > 9 && sw->fail_n > 9) {
+    if (sw->use_success_prob && sw->succ_n > 9 && sw->fail_n > 1) {
         int n_s = sw->succ_n, n_f = sw->fail_n, n_clf = n_s + n_f;
         float *X = sw->ext_buf;
         int *yy = sw->kept_buf;
@@ -1281,7 +1471,8 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     // GP predict + score/argmax
     gp_predict(&sw->gp_score, sw->d_candidates, sw->d_pred_y,
         sw->gp_score.d_stds, n_cands, sw->stream);
-    gp_predict(&sw->gp_cost, sw->d_candidates, sw->d_pred_c, NULL,
+    gp_predict(&sw->gp_cost, sw->d_candidates, sw->d_pred_c,
+        sw->gp_cost.d_stds,
         n_cands, sw->stream);
     cudaMemcpyAsync(sw->h_pred, sw->d_pred_y, n_cands * sizeof(float),
         cudaMemcpyDeviceToHost, sw->stream);
@@ -1289,50 +1480,156 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         cudaMemcpyDeviceToHost, sw->stream);
     cudaMemcpyAsync(sw->h_pred + 2 * n_cands, sw->gp_score.d_stds,
         n_cands * sizeof(float), cudaMemcpyDeviceToHost, sw->stream);
+    cudaMemcpyAsync(sw->h_pred + 3 * n_cands, sw->gp_cost.d_stds,
+        n_cands * sizeof(float), cudaMemcpyDeviceToHost, sw->stream);
     cudaStreamSynchronize(sw->stream);
 
     int best = 0;
     float best_s = -FLT_MAX;
-    int opt_dir = sw->space->optimize_direction;
-    float best_norm = (max_score - min_score) > PROTEIN_EPSILON
-        ? (opt_dir * sw->succ_scores[sw->top_idx[0]] - min_score)
-            / (max_score - min_score)
-        : 0.0f;
+    float best_ei = 0.0f;
+    float best_cost_weight = 1.0f;
+    float best_limit_probability = 1.0f;
+    float best_valid_probability = 1.0f;
     for (int i = 0; i < n_cands; i++) {
-        float mu = opt_dir * sw->h_pred[i];
-        float sd = sw->h_pred[2 * n_cands + i];
+        float mu = sw->h_pred[i] * sw->gp_score.target_scale
+            + sw->gp_score.target_mean;
+        float sd = sw->h_pred[2 * n_cands + i] * sw->gp_score.target_scale;
         float z = mu - best_norm;
         float t = z / sd;
-        float s = z * norm_cdf(t) + sd * norm_pdf(t);
+        float expected_improvement = z * norm_cdf(t) + sd * norm_pdf(t);
+        float cost_weight = 1.0f;
+        float limit_probability = 1.0f;
+        float valid_probability = 1.0f;
+        float s = expected_improvement;
         if (!is_fixed_cost) {
-            float cn = sw->h_pred[n_cands + i];
-            float c = expf(cn * (log_c_max - log_c_min) + log_c_min);
-            float cost_delta = (cn - target_cost) / PROTEIN_COST_SIGMA;
-            s *= (c < sw->max_suggestion_cost ? 1.0f : 0.0f)
-                * expf(-0.5f * cost_delta * cost_delta);
+            float rate_norm = sw->h_pred[n_cands + i] * sw->gp_cost.target_scale
+                + sw->gp_cost.target_mean;
+            float log_steps = 0.0f;
+            if (cost_dim >= 0) {
+                float steps = space_unnormalize(&sw->space->spaces[cost_dim],
+                    sw->h_cands[i * dim + cost_dim]);
+                log_steps = logf(steps);
+            }
+            float log_cost = rate_norm * rate_range + log_rate_min + log_steps;
+            float log_cost_sd = sqrtf(sw->h_pred[3 * n_cands + i]
+                    * sw->h_pred[3 * n_cands + i]
+                    + PROTEIN_NOISE_FLOOR + softplus(sw->gp_cost.raw_noise))
+                * sw->gp_cost.target_scale * rate_range;
+            float cn = (log_cost - log_c_min) / cost_range;
+            float cn_sd = log_cost_sd / cost_range;
+            float target_var = PROTEIN_COST_SIGMA * PROTEIN_COST_SIGMA
+                + cn_sd * cn_sd;
+            cost_weight = PROTEIN_COST_SIGMA / sqrtf(target_var)
+                * expf(-0.5f * (cn - target_cost) * (cn - target_cost) / target_var);
+            limit_probability = norm_cdf(
+                (logf(sw->max_suggestion_cost) - log_cost) / log_cost_sd);
+            s *= cost_weight * limit_probability;
         }
         if (sw->clf_fitted) {
             float clf_z = sw->clf_bias;
             for (int d = 0; d < dim; d++) {
                 clf_z += sw->h_cands[i * dim + d] * sw->clf_w[d];
             }
-            s *= 1.0f / (1.0f + expf(-clf_z));
+            valid_probability = 1.0f / (1.0f + expf(-clf_z));
+            s *= valid_probability;
         }
         if (s > best_s) {
             best_s = s;
             best = i;
+            best_ei = expected_improvement;
+            best_cost_weight = cost_weight;
+            best_limit_probability = limit_probability;
+            best_valid_probability = valid_probability;
         }
     }
     memcpy(out, &sw->h_cands[best * dim], dim * sizeof(float));
-    float y_norm = sw->h_pred[best], c_norm = sw->h_pred[n_cands + best];
+    float y_norm = sw->h_pred[best] * sw->gp_score.target_scale
+        + sw->gp_score.target_mean;
+    float score_pred_sd = sqrtf(sw->h_pred[2 * n_cands + best]
+            * sw->h_pred[2 * n_cands + best]
+            + PROTEIN_NOISE_FLOOR + softplus(sw->gp_score.raw_noise))
+        * sw->gp_score.target_scale;
+    float latent_score_sd = sw->h_pred[2 * n_cands + best]
+        * sw->gp_score.target_scale;
+    float rate_norm = sw->h_pred[n_cands + best] * sw->gp_cost.target_scale
+        + sw->gp_cost.target_mean;
+    float log_steps = 0.0f;
+    if (cost_dim >= 0) {
+        float steps = space_unnormalize(&sw->space->spaces[cost_dim],
+            sw->h_cands[best * dim + cost_dim]);
+        log_steps = logf(steps);
+    }
+    float log_cost = rate_norm * rate_range + log_rate_min + log_steps;
+    float log_cost_sd = sqrtf(sw->h_pred[3 * n_cands + best]
+            * sw->h_pred[3 * n_cands + best]
+            + PROTEIN_NOISE_FLOOR + softplus(sw->gp_cost.raw_noise))
+        * sw->gp_cost.target_scale * rate_range;
 
     info.score_loss = score_loss;
     info.cost_loss = cost_loss;
-    info.predicted_score = y_norm * (max_score - min_score) + min_score;
-    info.predicted_std =
-        sw->h_pred[2 * n_cands + best] * (max_score - min_score);
-    info.predicted_cost = expf(c_norm * (log_c_max - log_c_min) + log_c_min);
+    if (sw->use_quantile) {
+        float predicted = quantile_to_score(sw->succ_n, sw->score_sort_buf, y_norm);
+        float hi = quantile_to_score(sw->succ_n, sw->score_sort_buf,
+            fminf(y_norm + score_pred_sd, 1.0f));
+        float lo = quantile_to_score(sw->succ_n, sw->score_sort_buf,
+            fmaxf(y_norm - score_pred_sd, 0.0f));
+        info.predicted_score = restore_score(sw, predicted);
+        info.predicted_std = 0.5f
+            * fabsf(restore_score(sw, hi) - restore_score(sw, lo));
+        hi = quantile_to_score(sw->succ_n, sw->score_sort_buf,
+            fminf(y_norm + latent_score_sd, 1.0f));
+        lo = quantile_to_score(sw->succ_n, sw->score_sort_buf,
+            fmaxf(y_norm - latent_score_sd, 0.0f));
+        info.latent_std = 0.5f
+            * fabsf(restore_score(sw, hi) - restore_score(sw, lo));
+        info.best_score = restore_score(sw,
+            quantile_to_score(sw->succ_n, sw->score_sort_buf, best_norm));
+    } else {
+        float predicted = y_norm * score_range + min_score;
+        float transformed_sd = score_pred_sd * score_range;
+        float latent_transformed_sd = latent_score_sd * score_range;
+        info.predicted_score = restore_score(sw, predicted);
+        if (sw->use_logit) {
+            info.predicted_std = 0.5f * fabsf(
+                restore_score(sw, predicted + transformed_sd)
+                - restore_score(sw, predicted - transformed_sd));
+            info.latent_std = 0.5f * fabsf(
+                restore_score(sw, predicted + latent_transformed_sd)
+                - restore_score(sw, predicted - latent_transformed_sd));
+        } else {
+            info.predicted_std = transformed_sd;
+            info.latent_std = latent_transformed_sd;
+        }
+        info.best_score = restore_score(sw, best_norm * score_range + min_score);
+    }
+    float log_variance = log_cost_sd * log_cost_sd;
+    info.predicted_cost = expf(log_cost + 0.5f * log_variance);
+    info.predicted_cost_std = sqrtf((expf(log_variance) - 1.0f)
+        * expf(2.0f * log_cost + log_variance));
+    info.predicted_cost_upper = expf(log_cost + PROTEIN_COST_LIMIT_Z * log_cost_sd);
+    info.expected_improvement = best_ei;
+    info.target_cost = expf(log_c_min + target_cost * cost_range);
+    info.cost_weight = best_cost_weight;
+    info.limit_probability = best_limit_probability;
+    info.valid_probability = best_valid_probability;
     info.rating = best_s;
+    float nearest_distance = FLT_MAX;
+    for (int i = 0; i < n_gp; i++) {
+        float distance = 0.0f;
+        for (int d = 0; d < dim; d++) {
+            float delta = sw->h_cands[best * dim + d] - sw->gp_train_params[i * dim + d];
+            distance += delta * delta;
+        }
+        nearest_distance = fminf(nearest_distance, distance);
+    }
+    info.nearest_distance = sqrtf(nearest_distance / dim);
+    for (int d = 0; d < dim; d++) {
+        float value = space_unnormalize(
+            &sw->space->spaces[d], sw->h_cands[best * dim + d]);
+        if (value == sw->space->spaces[d].min || value == sw->space->spaces[d].max) {
+            info.boundary_count++;
+        }
+    }
     info.n_pareto = n_use;
     info.n_gp_obs = n_gp;
     info.n_candidates = n_cands;

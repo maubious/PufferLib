@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #ifdef USE_ROCM
 #include <rocblas/rocblas.h>
+#include <rocm_smi/rocm_smi.h>
 #endif
 #ifndef USE_ROCM
 #include <cuda_profiler_api.h>
@@ -413,7 +414,8 @@ struct RolloutBuf {
     Prec values;        // (horizon, agents)
     Prec logprobs;      // ...
     Prec rewards;
-    Prec terminals;
+    Prec rnn_resets;    // reset before processing observations[t]
+    Prec transition_dones; // done after executing actions[t]
     Prec action_mask;   // (horizon, agents, mask_size)
 };
 
@@ -428,12 +430,14 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
     bufs->values       = {.shape = {T, B}};
     bufs->logprobs     = {.shape = {T, B}};
     bufs->rewards      = {.shape = {T, B}};
-    bufs->terminals    = {.shape = {T, B}};
+    bufs->rnn_resets   = {.shape = {T, B}};
+    bufs->transition_dones = {.shape = {T, B}};
     bufs->action_mask  = {.shape = {T, B, mask_size}};
     alloc_register(alloc, &bufs->observations);
     Prec* fields[] = {
         &bufs->actions, &bufs->values, &bufs->logprobs,
-        &bufs->rewards, &bufs->terminals, &bufs->action_mask,
+        &bufs->rewards, &bufs->rnn_resets, &bufs->transition_dones,
+        &bufs->action_mask,
     };
     for (int i = 0; i < (int)(sizeof(fields) / sizeof(fields[0])); i++) {
         alloc_register(alloc, fields[i]);
@@ -469,7 +473,8 @@ RolloutBuf rollout_time_view(RolloutBuf* base, int start_t, int T) {
     view.values       = puf_time_view(base->values,       start_t, T);
     view.logprobs     = puf_time_view(base->logprobs,     start_t, T);
     view.rewards      = puf_time_view(base->rewards,      start_t, T);
-    view.terminals    = puf_time_view(base->terminals,    start_t, T);
+    view.rnn_resets   = puf_time_view(base->rnn_resets,   start_t, T);
+    view.transition_dones = puf_time_view(base->transition_dones, start_t, T);
     view.action_mask  = puf_time_view(base->action_mask,  start_t, T);
     return view;
 }
@@ -527,6 +532,7 @@ typedef struct {
     Prec param;
     Float master_weights;
     Prec* buffer_states;         // [num_buffers]
+    Prec* bootstrap_states;      // [num_buffers]
     Activations* buf_acts;  // [num_buffers]
 } Policy;
 
@@ -601,6 +607,8 @@ typedef struct PuffeRL {
     RolloutBuf rollouts;
     RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
     EnvBuf env;
+    PolicyObs bootstrap_observations; // (1, total_agents, obs_size)
+    Prec bootstrap_values;           // (slots, total_agents)
     TrainGraph train_buf;
     Prec train_state;  // (L, A, H) carry in env order; graph reads with dest_off
     cudaGraphExec_t* rollout_graphs;  // CPU: [slots][horizon][num_buffers]
@@ -985,6 +993,29 @@ PolicyObs puf_obs_slice(PolicyObs p, int t, int start, int count) {
 }
 #endif
 
+static void copy_observation(PolicyObs dst, ObsTensor src, int n,
+        cudaStream_t stream) {
+#ifdef PUFFER_PACKED_OBS
+    static_assert(sizeof(obs_t) == 1,
+        "packed observations require byte env output");
+    cudaMemcpyAsync(dst.data, src.data, n, cudaMemcpyDeviceToDevice, stream);
+#else
+    if (sizeof(obs_t) == sizeof(precision_t)) {
+        cudaMemcpyAsync(dst.data, src.data,
+            n * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
+    } else {
+        cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst.data, src.data, n);
+    }
+#endif
+}
+
+__global__ void store_values(Prec dst, Prec dec, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst.data[idx] = dec.data[idx * dec.shape[1] + dec.shape[1] - 1];
+    }
+}
+
 static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         cudaStream_t stream) {
     Hypers* hypers = &pufferl->hypers;
@@ -1001,7 +1032,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
     int start = buf * block_size;
     int* layout = vec->policy_layout;
 
-    // Copy observations, rewards, terminals from GPU env buffers to rollout buffer
+    // Copy the current observation and reset flag before selecting the action.
     ObsTensor* obs_env = &env->obs;
     PolicyObs obs_dst = puf_obs_slice(rollouts.observations, t, start, block_size);
     int n = block_size * obs_env->shape[1];
@@ -1010,32 +1041,19 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
     // step); fold it into this horizon's slice 0. Steps t > 0 were already
     // written straight into the slice by cpu_upload.
     if (t == 0) {
-        cudaMemcpyAsync(obs_dst.data,
-            obs_env->data + (long)start * obs_env->shape[1],
-            n, cudaMemcpyDeviceToDevice, stream);
+        copy_observation(obs_dst, {
+            .data = obs_env->data + (long)start * obs_env->shape[1],
+            .shape = {block_size, obs_env->shape[1]}}, n, stream);
     }
-    #elif defined(PUFFER_PACKED_OBS)
-    static_assert(sizeof(obs_t) == 1, "packed observations require byte env output");
-    cudaMemcpyAsync(obs_dst.data,
-        obs_env->data + (long)start * obs_env->shape[1],
-        n, cudaMemcpyDeviceToDevice, stream);
 #else
-    // Env obs → rollout: D2D if same type, else cast (float/uchar → precision_t).
-    if (sizeof(obs_t) == sizeof(precision_t)) {
-        cudaMemcpyAsync(obs_dst.data,
-            obs_env->data + (long)start * obs_env->shape[1],
-            n * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
-    } else {
-        cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-            obs_dst.data, obs_env->data + (long)start * obs_env->shape[1], n);
-    }
+    copy_observation(obs_dst, {
+        .data = obs_env->data + (long)start * obs_env->shape[1],
+        .shape = {block_size, obs_env->shape[1]}}, n, stream);
 #endif
 
-    Prec rew_dst = puf_slice(rollouts.rewards, t, start, block_size);
-    Prec term_dst = puf_slice(rollouts.terminals, t, start, block_size);
-    cast_rew_term<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
-        rew_dst.data, env->rewards.data + start,
-        term_dst.data, env->terminals.data + start, block_size);
+    Prec reset_dst = puf_slice(rollouts.rnn_resets, t, start, block_size);
+    cast<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
+        reset_dst.data, env->terminals.data + start, block_size);
     
     // Mask always allocated (env-written or synthetic all-ones). Continuous ignores it in sample.
     int mask_size = rollouts.action_mask.shape[2];
@@ -1102,6 +1120,77 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
                 env->actions.data + (long)sub * act_cols,
                 act_b.data, numel(act_b.shape));
     }
+}
+
+static void bootstrap(PuffeRL* pufferl, int buf, cudaStream_t stream) {
+    Hypers* hypers = &pufferl->hypers;
+    int graph_slot = hypers->async ? pufferl->write_slot : 0;
+    int block_size = hypers->total_agents / hypers->num_buffers;
+    int start = buf * block_size;
+    int obs_size = pufferl->env.obs.shape[1];
+    int n = block_size * obs_size;
+
+    PolicyObs observation = puf_obs_slice(
+        pufferl->bootstrap_observations, 0, start, block_size);
+    copy_observation(observation, {
+        .data = pufferl->env.obs.data + (long)start * obs_size,
+        .shape = {block_size, obs_size}}, n, stream);
+
+    Prec values = {
+        .data = pufferl->bootstrap_values.data
+            + (long)graph_slot * hypers->total_agents,
+        .shape = {hypers->total_agents},
+    };
+    int* layout = pufferl->vec->policy_layout;
+    for (int b = 0; b < pufferl->num_policies; b++) {
+        int off = layout[b];
+        int count = layout[b + 1] - off;
+        if (count == 0) {
+            continue;
+        }
+
+        Policy* pol = &pufferl->policies[b];
+        Weights* w = (!pol->frozen && hypers->async)
+            ? &pufferl->actor_weights : &pol->weights;
+        Activations* acts = &pol->buf_acts[buf];
+        Prec* state = &pol->buffer_states[buf];
+        Prec* state_copy = &pol->bootstrap_states[buf];
+        int sub = start + off;
+        cudaMemcpyAsync(state_copy->data, state->data,
+            numel(state->shape) * sizeof(precision_t),
+            cudaMemcpyDeviceToDevice, stream);
+        zero_term_state<<<grid_size((int)state->shape[0] * count
+                * (int)state->shape[2]), BLOCK_SIZE, 0, stream>>>(
+            *state_copy, pufferl->env.terminals, 0, sub, count);
+
+        PolicyObs obs_b = puf_obs_slice(
+            pufferl->bootstrap_observations, 0, sub, count);
+        Prec value_b = {
+            .data = values.data + sub,
+            .shape = {count},
+        };
+        Prec dec = arch_forward(&pol->arch, *w, *acts, obs_b, *state_copy,
+            stream);
+        store_values<<<grid_size(count), BLOCK_SIZE, 0, stream>>>(
+            value_b, dec, count);
+    }
+}
+
+static void store_transition(PuffeRL* pufferl, int t, int start, int count,
+        cudaStream_t stream) {
+    assert(t < pufferl->hypers.horizon);
+    RolloutBuf rollouts = pufferl->rollouts;
+    if (pufferl->hypers.async) {
+        rollouts = rollout_time_view(&pufferl->rollouts,
+            pufferl->write_slot * pufferl->hypers.horizon,
+            pufferl->hypers.horizon);
+    }
+    Prec reward = puf_slice(rollouts.rewards, t, start, count);
+    Prec transition_done = puf_slice(
+        rollouts.transition_dones, t, start, count);
+    cast_rew_term<<<grid_size(count), BLOCK_SIZE, 0, stream>>>(
+        reward.data, pufferl->env.rewards.data + start,
+        transition_done.data, pufferl->env.terminals.data + start, count);
 }
 
 void pufferl_forward(PuffeRL* pufferl, int buf, int t, cudaStream_t stream) {
@@ -1363,6 +1452,9 @@ static void cpu_upload(PuffeRL* p, int t, int start, int n, cudaStream_t stream)
         n * sizeof(float), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(e->terminals.data + start, v->terminals + start,
         n * sizeof(float), cudaMemcpyHostToDevice, stream);
+    if (t < p->hypers.horizon) {
+        store_transition(p, t, start, n, stream);
+    }
     cudaMemcpyAsync(e->action_mask.data + (size_t)start * mask,
         v->action_mask + (size_t)start * mask,
         n * mask * sizeof(unsigned char), cudaMemcpyHostToDevice, stream);
@@ -1465,6 +1557,7 @@ static void* vec_thread_main(void* arg) {
             cudaEventRecord(ev[H2D_END], stream);
             h2d_pending = 1;
         }
+        bootstrap(pufferl, buf, stream);
         cudaStreamSynchronize(stream);
         if (h2d_pending) {
             cudaEventElapsedTime(&ms, ev[H2D_START], ev[H2D_END]);
@@ -1534,8 +1627,10 @@ static void rollout_start(PuffeRL* p) {
             pufferl_forward_step(p, 0, t, stream);
             cudaEventRecord(ev[base + MODEL_END], stream);
             puf_step(p->vec->envs);
+            store_transition(p, t, 0, p->hypers.total_agents, stream);
             cudaEventRecord(ev[base + ENV_END], stream);
         }
+        bootstrap(p, 0, stream);
         if (first) {
             cudaGraph_t graph;
             assert(cudaStreamEndCapture(stream, &graph) == cudaSuccess
@@ -1798,7 +1893,9 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
         rollouts->rewards.data, src.rewards.data, T, B, 1);
     transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->terminals.data, src.terminals.data, T, B, 1);
+        rollouts->rnn_resets.data, src.rnn_resets.data, T, B, 1);
+    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
+        rollouts->transition_dones.data, src.transition_dones.data, T, B, 1);
     transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
         rollouts->values.data, src.values.data, T, B, 1);
     transpose_102<<<grid_size(T * B * mask_c), BLOCK_SIZE, 0, stream>>>(
@@ -1806,7 +1903,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
 
     clamp_precision_kernel<<<grid_size(
         numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
-        rollouts->rewards.data, -1.0f, 1.0f, numel(rollouts->rewards.shape));
+        rollouts->rewards.data, -100.0f, 100.0f, numel(rollouts->rewards.shape));
 
     if (hypers->reset_every_horizon || src.initial_states.data == NULL) {
         cudaMemsetAsync(pufferl->train_state.data, 0,
@@ -1835,9 +1932,18 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         graph.mb_obs = slice_rows(rollouts->observations, dest_off, Nmb);
         graph.mb_actions = slice_rows(rollouts->actions, dest_off, Nmb);
         graph.mb_logprobs = slice_rows(rollouts->logprobs, dest_off, Nmb);
-        graph.mb_terminals = slice_rows(rollouts->terminals, dest_off, Nmb);
+        graph.mb_rnn_resets = slice_rows(rollouts->rnn_resets, dest_off, Nmb);
+        graph.mb_transition_dones = slice_rows(
+            rollouts->transition_dones, dest_off, Nmb);
         graph.mb_rewards = slice_rows(rollouts->rewards, dest_off, Nmb);
         graph.mb_values = slice_rows(rollouts->values, dest_off, Nmb);
+        Prec bootstrap_values = {
+            .data = pufferl->bootstrap_values.data
+                + (long)slot * B,
+            .shape = {B},
+        };
+        graph.mb_bootstrap_values = slice_rows(
+            bootstrap_values, dest_off, Nmb);
         graph.mb_action_mask = slice_rows(rollouts->action_mask, dest_off, Nmb);
         graph.mb_state = pufferl->train_state;
         DecoderWeights* dw_train = (DecoderWeights*)primary->weights.decoder;
@@ -1849,13 +1955,14 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         }
         Prec dec = arch_forward_train(&primary->arch, primary->weights,
             pufferl->train_activs, graph.mb_obs, graph.mb_state,
-            graph.mb_terminals, dest_off, graph, p_logstd,
+            graph.mb_rnn_resets, dest_off, graph, p_logstd,
             dw_train->condition, pufferl->act_sizes,
             pufferl->ppo_bufs.grad_logits.data,
             pufferl->ppo_bufs.grad_values.data, stream);
         puff_advantage<<<adv_grid, ADV_THREADS, 0, stream>>>(
             graph.mb_gae_v.data, graph.mb_rewards.data,
-            graph.mb_terminals.data,
+            graph.mb_transition_dones.data,
+            graph.mb_bootstrap_values.data,
             hypers->vtrace ? graph.mb_imp.data : NULL,
             graph.mb_advantages.data, graph.mb_gae_v.data,
             hypers->gamma, hypers->gae_lambda,
@@ -1896,6 +2003,9 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     Hypers* hypers = &pufferl->hypers;
     RolloutBuf src = src_arg ? *src_arg : pufferl->rollouts;
     cudaStream_t train_stream = pufferl->train_stream;
+#ifdef USE_ROCM
+    double train_start = wall_clock();
+#endif
 
 
     int batch_size = hypers->total_agents * hypers->horizon;
@@ -1967,12 +2077,21 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     cudaStreamSynchronize(train_stream);
 
     if (total_minibatches > 0 && !first) {
+#ifdef USE_ROCM
+        // ROCm does not update elapsed events recorded inside a replayed
+        // training graph reliably. The stream sync above makes this wall
+        // duration include the complete learner step, so report it as model
+        // time instead of displaying a false zero.
+        pufferl->profile.accum[PROF_TRAIN_MODEL] +=
+            (wall_clock() - train_start) * 1000.0f;
+#else
         float ms;
         cudaEvent_t* ev = pufferl->profile.events[slot];
         cudaEventElapsedTime(&ms, ev[TE_S], ev[TE_E]);
         pufferl->profile.accum[PROF_TRAIN_MISC] += ms;
         cudaEventElapsedTime(&ms, ev[TE_MS], ev[TE_FE]);
         pufferl->profile.accum[PROF_TRAIN_MODEL] += ms;
+#endif
     }
     pufferl->epoch += 1;
 }
@@ -2170,6 +2289,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaSetDevice(hypers.gpu_id);
     cublas_init_handle();
 #ifdef USE_ROCM
+    assert(rsmi_init(0) == RSMI_STATUS_SUCCESS);
     rocblas_init_handle();
 #endif
 
@@ -2370,11 +2490,14 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         pol->buf_acts = (Activations*)calloc(
             1, num_buffers * sizeof(Activations));
         pol->buffer_states = (Prec*)calloc(1, num_buffers * sizeof(Prec));
+        pol->bootstrap_states = (Prec*)calloc(1, num_buffers * sizeof(Prec));
         for (int i = 0; i < num_buffers; i++) {
             pol->buf_acts[i] = arch_reg_rollout(
                 &pol->arch, pol->weights, aalloc, slice);
             pol->buffer_states[i] = {.shape = {L, slice, h}};
             alloc_register(aalloc, &pol->buffer_states[i]);
+            pol->bootstrap_states[i] = {.shape = {L, slice, h}};
+            alloc_register(aalloc, &pol->bootstrap_states[i]);
         }
     }
 
@@ -2394,6 +2517,12 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     register_rollout_buffers(&pufferl->rollouts,
         acts, rollout_horizon, total_agents, input_size, num_action_heads,
         vec->mask_size);
+    pufferl->bootstrap_observations = {
+        .shape = {1, total_agents, input_size}};
+    alloc_register(acts, &pufferl->bootstrap_observations);
+    pufferl->bootstrap_values = {
+        .shape = {async_slots, total_agents}};
+    alloc_register(acts, &pufferl->bootstrap_values);
     // Carry path: per-slot initial RNN states. reset_every_horizon zeros train_state.
     if (!hypers.reset_every_horizon) {
         int slots = hypers.async ? 2 : 1;
@@ -2534,6 +2663,8 @@ void close_pufferl(PuffeRL* p) {
     }
 #ifndef USE_ROCM
     nvmlShutdown();
+#else
+    assert(rsmi_shut_down() == RSMI_STATUS_SUCCESS);
 #endif
     env_close(p->vec);
     cudaDeviceSynchronize();
@@ -2812,10 +2943,10 @@ void log_util(PuffeRL* p, Dict* out) {
     nvmlDeviceGetUtilizationRates(p->nvml_device, &util);
     dict_set(out, "util/gpu_percent", (double)util.gpu);
 #else
-    (void)p;
-    // ROCm SMI is deliberately optional: it is not consistently available
-    // alongside ROCm-enabled PyTorch installs.
-    dict_set(out, "util/gpu_percent", 0.0);
+    uint32_t busy_percent = 0;
+    assert(rsmi_dev_busy_percent_get((uint32_t)p->hypers.gpu_id,
+        &busy_percent) == RSMI_STATUS_SUCCESS);
+    dict_set(out, "util/gpu_percent", (double)busy_percent);
 #endif
 
     size_t cuda_free;
@@ -3094,8 +3225,9 @@ void run_sweep(Ini* ini, const char* exe_path) {
     int downsample = puf_ini_get(ini, "sweep", "downsample");
     int prune_pareto = puf_ini_get(ini, "sweep", "prune_pareto");
     const char* metric_dist = puf_ini_get_str(ini, "sweep", "metric_distribution");
-    assert((strcmp(metric_dist, "linear") == 0 || strcmp(metric_dist, "logit") == 0)
-        && "sweep.metric_distribution must be linear or logit");
+    assert((strcmp(metric_dist, "linear") == 0 || strcmp(metric_dist, "logit") == 0
+            || strcmp(metric_dist, "quantile") == 0)
+        && "sweep.metric_distribution must be linear, logit, or quantile");
     int use_logit = strcmp(metric_dist, "logit") == 0;
     float max_cost = puf_ini_get(ini, "sweep", "max_suggestion_cost");
     float early_stop_quantile = puf_ini_get(ini, "sweep", "early_stop_quantile");
@@ -3126,9 +3258,10 @@ void run_sweep(Ini* ini, const char* exe_path) {
         .optimizer_reset_frequency = 50,
         .gp_max_obs = 750,
         .infer_batch_size = 4096,
-        .use_success_prob = downsample == 1,
+        .use_success_prob = 1,
         .prune_pareto = prune_pareto,
         .use_logit = use_logit,
+        .use_quantile = strcmp(metric_dist, "quantile") == 0,
         .global_search_scale = 1.0f,
         .max_suggestion_cost = max_cost,
         .expansion_rate = 0.1f,
@@ -3205,7 +3338,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
                     " minibatch=%d timesteps=%ld gpus=%d\n",
                     job.run, agents, buffers, horizon, minibatch, timesteps, gpus);
                 protein_sweep_observe(
-                    protein, job.sample, NAN, max_cost, 1);
+                    protein, job.sample, NAN, max_cost, 1, 1);
                 assert(++failed_workers <= 1000
                     && "too many invalid sweep configurations");
                 continue;
@@ -3299,7 +3432,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
                 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             fprintf(stderr, "sweep worker run=%d failed; marking sample bad\n",
                 job->run);
-            protein_sweep_observe(protein, job->sample, NAN, max_cost, 1);
+            protein_sweep_observe(protein, job->sample, NAN, max_cost, 1, 1);
             assert(++failed_workers <= 1000 && "too many failed sweep workers");
             continue;
         }
@@ -3310,39 +3443,92 @@ void run_sweep(Ini* ini, const char* exe_path) {
             if (space->cost_idx >= 0) {
                 Space* budget = &space->spaces[space->cost_idx];
                 float steps = job->result.step_points[pi];
-                if (steps < budget->min || steps > budget->max) {
-                    if (pi + 1 < job->result.points) {
-                        continue;
-                    }
-                    // Completed runs stop on batch boundaries and can land just
-                    // outside the requested boundary. Retain the terminal result.
-                    steps = fmaxf(budget->min, fminf(budget->max, steps));
-                }
                 observed[space->cost_idx] = space_normalize(budget, steps);
             }
             protein_sweep_observe(protein, observed,
-                job->result.scores[pi], job->result.costs[pi], 0);
+                job->result.scores[pi], job->result.costs[pi], 0,
+                pi + 1 == job->result.points);
         }
+        char acquisition_path[4096];
+        snprintf(acquisition_path, sizeof(acquisition_path), "%s/%s/%s.ini",
+            puf_ini_get_str(ini, "base", "log_dir"),
+            puf_ini_get_str(ini, "base", "env_name"), job->run_id);
+        FILE* acquisition = fopen(acquisition_path, "a");
+        assert(acquisition && "failed to append sweep acquisition log");
+        fprintf(acquisition, "\n[acquisition]\n");
+        fprintf(acquisition, "is_random = %d\n", job->info.is_random);
+        fprintf(acquisition, "actual_score = %.9g\n", job->result.score);
+        fprintf(acquisition, "actual_cost = %.9g\n", job->result.cost);
+        fprintf(acquisition, "steps = %.9g\n", job->result.steps);
         if (job->info.n_candidates > 0) {
-            printf("sweep run=%d score=%.4f pred_score=%.4f pred_std=%.4f "
-                   "score_err=%+.4f cost=%.2f pred_cost=%.2f "
-                   "cost_ratio=%.3f steps=%.0f\n",
+            float score_error = job->result.score - job->info.predicted_score;
+            float predicted_z = score_error / fmaxf(job->info.predicted_std, 1e-6f);
+            float cost_ratio = job->result.cost / job->info.predicted_cost;
+            fprintf(acquisition, "predicted_score = %.9g\n", job->info.predicted_score);
+            fprintf(acquisition, "predicted_std = %.9g\n", job->info.predicted_std);
+            fprintf(acquisition, "latent_std = %.9g\n", job->info.latent_std);
+            fprintf(acquisition, "score_error = %.9g\n", score_error);
+            fprintf(acquisition, "predicted_z = %.9g\n", predicted_z);
+            fprintf(acquisition, "best_score = %.9g\n", job->info.best_score);
+            fprintf(acquisition, "expected_improvement = %.9g\n",
+                job->info.expected_improvement);
+            fprintf(acquisition, "rating = %.9g\n", job->info.rating);
+            fprintf(acquisition, "target_cost = %.9g\n", job->info.target_cost);
+            fprintf(acquisition, "cost_weight = %.9g\n", job->info.cost_weight);
+            fprintf(acquisition, "limit_probability = %.9g\n",
+                job->info.limit_probability);
+            fprintf(acquisition, "valid_probability = %.9g\n",
+                job->info.valid_probability);
+            fprintf(acquisition, "predicted_cost = %.9g\n", job->info.predicted_cost);
+            fprintf(acquisition, "predicted_cost_std = %.9g\n",
+                job->info.predicted_cost_std);
+            fprintf(acquisition, "predicted_cost_upper = %.9g\n",
+                job->info.predicted_cost_upper);
+            fprintf(acquisition, "cost_ratio = %.9g\n", cost_ratio);
+            fprintf(acquisition, "nearest_distance = %.9g\n",
+                job->info.nearest_distance);
+            fprintf(acquisition, "boundary_count = %d\n", job->info.boundary_count);
+            fprintf(acquisition, "score_loss = %.9g\n", job->info.score_loss);
+            fprintf(acquisition, "cost_loss = %.9g\n", job->info.cost_loss);
+            fprintf(acquisition, "pareto_size = %d\n", job->info.n_pareto);
+            fprintf(acquisition, "gp_observations = %d\n", job->info.n_gp_obs);
+            fprintf(acquisition, "candidates = %d\n", job->info.n_candidates);
+
+            printf("sweep run=%d score=%.4f predicted=%.4f std=%.4f "
+                   "error=%+.4f z=%+.2f steps=%.0f\n",
                 job->run, job->result.score, job->info.predicted_score,
-                job->info.predicted_std,
-                job->result.score - job->info.predicted_score,
+                job->info.predicted_std, score_error, predicted_z,
+                job->result.steps);
+            printf("  acq rating=%.6g ei=%.6g best=%.4f latent_std=%.4f "
+                   "target_cost=%.2f\n",
+                job->info.rating, job->info.expected_improvement,
+                job->info.best_score, job->info.latent_std, job->info.target_cost);
+            printf("  weights cost=%.3f limit=%.3f valid=%.3f nearest=%.3f "
+                   "boundaries=%d\n",
+                job->info.cost_weight, job->info.limit_probability,
+                job->info.valid_probability, job->info.nearest_distance,
+                job->info.boundary_count);
+            printf("  cost actual=%.2f predicted=%.2f std=%.2f upper95=%.2f "
+                   "ratio=%.3f\n",
                 job->result.cost, job->info.predicted_cost,
-                job->result.cost / job->info.predicted_cost, job->result.steps);
+                job->info.predicted_cost_std, job->info.predicted_cost_upper,
+                cost_ratio);
+            printf("  model score_loss=%.4f cost_loss=%.4f observations=%d "
+                   "pareto=%d candidates=%d\n",
+                job->info.score_loss, job->info.cost_loss, job->info.n_gp_obs,
+                job->info.n_pareto, job->info.n_candidates);
         } else {
             printf("sweep run=%d score=%.4f cost=%.2f steps=%.0f\n",
                 job->run, job->result.score, job->result.cost, job->result.steps);
         }
+        fclose(acquisition);
         completed++;
     }
 }
 
 // board!=NULL: merge env/* into train last_log (uptime + util/* stay frozen).
 static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
-        long eval_episodes, Dict* board, int epoch) {
+        long eval_episodes, const char* metric_key, Dict* board, int epoch) {
     int render = mode == EVAL_RENDER;
     int match = mode == EVAL_MATCH;
     EvalResult result = {0};
@@ -3386,8 +3572,10 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
         if (verbose) {
             puf_dashboard_print(ini, p, show, board ? epoch : 0);
         }
-        result.score = match ? dict_get(&el, "env/policy_0_score")
-            : dict_get(&el, "env/score");
+        const char* result_key = match ? "env/policy_0_score" : metric_key;
+        DictItem* metric = dict_find(&el, result_key);
+        assert(metric && "evaluation did not emit the requested metric");
+        result.score = (float)metric->value;
         if (match) {
             result.draw = dict_get(&el, "env/draw_rate");
         }
@@ -3448,7 +3636,7 @@ EvalResult run_eval(Ini* ini, TrainContext* ctx, int mode, int verbose) {
     long n = puf_ini_get(ini, "base", "eval_episodes");
     assert((mode == EVAL_RENDER || n > 0) && "eval requires positive base.eval_episodes");
     PuffeRL* p = eval_make(ini, ctx, mode);
-    EvalResult r = eval_loop(ini, p, mode, verbose, n, NULL, 0);
+    EvalResult r = eval_loop(ini, p, mode, verbose, n, "env/score", NULL, 0);
     close_pufferl(p);
     return r;
 }
@@ -3704,7 +3892,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     long eval_episodes = puf_ini_get(ini, "base", "eval_episodes");
     if (ctx->artifact_owner && !pool_eval && eval_episodes > 0) {
         EvalResult r = eval_loop(ini, pufferl, EVAL_SCORE, 1, eval_episodes,
-            &last_log, (int)pufferl->epoch);
+            target_key, &last_log, (int)pufferl->epoch);
         result.score = result.scores[result.points - 1] = r.score;
     }
     close_pufferl(pufferl);
@@ -3719,7 +3907,8 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             }
             puf_ini_put(ini, "base.load_enemy_model_path", selfplay.pool[i]);
             PuffeRL* ep = eval_make(ini, ctx, EVAL_MATCH);
-            EvalResult r = eval_loop(ini, ep, EVAL_MATCH, 0, pool_games, NULL, 0);
+            EvalResult r = eval_loop(ini, ep, EVAL_MATCH, 0, pool_games,
+                "env/policy_0_score", NULL, 0);
             close_pufferl(ep);
             sum += r.score;
             n_opp++;

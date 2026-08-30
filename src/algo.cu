@@ -23,7 +23,7 @@ typedef Prec (*decoder_backward_fn)(void* weights, void* activations,
 typedef Prec (*network_forward_fn)(void* weights, Prec x,
     Prec state, void* activations, cudaStream_t stream);
 typedef Prec (*network_forward_train_fn)(void* weights, Prec x,
-    Prec state, Prec terminals, void* activations, int agent_off,
+    Prec state, Prec rnn_resets, void* activations, int agent_off,
     cudaStream_t stream);
 typedef Prec (*network_backward_fn)(void* weights,
     Prec grad, void* activations, cudaStream_t stream);
@@ -305,7 +305,7 @@ struct PrefixScan {
     precision_t* combined_ptr = NULL;
     precision_t* state_ptr = NULL;
     precision_t* input_ptr = NULL;  // (B, T, H) pre-projection input (highway)
-    precision_t* terminals_ptr = NULL;  // (B, T), reset before step t if terminal[t]
+    precision_t* rnn_resets_ptr = NULL;  // (B, T), reset before observation[t]
     int B = 0, T = 0, H = 0;
     Prec scan_h;  // (B, T, H), recurrent input to each step
     Prec out, next_state;
@@ -322,7 +322,7 @@ __global__ void mingru_scan_forward_seq(PrefixScan scan) {
     const precision_t* __restrict__ combined = scan.combined_ptr;
     const precision_t* __restrict__ state = scan.state_ptr;
     const precision_t* __restrict__ input = scan.input_ptr;
-    const precision_t* __restrict__ terminals = scan.terminals_ptr;
+    const precision_t* __restrict__ rnn_resets = scan.rnn_resets_ptr;
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * H) {
@@ -351,8 +351,8 @@ __global__ void mingru_scan_forward_seq(PrefixScan scan) {
     int t_offset = 0;
 
     for (int t = 0; t < T_seq; t++) {
-        // terminal[t] and observation[t] are emitted together after the prior step.
-        if (terminals != NULL && to_float(terminals[b * T_seq + t]) != 0.0f) {
+        // rnn_resets[t] marks that observation[t] starts a new episode.
+        if (rnn_resets != NULL && to_float(rnn_resets[b * T_seq + t]) != 0.0f) {
             h_t = 0.0f;
         }
         scan_h[h_base + t * H] = from_float(h_t);
@@ -388,7 +388,7 @@ __global__ void mingru_scan_backward(PrefixScan scan,
     precision_t* __restrict__ grad_input = scan.grad_input.data;
     const precision_t* __restrict__ combined = scan.combined_ptr;
     const precision_t* __restrict__ input = scan.input_ptr;
-    const precision_t* __restrict__ terminals = scan.terminals_ptr;
+    const precision_t* __restrict__ rnn_resets = scan.rnn_resets_ptr;
     const precision_t* __restrict__ scan_h = scan.scan_h.data;
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -462,8 +462,8 @@ __global__ void mingru_scan_backward(PrefixScan scan,
         // terminal before this step zeroed h_prev contribution into this step;
         // after bwd through the step, cut gradient flow into pre-reset state.
         dh = d_h_prev;
-        if (terminals != NULL &&
-                to_float(terminals[b * T_seq + t0]) != 0.0f) {
+        if (rnn_resets != NULL &&
+                to_float(rnn_resets[b * T_seq + t0]) != 0.0f) {
             dh = 0.0f;
         }
     }
@@ -795,7 +795,7 @@ Prec mingru_forward(void* w, Prec x, Prec state,
     return x;
 }
 
-Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
+Prec mingru_forward_train(void* w, Prec x, Prec state, Prec rnn_resets,
         void* activations, int agent_off, cudaStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
@@ -808,7 +808,7 @@ Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
         scan.combined_ptr = a->combined_bufs[i].data;
         scan.state_ptr = state_i.data;
         scan.input_ptr = a->saved_inputs[i].data;
-        scan.terminals_ptr = terminals.data;
+        scan.rnn_resets_ptr = rnn_resets.data;
         mingru_scan_forward_seq<<<grid_size(scan.B * scan.H), BLOCK_SIZE, 0, stream>>>(scan);
         x = scan.out;
     }
@@ -1322,8 +1322,10 @@ struct TrainGraph {
     PolicyObs mb_obs;    // view (B, T, packed bytes or precision values)
     Prec mb_actions;     // view (B, T, num_atns)
     Prec mb_logprobs;    // view (B, T)
-    Prec mb_terminals;   // view (B, T)
+    Prec mb_rnn_resets;  // view (B, T), reset before observation[t]
+    Prec mb_transition_dones; // view (B, T), done after action[t]
     Prec mb_rewards;     // view (B, T)
+    Prec mb_bootstrap_values; // view (B), V(s_H)
     Prec mb_advantages;  // scratch
     Prec mb_values;      // view: frozen rollout V (vf-clip)
     Prec mb_returns;     // view: aliases mb_gae_v after GAE (V+A)
@@ -1534,8 +1536,8 @@ __device__ __forceinline__ uint64_t mask_u64(
 }
 
 __device__ __forceinline__ bool has_primary(int type) {
-    return type >= ACTION_BUY_CARD &&
-        type <= ACTION_SWAP_HAND_RIGHT;
+    return (type >= ACTION_BUY_CARD && type <= ACTION_SWAP_HAND_RIGHT) ||
+        type == ACTION_BUY_AND_USE;
 }
 
 // Actions are stored in precision_t buffers. A bad/stale action must not be
@@ -2039,14 +2041,14 @@ __global__ void cache_imp_and_v(
 
 Prec arch_forward_train(Arch* p, Weights& w,
         Activations& activations, PolicyObs x,
-        Prec state, Prec terminals, int agent_off,
+        Prec state, Prec rnn_resets, int agent_off,
         TrainGraph& g, Prec logstd, Prec condition, int* act_sizes,
         float* logps, float* new_lp, cudaStream_t stream) {
     int B = x.shape[0], TT = x.shape[1];
     Prec h = p->encoder.forward(w.encoder,
         activations.encoder, *puf_squeeze(&x, 0), stream);
     h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT),
-        state, terminals, activations.network, agent_off, stream);
+        state, rnn_resets, activations.network, agent_off, stream);
     Prec dec_out = p->decoder.forward(
         w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
     Prec dec = *puf_unsqueeze(&dec_out, 0, B, TT);
@@ -2359,6 +2361,7 @@ __device__ __forceinline__ void adv_st(precision_t* p, const float* o) {
 
 __global__ void puff_advantage(const precision_t* values,
         const precision_t* rewards, const precision_t* dones,
+        const precision_t* bootstrap_values,
         const precision_t* importance, precision_t* advantages,
         precision_t* returns,
         float gamma, float lambda, float rho_clip, float c_clip,
@@ -2367,9 +2370,7 @@ __global__ void puff_advantage(const precision_t* values,
     if (row >= num_steps) return;
     int off = row * horizon;
     float lastlam = 0.f;
-    float next_v = to_float(values[off + horizon - 1]);
-    float next_d = to_float(dones[off + horizon - 1]);
-    float next_r = to_float(rewards[off + horizon - 1]);
+    float next_v = to_float(bootstrap_values[row]);
 
     for (int seg = horizon / ADV_VEC_WIDTH - 1; seg >= 0; seg--) {
         int base = off + seg * ADV_VEC_WIDTH;
@@ -2387,18 +2388,14 @@ __global__ void puff_advantage(const precision_t* values,
                 imp[i] = 1.f;
             }
         }
-        // Last index H-1 left 0. First seg starts at width-2.
-        int i0 = (seg + 1 == horizon / ADV_VEC_WIDTH) ? ADV_VEC_WIDTH - 2 : ADV_VEC_WIDTH - 1;
-        // This is the simple puffer_advantage function. All the
-        // vec load/stores are minor perf optimizations
         #pragma unroll
-        for (int i = i0; i >= 0; i--) {
-            float nnt = 1.f - next_d;
+        for (int i = ADV_VEC_WIDTH - 1; i >= 0; i--) {
+            float nnt = 1.f - d[i];
             float rho_t = fminf(imp[i], rho_clip), c_t = fminf(imp[i], c_clip);
-            float delta = rho_t * (next_r + gamma * next_v * nnt - v[i]);
+            float delta = rho_t * (r[i] + gamma * next_v * nnt - v[i]);
             lastlam = delta + gamma * lambda * c_t * lastlam * nnt;
             adv[i] = lastlam;
-            next_v = v[i]; next_d = d[i]; next_r = r[i];
+            next_v = v[i];
         }
         #pragma unroll
         for (int i = 0; i < ADV_VEC_WIDTH; i++) {

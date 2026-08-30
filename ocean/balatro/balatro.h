@@ -295,8 +295,9 @@ void puf_step(Env *env) {
         !legal->primary[policy.type]) {
         action_is_legal = 0;
     } else {
-        int has_primary = policy.type >= ACTION_BUY_CARD &&
-                          policy.type <= ACTION_SWAP_HAND_RIGHT;
+        int has_primary = (policy.type >= ACTION_BUY_CARD &&
+                           policy.type <= ACTION_SWAP_HAND_RIGHT) ||
+                          policy.type == ACTION_BUY_AND_USE;
         if (!has_primary) {
             policy.primary = 0;
         } else {

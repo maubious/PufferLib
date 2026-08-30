@@ -104,6 +104,26 @@ typedef enum Seal {
     SEAL_PURPLE = 4
 } Seal;
 
+typedef enum TargetEffect {
+    TARGET_CUSTOM,
+    TARGET_ENHANCEMENT,
+    TARGET_SUIT,
+    TARGET_RANK_UP,
+    TARGET_SEAL,
+} TargetEffect;
+
+typedef enum CardSet {
+    SET_DEFAULT = 1,
+    SET_PLAYING = 1,
+    SET_ENHANCED = 2,
+    SET_JOKER = 3,
+    SET_TAROT = 4,
+    SET_PLANET = 5,
+    SET_SPECTRAL = 6,
+    SET_VOUCHER = 7,
+    SET_BOOSTER = 8,
+} CardSet;
+
 typedef enum CardFlag {
     CARD_DEBUFFED = 1u << 0,
     CARD_ETERNAL = 1u << 1,
