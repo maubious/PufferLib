@@ -10,7 +10,7 @@ static uint64_t mask_u64(const unsigned char *mask, int offset) {
     return value;
 }
 
-static const ObservedSelection *selection_for(
+static const SelectionContract *selection_for(
         const LegalMasks *masks, uint8_t type, uint8_t primary) {
     if (type == ACTION_PLAY_HAND) return &masks->play;
     if (type == ACTION_DISCARD) return &masks->discard;
@@ -29,7 +29,7 @@ static Action first_action(const LegalMasks *masks) {
         if (!primaries) continue;
         uint8_t primary = (uint8_t)__builtin_ctzll(primaries);
         Action action = {.type = type, .primary = primary};
-        const ObservedSelection *selection = selection_for(masks, type, primary);
+        const SelectionContract *selection = selection_for(masks, type, primary);
         if (!selection || !selection->valid) return action;
 
         uint64_t chosen = selection->required_hand;
@@ -145,7 +145,7 @@ int main(void) {
         for (uint8_t type = 0; type < ACTION_TYPE_COUNT; ++type)
             for (uint8_t primary = 0; primary < 64; ++primary) {
                 if (!(masks.primary[type] & (UINT64_C(1) << primary))) continue;
-                const ObservedSelection *selection = selection_for(&masks, type, primary);
+                const SelectionContract *selection = selection_for(&masks, type, primary);
                 if (!selection || !selection->valid) continue;
                 int entry = policy_selection_entry(type, primary);
                 assert(entry >= 0);

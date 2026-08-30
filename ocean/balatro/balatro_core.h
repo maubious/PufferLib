@@ -1,4 +1,6 @@
 #pragma once
+#ifndef BALATRO_CORE_H
+#define BALATRO_CORE_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -10,7 +12,6 @@ extern "C" {
 
 
 #define OBS_MAX_PLAYING_CARDS 256
-#define OBS_MAX_PLAYING_VARIANTS 256
 #define OBS_MAX_HAND 64
 #define OBS_MAX_JOKERS 32
 #define OBS_MAX_CONSUMABLES 32
@@ -20,19 +21,14 @@ extern "C" {
 #define OBS_MAX_SHOP_BOOSTERS 2
 #define OBS_MAX_PACK_CARDS 5
 
-
 #define MAX_DECK OBS_MAX_PLAYING_CARDS
 #define MAX_HAND OBS_MAX_HAND
 #define MAX_JOKERS OBS_MAX_JOKERS
 #define MAX_CONSUMABLES OBS_MAX_CONSUMABLES
-#define MAX_SHOP_CARDS \
-    (OBS_MAX_SHOP_MAIN + OBS_MAX_SHOP_VOUCHERS + OBS_MAX_SHOP_BOOSTERS)
 #define MAX_PACK_CARDS OBS_MAX_PACK_CARDS
 #define MAX_SELECTION 5
 #define MAX_RNG_STREAMS 256
 #define ACTION_TYPE_COUNT 23
-#define MAX_OBSERVED_CARDS \
-    (OBS_MAX_PLAYING_CARDS + OBS_MAX_HAND + OBS_MAX_PLAYING_CARDS)
 
 typedef enum Error {
     OK = 0,
@@ -115,9 +111,6 @@ typedef enum CardFlag {
     CARD_RENTAL = 1u << 3,
     CARD_FORCED = 1u << 4
 } CardFlag;
-
-
-#define EDITION_POLL UINT8_MAX
 
 typedef enum HandType {
     FLUSH_FIVE = 0,
@@ -326,7 +319,6 @@ typedef struct SelectionContract {
     uint8_t valid;
     uint8_t reserved;
 } SelectionContract;
-typedef SelectionContract ObservedSelection;
 
 typedef struct LegalMasks {
     uint64_t primary[ACTION_TYPE_COUNT];
@@ -335,8 +327,6 @@ typedef struct LegalMasks {
     SelectionContract consumable[OBS_MAX_CONSUMABLES];
     SelectionContract shop[OBS_MAX_SHOP_MAIN];
     SelectionContract pack[OBS_MAX_PACK_CARDS];
-    uint64_t hand_reorder_destination[OBS_MAX_HAND];
-    uint64_t joker_reorder_destination[OBS_MAX_JOKERS];
 } LegalMasks;
 
 /* Selection entry for a (type, primary) pair, or NULL when the action
@@ -441,19 +431,19 @@ typedef struct ObservationGlobals {
     int32_t  dollars;
     int32_t  reroll_cost;
     int32_t  round_earnings;
-    int16_t  chips_q8_8;
-    int16_t  blind_chips_q8_8;
-    int16_t  last_hand_score_q8_8;
-    int16_t  chips_over_blind_q8_8;
-    int16_t  interest_cap_q8_8;
-    int16_t  interest_amount_q8_8;
-    int16_t  blind_reward_q8_8;
-    int16_t  joker_rate_q8_8;
-    int16_t  tarot_rate_q8_8;
-    int16_t  planet_rate_q8_8;
-    int16_t  spectral_rate_q8_8;
-    int16_t  playing_card_rate_q8_8;
-    int16_t  edition_rate_q8_8;
+    float    chips_log2;
+    float    blind_chips_log2;
+    float    last_hand_score_log2;
+    float    chips_over_blind_log2;
+    uint16_t interest_cap;
+    uint16_t interest_amount;
+    uint16_t blind_reward;
+    uint8_t  joker_rate;
+    uint8_t  tarot_rate;
+    uint8_t  planet_rate;
+    uint8_t  spectral_rate;
+    uint8_t  playing_card_rate;
+    uint8_t  edition_rate;
     uint64_t redeemed_vouchers_mask;
 } ObservationGlobals;
 
@@ -462,8 +452,8 @@ typedef struct PokerHandStat {
     uint8_t  level;
     uint16_t total_plays;
     uint16_t round_plays;
-    int16_t  chips_q8_8;
-    int16_t  mult_q8_8;
+    float    chips_log2;
+    float    mult_log2;
 } PokerHandStat;
 
 typedef struct Observation {
@@ -500,3 +490,5 @@ uint64_t state_hash(const State *state);
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* BALATRO_CORE_H */
