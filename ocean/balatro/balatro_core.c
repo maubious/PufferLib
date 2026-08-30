@@ -1736,16 +1736,11 @@ void apply_consumable(State *state, const Action *action, Card card) {
         static const uint8_t face_ranks[] = {11, 12, 13};
         static const uint8_t ace_ranks[] = {14};
         static const uint8_t number_ranks[] = {2, 3, 4, 5, 6, 7, 8, 9, 10};
-        const uint8_t *ranks = card.center_id == CENTER_C_FAMILIAR ? face_ranks
-                               : card.center_id == CENTER_C_GRIM   ? ace_ranks
-                                                                           : number_ranks;
-        size_t rank_count = card.center_id == CENTER_C_FAMILIAR ? sizeof(face_ranks)
-                            : card.center_id == CENTER_C_GRIM   ? sizeof(ace_ranks)
-                                                                        : sizeof(number_ranks);
-        uint8_t create_count = card.center_id == CENTER_C_FAMILIAR ? 3 : card.center_id == CENTER_C_GRIM ? 2 : 4;
-        const char *stream = card.center_id == CENTER_C_FAMILIAR ? "familiar_create"
-                             : card.center_id == CENTER_C_GRIM   ? "grim_create"
-                                                                         : "incantation_create";
+        int is_fam = card.center_id == CENTER_C_FAMILIAR, is_grim = card.center_id == CENTER_C_GRIM;
+        const uint8_t *ranks = is_fam ? face_ranks : is_grim ? ace_ranks : number_ranks;
+        size_t rank_count = is_fam ? 3 : is_grim ? 1 : 9;
+        uint8_t create_count = is_fam ? 3 : is_grim ? 2 : 4;
+        const char *stream = is_fam ? "familiar_create" : is_grim ? "grim_create" : "incantation_create";
         add_spectral_cards(state, ranks, rank_count, create_count, stream);
     } else if (card.center_id == CENTER_C_CRYPTID && action->selection_count) {
         Card source = state->hand[action->selection[0]];
@@ -1764,44 +1759,34 @@ void apply_consumable(State *state, const Action *action, Card card) {
         if (state->phase == PHASE_SELECTING_HAND) sort_hand(state, state->hand_sort_suit != 0);
     } else if (card.center_id == CENTER_C_AURA && action->selection_count) {
         state->hand[action->selection[0]].edition = roll_aura_edition(pseudorandom(state, "aura"));
-    } else if (card.center_id == CENTER_C_ECTOPLASM) {
+    } else if (card.center_id == CENTER_C_ECTOPLASM || card.center_id == CENTER_C_HEX ||
+               card.center_id == CENTER_C_WHEEL_OF_FORTUNE) {
         uint8_t eligible[MAX_JOKERS];
         uint8_t count = sorted_editionless_jokers(state, eligible);
         if (count) {
-            size_t pick = (size_t)floor(pseudorandom(state, "ectoplasm") * count);
-            state->jokers[eligible[pick]].edition = EDITION_NEGATIVE;
-            price_card(state, &state->jokers[eligible[pick]]);
-            if (state->joker_slots < UINT8_MAX) state->joker_slots++;
-            uint8_t penalty = state->ecto_penalty ? state->ecto_penalty : 1;
-            if (state->hand_size > penalty)
-                state->hand_size -= penalty;
-            else
-                state->hand_size = 1;
-            if (state->base_hand_size > penalty)
-                state->base_hand_size -= penalty;
-            else
-                state->base_hand_size = 1;
-            state->ecto_penalty = penalty < UINT8_MAX ? (uint8_t)(penalty + 1) : UINT8_MAX;
-        }
-    } else if (card.center_id == CENTER_C_HEX) {
-        uint8_t eligible[MAX_JOKERS];
-        uint8_t count = sorted_editionless_jokers(state, eligible);
-        if (count) {
-            size_t pick = (size_t)floor(pseudorandom(state, "hex") * count);
-            uint8_t target = eligible[pick];
-            state->jokers[target].edition = EDITION_POLYCHROME;
-            price_card(state, &state->jokers[target]);
-            for (uint8_t i = state->joker_count; i-- > 0;) {
-                if (i != target && !(state->jokers[i].flags & CARD_ETERNAL)) remove_joker_at(state, i);
+            if (card.center_id == CENTER_C_WHEEL_OF_FORTUNE) {
+                if (pseudorandom(state, "wheel_of_fortune") < adjust_probability(state, 0.25)) {
+                    size_t pick = (size_t)floor(pseudorandom(state, "wheel_of_fortune") * count);
+                    state->jokers[eligible[pick]].edition = roll_aura_edition(pseudorandom(state, "wheel_of_fortune"));
+                    price_card(state, &state->jokers[eligible[pick]]);
+                }
+            } else if (card.center_id == CENTER_C_ECTOPLASM) {
+                size_t pick = (size_t)floor(pseudorandom(state, "ectoplasm") * count);
+                state->jokers[eligible[pick]].edition = EDITION_NEGATIVE;
+                price_card(state, &state->jokers[eligible[pick]]);
+                if (state->joker_slots < UINT8_MAX) state->joker_slots++;
+                uint8_t penalty = state->ecto_penalty ? state->ecto_penalty : 1;
+                state->hand_size = state->hand_size > penalty ? state->hand_size - penalty : 1;
+                state->base_hand_size = state->base_hand_size > penalty ? state->base_hand_size - penalty : 1;
+                state->ecto_penalty = penalty < UINT8_MAX ? (uint8_t)(penalty + 1) : UINT8_MAX;
+            } else {
+                size_t pick = (size_t)floor(pseudorandom(state, "hex") * count);
+                uint8_t target = eligible[pick];
+                state->jokers[target].edition = EDITION_POLYCHROME;
+                price_card(state, &state->jokers[target]);
+                for (uint8_t i = state->joker_count; i-- > 0;)
+                    if (i != target && !(state->jokers[i].flags & CARD_ETERNAL)) remove_joker_at(state, i);
             }
-        }
-    } else if (card.center_id == CENTER_C_WHEEL_OF_FORTUNE) {
-        uint8_t eligible[MAX_JOKERS];
-        uint8_t count = sorted_editionless_jokers(state, eligible);
-        if (count && pseudorandom(state, "wheel_of_fortune") < adjust_probability(state, 0.25)) {
-            size_t pick = (size_t)floor(pseudorandom(state, "wheel_of_fortune") * count);
-            state->jokers[eligible[pick]].edition = roll_aura_edition(pseudorandom(state, "wheel_of_fortune"));
-            price_card(state, &state->jokers[eligible[pick]]);
         }
     } else if (card.center_id == CENTER_C_FOOL) {
         if (state->last_tarot_planet && state->last_tarot_planet != CENTER_C_FOOL) {
@@ -1810,19 +1795,14 @@ void apply_consumable(State *state, const Action *action, Card card) {
             (void)add_specific_consumable(state, state->last_tarot_planet);
             state->consumable_slots = saved_slots;
         }
-    } else if (card.center_id == CENTER_C_EMPEROR) {
+    } else if (card.center_id == CENTER_C_EMPEROR || card.center_id == CENTER_C_HIGH_PRIESTESS) {
+        uint8_t set_type = card.center_id == CENTER_C_EMPEROR ? SET_TAROT : SET_PLANET;
+        const char *append = card.center_id == CENTER_C_EMPEROR ? "emp" : "pri";
         uint8_t saved_slots = state->consumable_slots;
         if (action->type == ACTION_USE_CONSUMABLE && state->consumable_slots < UINT8_MAX) state->consumable_slots++;
-        uint8_t room = state->consumable_slots - state->consumable_count;
-        if (room) (void)add_pooled_consumable(state, SET_TAROT, "emp", 0);
-        if (room > 1) (void)add_pooled_consumable(state, SET_TAROT, "emp", 0);
-        state->consumable_slots = saved_slots;
-    } else if (card.center_id == CENTER_C_HIGH_PRIESTESS) {
-        uint8_t saved_slots = state->consumable_slots;
-        if (action->type == ACTION_USE_CONSUMABLE && state->consumable_slots < UINT8_MAX) state->consumable_slots++;
-        uint8_t room = state->consumable_slots - state->consumable_count;
-        if (room) (void)add_pooled_consumable(state, SET_PLANET, "pri", 0);
-        if (room > 1) (void)add_pooled_consumable(state, SET_PLANET, "pri", 0);
+        uint8_t room = state->consumable_slots > state->consumable_count ? state->consumable_slots - state->consumable_count : 0;
+        if (room) (void)add_pooled_consumable(state, set_type, append, 0);
+        if (room > 1) (void)add_pooled_consumable(state, set_type, append, 0);
         state->consumable_slots = saved_slots;
     } else if (card.center_id == CENTER_C_JUDGEMENT) {
         if (state->joker_count < state->joker_slots && state->joker_count < MAX_JOKERS) {
@@ -1858,11 +1838,11 @@ void apply_consumable(State *state, const Action *action, Card card) {
         for (uint8_t i = action->selection_count; i-- > 0;) {
             if (action->selection[i] < state->hand_count) remove_hand_index(state, action->selection[i]);
         }
-    } else if (card.center_id == CENTER_C_WRAITH) {
-        (void)add_joker_rarity(state, 3, "wra", 0);
-        state->dollars = 0;
-    } else if (card.center_id == CENTER_C_SOUL) {
-        (void)add_joker_rarity(state, 4, "sou", 1);
+    } else if (card.center_id == CENTER_C_WRAITH || card.center_id == CENTER_C_SOUL) {
+        int rarity = card.center_id == CENTER_C_WRAITH ? 3 : 4;
+        const char *stream = card.center_id == CENTER_C_WRAITH ? "wra" : "sou";
+        (void)add_joker_rarity(state, (uint8_t)rarity, stream, rarity == 4);
+        if (card.center_id == CENTER_C_WRAITH) state->dollars = 0;
     } else if (card.center_id == CENTER_C_ANKH && state->joker_count) {
         uint8_t order[MAX_JOKERS];
         for (uint8_t i = 0; i < state->joker_count; ++i) order[i] = i;
