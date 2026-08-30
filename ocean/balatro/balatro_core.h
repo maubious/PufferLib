@@ -372,7 +372,10 @@ typedef struct CardToken {
     uint8_t  edition;     // EDITION_* (0..4)
     uint8_t  seal;        // SEAL_* (0..4)
     uint8_t  flags;       // Debuffed, Eternal, Perishable, Rental, Forced
-    int8_t   dynamic_val; // Sell cost / accrued chips / remaining charges / perishable rounds
+    int8_t   sell_cost;   // Exact sell value
+    int16_t  perma_bonus; // Permanent bonus chips on playing card (Hiker, Stone)
+    int32_t  state0;      // Primary dynamic state (chips, mult, countdown, rank)
+    int32_t  state1;      // Secondary dynamic state (chips, suit, active flag)
 } CardToken;
 
 typedef struct DeckSlot {

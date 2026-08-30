@@ -12,7 +12,7 @@
 #include "joker_signatures.h"
 #include "consumable_signatures.h"
 
-static constexpr int BA_RAW_DIM = 24;
+static constexpr int BA_RAW_DIM = 28;
 static constexpr int BA_KEY_DIM = 32;
 static constexpr int BA_ZONES = 7;
 
@@ -29,13 +29,15 @@ static constexpr int BA_OFF_POKER = BA_OFF_COUNTS + BA_COUNT_FEATURES;
 static constexpr int BA_POKER_FEATURES = HAND_COUNT * 6;  // 12 * 6 = 72
 static constexpr int BA_OFF_TAGS = BA_OFF_POKER + BA_POKER_FEATURES;
 static constexpr int BA_TAG_FEATURES = 13;                // 1 double tag + 2 * 6 tag features
-static constexpr int BA_FIXED = BA_OFF_TAGS + BA_TAG_FEATURES; // 520
+static constexpr int BA_OFF_BLIND_SIG = BA_OFF_TAGS + BA_TAG_FEATURES;
+static constexpr int BA_BLIND_SIG_FEATURES = 32;          // 16 for current blind + 16 for upcoming boss
+static constexpr int BA_FIXED = BA_OFF_BLIND_SIG + BA_BLIND_SIG_FEATURES; // 552
 
 // Permutation-invariant set pooling (Mean + Max across 7 zones)
 static constexpr int BA_POOL_SECTIONS = 7;                // hand, jokers, consumables, shop, vouchers, boosters, pack
 static constexpr int BA_POOLED_FEATURES = BA_POOL_SECTIONS * BA_KEY_DIM * 2;
-static constexpr int BA_OFF_POOLED = BA_FIXED;            // 520
-static constexpr int BA_TOTAL = BA_OFF_POOLED + BA_POOLED_FEATURES;
+static constexpr int BA_OFF_POOLED = BA_FIXED;            // 552
+static constexpr int BA_TOTAL = BA_OFF_POOLED + BA_POOLED_FEATURES; // 1000
 static constexpr int BA_RANK_EMBED_ROWS = 15;
 static constexpr int BA_SUIT_EMBED_ROWS = 4;
 static constexpr int BA_ZONE_EMBED_ROWS = BA_ZONES;
@@ -54,10 +56,84 @@ static constexpr int BA_FUSED_ROWS = BA_LINEAR_PAD + BA_QUERY_DIM;
 static constexpr float BA_QUERY_SCALE = 0.1767766952966369f;
 static_assert(BA_LINEAR_ROWS <= BA_LINEAR_PAD, "linear decoder rows exceed padding");
 
-static_assert(sizeof(Observation) == 1775,
+static_assert(sizeof(Observation) == 3055,
     "Balatro encoder must be updated for the Observation layout");
-static_assert(BA_FIXED == 520 && BA_TOTAL == 968,
+static_assert(BA_FIXED == 552 && BA_TOTAL == 1000,
     "Balatro encoder feature layout mismatch");
+
+struct BlindSignature {
+    uint8_t debuff_suit;            // 0=Spades, 1=Hearts, 2=Clubs, 3=Diamonds, 255=None
+    uint8_t debuff_face;            // The Plant (1)
+    uint8_t debuff_played;          // The Pillar (1)
+    uint8_t debuff_all_jokers;      // Final Leaf / Amber Acorn (1)
+    uint8_t min_play_size;          // The Psychic (5), 1 otherwise
+    uint8_t max_hands;              // The Needle (1), 0=unlimited
+    uint8_t max_discards;           // The Water (0), 255=unlimited
+    uint8_t single_hand_type;       // The Mouth (1)
+    uint8_t no_repeat_hands;        // The Eye (1)
+    uint8_t base_score_halved;      // The Flint (1)
+    uint8_t chips_mult;             // The Wall (2), Violet Vessel (3), 1 otherwise
+    uint8_t discard_random_on_play; // The Hook (1)
+    uint8_t money_lost_on_play;     // The Tooth ($1/card)
+    uint8_t set_money_zero_on_most; // The Ox (1)
+    uint8_t cards_drawn_facedown;   // The Mark, The Wheel, The House (1)
+    uint8_t hand_size_reduced;      // The Manacle (1)
+};
+
+static __device__ __constant__ BlindSignature BLIND_SIGNATURES[31] = {
+    /* 0 */                         {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 1: BLIND_BL_ARM */           {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 2: BLIND_BL_BIG */           {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 3: BLIND_BL_CLUB */          {2,   0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 4: BLIND_BL_EYE */           {255, 0, 0, 0, 1, 0, 255, 0, 1, 0, 1, 0, 0, 0, 0, 0},
+    /* 5: BLIND_BL_FINAL_ACORN */   {255, 0, 0, 1, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 1, 0},
+    /* 6: BLIND_BL_FINAL_BELL */    {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 1, 0, 0, 0, 0},
+    /* 7: BLIND_BL_FINAL_HEART */   {255, 0, 0, 1, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 8: BLIND_BL_FINAL_LEAF */    {255, 0, 0, 1, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 9: BLIND_BL_FINAL_VESSEL */  {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 3, 0, 0, 0, 0, 0},
+    /* 10: BLIND_BL_FISH */         {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 1, 0},
+    /* 11: BLIND_BL_FLINT */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 1, 1, 0, 0, 0, 0, 0},
+    /* 12: BLIND_BL_GOAD */         {0,   0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 13: BLIND_BL_HEAD */         {1,   0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 14: BLIND_BL_HOOK */         {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 1, 0, 0, 0, 0},
+    /* 15: BLIND_BL_HOUSE */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 1, 0},
+    /* 16: BLIND_BL_MANACLE */      {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 1},
+    /* 17: BLIND_BL_MARK */         {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 1, 0},
+    /* 18: BLIND_BL_MOUTH */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 19: BLIND_BL_NEEDLE */       {255, 0, 0, 0, 1, 1, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 20: BLIND_BL_OX */           {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 1, 0, 0},
+    /* 21: BLIND_BL_PILLAR */       {255, 0, 1, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 22: BLIND_BL_PLANT */        {255, 1, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 23: BLIND_BL_PSYCHIC */      {255, 0, 0, 0, 5, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 24: BLIND_BL_SERPENT */      {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 25: BLIND_BL_SMALL */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 26: BLIND_BL_TOOTH */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 1, 0, 0, 0},
+    /* 27: BLIND_BL_WALL */         {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 2, 0, 0, 0, 0, 0},
+    /* 28: BLIND_BL_WATER */        {255, 0, 0, 0, 1, 0, 0,   0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 29: BLIND_BL_WHEEL */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 1, 0},
+    /* 30: BLIND_BL_WINDOW */       {3,   0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+};
+
+__device__ __forceinline__ float blind_sig_value(const BlindSignature* sig, int d) {
+    switch (d) {
+    case 0: return sig->debuff_suit < 4 ? ((float)sig->debuff_suit + 1.0f) / 4.0f : 0.0f;
+    case 1: return (float)sig->debuff_face;
+    case 2: return (float)sig->debuff_played;
+    case 3: return (float)sig->debuff_all_jokers;
+    case 4: return sig->min_play_size > 1 ? (float)sig->min_play_size / 5.0f : 0.0f;
+    case 5: return sig->max_hands > 0 ? (float)sig->max_hands / 4.0f : 0.0f;
+    case 6: return sig->max_discards == 0 ? 1.0f : 0.0f;
+    case 7: return (float)sig->single_hand_type;
+    case 8: return (float)sig->no_repeat_hands;
+    case 9: return (float)sig->base_score_halved;
+    case 10: return (float)sig->chips_mult / 3.0f;
+    case 11: return (float)sig->discard_random_on_play;
+    case 12: return (float)sig->money_lost_on_play;
+    case 13: return (float)sig->set_money_zero_on_most;
+    case 14: return (float)sig->cards_drawn_facedown;
+    default: return (float)sig->hand_size_reduced;
+    }
+}
 
 // Joker signature feature vector: 16 normalized floats from static table row.
 __device__ __forceinline__ float sig_value(const JokerSignature* sig, int d) {
@@ -241,13 +317,16 @@ __device__ __forceinline__ void ba_token_features(
     #pragma unroll
     for (int d = 0; d < BA_RAW_DIM; ++d) v[d] = 0.0f;
     int base = offsetof(Observation, tokens) + token_idx * sizeof(CardToken);
-    int id = ba_u16(obs, in, base + 0);
-    int zone = ba_byte(obs, in, base + 2);
-    int enh = ba_byte(obs, in, base + 3);
-    int ed = ba_byte(obs, in, base + 4);
-    int seal = ba_byte(obs, in, base + 5);
-    int flags = ba_byte(obs, in, base + 6);
-    int dval = (int8_t)ba_byte(obs, in, base + 7);
+    int id = ba_u16(obs, in, base + offsetof(CardToken, id));
+    int zone = ba_byte(obs, in, base + offsetof(CardToken, zone));
+    int enh = ba_byte(obs, in, base + offsetof(CardToken, enhancement));
+    int ed = ba_byte(obs, in, base + offsetof(CardToken, edition));
+    int seal = ba_byte(obs, in, base + offsetof(CardToken, seal));
+    int flags = ba_byte(obs, in, base + offsetof(CardToken, flags));
+    int sell_cost = (int8_t)ba_byte(obs, in, base + offsetof(CardToken, sell_cost));
+    int perma_bonus = (int16_t)ba_u16(obs, in, base + offsetof(CardToken, perma_bonus));
+    int state0 = (int32_t)ba_u32(obs, in, base + offsetof(CardToken, state0));
+    int state1 = (int32_t)ba_u32(obs, in, base + offsetof(CardToken, state1));
 
     int is_playing = (zone == ZONE_HAND) || (id > 300);
     if (is_playing) {
@@ -259,7 +338,7 @@ __device__ __forceinline__ void ba_token_features(
         v[3] = (float)ed / 4.0f;
         v[4] = (float)seal / 4.0f;
         v[5] = (float)flags / 255.0f;
-        v[6] = (float)dval / 128.0f;
+        v[6] = (float)sell_cost / 16.0f;
         v[7] = 1.0f;
         for (int k = 0; k < 7; ++k) v[8 + k] = (k == zone) ? 1.0f : 0.0f;
         for (int k = 0; k < 4; ++k) v[15 + k] = (k == suit) ? 1.0f : 0.0f;
@@ -268,6 +347,10 @@ __device__ __forceinline__ void ba_token_features(
         v[21] = (rank % 2 == 0) ? 1.0f : 0.0f;
         v[22] = (rank % 2 == 1 && rank != 14) ? 1.0f : 0.0f;
         v[23] = (float)rank / 14.0f;
+        v[24] = asinhf((float)perma_bonus / 10.0f) / 3.0f;
+        v[25] = (float)perma_bonus / 100.0f;
+        v[26] = asinhf((float)state0 / 10.0f) / 3.0f;
+        v[27] = asinhf((float)state1 / 10.0f) / 3.0f;
     } else {
         int center = id;
         if (center >= 0 && center < CENTER_COUNT) {
@@ -293,13 +376,17 @@ __device__ __forceinline__ void ba_token_features(
         v[17] = (float)ed / 4.0f;
         v[18] = (float)seal / 4.0f;
         v[19] = (float)flags / 255.0f;
-        v[20] = (float)dval / 128.0f;
+        v[20] = (float)sell_cost / 16.0f;
         // Non-ordinal 2D circular identity code on unit circle for center_id:
         float theta = (center >= 0 && center < CENTER_COUNT)
             ? (2.0f * 3.14159265f * (float)center / (float)CENTER_COUNT) : 0.0f;
         v[21] = (center >= 0 && center < CENTER_COUNT) ? __sinf(theta) : 0.0f;
         v[22] = (float)zone / 6.0f;
         v[23] = (center >= 0 && center < CENTER_COUNT) ? __cosf(theta) : 0.0f;
+        v[24] = asinhf((float)perma_bonus / 10.0f) / 3.0f;
+        v[25] = asinhf((float)state0 / 100.0f) / 3.0f;
+        v[26] = asinhf((float)state1 / 10.0f) / 3.0f;
+        v[27] = (float)state0 / 1000.0f;
     }
 }
 
@@ -485,7 +572,7 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
             else if (f == 3) value = ba_float(obs, in, record + offsetof(PokerHandStat, mult_log2)) / 16.0f;
             else if (f == 4) value = (float)ba_u16(obs, in, record + offsetof(PokerHandStat, total_plays)) / 256.0f;
             else value = (float)ba_u16(obs, in, record + offsetof(PokerHandStat, round_plays)) / 64.0f;
-        } else {
+        } else if (feature < BA_OFF_BLIND_SIG) {
             int local = feature - BA_OFF_TAGS;
             if (local == 0) {
                 value = (float)ba_byte(obs, in, base + offsetof(ObservationGlobals, double_tag));
@@ -505,6 +592,14 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
                 } else {
                     value = 1.0f;
                 }
+            }
+        } else {
+            int local = feature - BA_OFF_BLIND_SIG;
+            if (local < 16) {
+                value = (blind >= 0 && blind < 31) ? blind_sig_value(&BLIND_SIGNATURES[blind], local) : 0.0f;
+            } else {
+                int d = local - 16;
+                value = (boss >= 0 && boss < 31) ? blind_sig_value(&BLIND_SIGNATURES[boss], d) : 0.0f;
             }
         }
         pooled[b * BA_TOTAL + feature] = from_float(value);
@@ -532,8 +627,8 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
             ba_token_features(obs, in, slot, s_raw[warp]);
             int token_base = offsetof(Observation, tokens)
                 + slot * sizeof(CardToken);
-            int id = ba_u16(obs, in, token_base);
-            int zone = ba_byte(obs, in, token_base + 2);
+            int id = ba_u16(obs, in, token_base + offsetof(CardToken, id));
+            int zone = ba_byte(obs, in, token_base + offsetof(CardToken, zone));
             s_id[warp] = id;
             s_playing[warp] = zone == ZONE_HAND || id > 300;
         }
@@ -665,8 +760,8 @@ __global__ void ba_token_backward_kernel(
     ba_token_features(obs, in, slot, v);
 
     int token_base = offsetof(Observation, tokens) + slot * sizeof(CardToken);
-    int id = ba_u16(obs, in, token_base);
-    int zone = ba_byte(obs, in, token_base + 2);
+    int id = ba_u16(obs, in, token_base + offsetof(CardToken, id));
+    int zone = ba_byte(obs, in, token_base + offsetof(CardToken, zone));
     int is_playing = (zone == ZONE_HAND) || (id > 300);
     int rank = is_playing ? id >> 8 : 0;
     int suit = is_playing ? id & 0xFF : 0;

@@ -85,6 +85,8 @@ typedef struct Env {
     State state;
     LegalMasks legal_masks;
     float invalid_action_reward;
+    uint8_t deck_config;
+    uint8_t stake_config;
 } Env;
 
 static inline void log_episode_end(Env *env, int won) {
@@ -184,6 +186,74 @@ void puf_init(Env *env, Dict *kwargs) {
     env->episode_reward = 0.0f;
     env->agents[0].policy = 0;
     default_config(&env->config);
+    env->deck_config = 0;
+    env->stake_config = 1;
+    DictItem *deck_item = dict_find(kwargs, "deck");
+    if (deck_item) {
+        if (deck_item->str && (strcmp(deck_item->str, "all") == 0 || strcmp(deck_item->str, "random") == 0 || strcmp(deck_item->str, "any") == 0)) {
+            env->deck_config = 255;
+        } else if (deck_item->str && strcmp(deck_item->str, "red") == 0) {
+            env->deck_config = CENTER_B_RED;
+        } else if (deck_item->str && strcmp(deck_item->str, "blue") == 0) {
+            env->deck_config = CENTER_B_BLUE;
+        } else if (deck_item->str && strcmp(deck_item->str, "yellow") == 0) {
+            env->deck_config = CENTER_B_YELLOW;
+        } else if (deck_item->str && strcmp(deck_item->str, "green") == 0) {
+            env->deck_config = CENTER_B_GREEN;
+        } else if (deck_item->str && strcmp(deck_item->str, "black") == 0) {
+            env->deck_config = CENTER_B_BLACK;
+        } else if (deck_item->str && strcmp(deck_item->str, "magic") == 0) {
+            env->deck_config = CENTER_B_MAGIC;
+        } else if (deck_item->str && strcmp(deck_item->str, "nebula") == 0) {
+            env->deck_config = CENTER_B_NEBULA;
+        } else if (deck_item->str && strcmp(deck_item->str, "ghost") == 0) {
+            env->deck_config = CENTER_B_GHOST;
+        } else if (deck_item->str && strcmp(deck_item->str, "abandoned") == 0) {
+            env->deck_config = CENTER_B_ABANDONED;
+        } else if (deck_item->str && strcmp(deck_item->str, "checkered") == 0) {
+            env->deck_config = CENTER_B_CHECKERED;
+        } else if (deck_item->str && strcmp(deck_item->str, "zodiac") == 0) {
+            env->deck_config = CENTER_B_ZODIAC;
+        } else if (deck_item->str && strcmp(deck_item->str, "painted") == 0) {
+            env->deck_config = CENTER_B_PAINTED;
+        } else if (deck_item->str && strcmp(deck_item->str, "anaglyph") == 0) {
+            env->deck_config = CENTER_B_ANAGLYPH;
+        } else if (deck_item->str && strcmp(deck_item->str, "plasma") == 0) {
+            env->deck_config = CENTER_B_PLASMA;
+        } else if (deck_item->str && strcmp(deck_item->str, "erratic") == 0) {
+            env->deck_config = CENTER_B_ERRATIC;
+        } else {
+            int val = (int)deck_item->value;
+            if (val == -1 || val == 255) env->deck_config = 255;
+            else if (val >= 0 && val <= 16) env->deck_config = (uint8_t)val;
+        }
+    }
+    DictItem *stake_item = dict_find(kwargs, "stake");
+    if (stake_item) {
+        if (stake_item->str && (strcmp(stake_item->str, "all") == 0 || strcmp(stake_item->str, "random") == 0 || strcmp(stake_item->str, "any") == 0)) {
+            env->stake_config = 255;
+        } else if (stake_item->str && strcmp(stake_item->str, "white") == 0) {
+            env->stake_config = 1;
+        } else if (stake_item->str && strcmp(stake_item->str, "red") == 0) {
+            env->stake_config = 2;
+        } else if (stake_item->str && strcmp(stake_item->str, "green") == 0) {
+            env->stake_config = 3;
+        } else if (stake_item->str && strcmp(stake_item->str, "black") == 0) {
+            env->stake_config = 4;
+        } else if (stake_item->str && strcmp(stake_item->str, "blue") == 0) {
+            env->stake_config = 5;
+        } else if (stake_item->str && strcmp(stake_item->str, "purple") == 0) {
+            env->stake_config = 6;
+        } else if (stake_item->str && strcmp(stake_item->str, "orange") == 0) {
+            env->stake_config = 7;
+        } else if (stake_item->str && strcmp(stake_item->str, "gold") == 0) {
+            env->stake_config = 8;
+        } else {
+            int val = (int)stake_item->value;
+            if (val == -1 || val == 255) env->stake_config = 255;
+            else if (val >= 1 && val <= 8) env->stake_config = (uint8_t)val;
+        }
+    }
     DictItem *shaped = dict_find(kwargs, "shaped_reward");
     DictItem *win_ante = dict_find(kwargs, "win_ante");
     DictItem *max_episode_steps = dict_find(kwargs, "max_episode_steps");
@@ -227,6 +297,22 @@ void puf_init(Env *env, Dict *kwargs) {
 }
 
 void puf_reset(Env *env) {
+    static const uint8_t ALL_DECKS[15] = {
+        CENTER_B_RED, CENTER_B_BLUE, CENTER_B_YELLOW, CENTER_B_GREEN,
+        CENTER_B_BLACK, CENTER_B_MAGIC, CENTER_B_NEBULA, CENTER_B_GHOST,
+        CENTER_B_ABANDONED, CENTER_B_CHECKERED, CENTER_B_ZODIAC, CENTER_B_PAINTED,
+        CENTER_B_ANAGLYPH, CENTER_B_PLASMA, CENTER_B_ERRATIC
+    };
+    if (env->deck_config == 255) {
+        env->config.deck = ALL_DECKS[rand_r(&env->rng) % 15];
+    } else {
+        env->config.deck = env->deck_config;
+    }
+    if (env->stake_config == 255) {
+        env->config.stake = 1 + (rand_r(&env->rng) % 8);
+    } else {
+        env->config.stake = env->stake_config;
+    }
     uint64_t seed = ((uint64_t)rand_r(&env->rng) << 32) | rand_r(&env->rng);
     init(&env->state, &env->config, seed);
     env->agents[0].rewards[0] = 0.0f;

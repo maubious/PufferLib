@@ -3438,7 +3438,10 @@ static inline void write_card_token(CardToken *dst, const Card *card, uint8_t zo
     dst->edition = card->edition;
     dst->seal = card->seal;
     dst->flags = is_playing ? public_playing_flags(card) : card->flags;
-    dst->dynamic_val = (int8_t)(card->sell_cost > 127 ? 127 : card->sell_cost < -128 ? -128 : card->sell_cost);
+    dst->sell_cost = (int8_t)(card->sell_cost > 127 ? 127 : card->sell_cost < -128 ? -128 : card->sell_cost);
+    dst->perma_bonus = card->perma_bonus;
+    dst->state0 = card->state[0];
+    dst->state1 = card->state[1];
 }
 
 int state_layout_valid(const State *state) {
