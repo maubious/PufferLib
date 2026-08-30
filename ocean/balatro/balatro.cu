@@ -770,24 +770,13 @@ __global__ void ba_grad_finalize_kernel(
     if (cell >= BA_TOKEN_CELLS) return;
     float sum = 0.0f;
     const float* p = partials + cell;
-    int b = 0;
-    for (; b + 7 < num_blocks; b += 8, p += 8 * BA_TOKEN_CELLS) {
-        float s0 = p[0];
-        float s1 = p[BA_TOKEN_CELLS];
-        float s2 = p[2 * BA_TOKEN_CELLS];
-        float s3 = p[3 * BA_TOKEN_CELLS];
-        float s4 = p[4 * BA_TOKEN_CELLS];
-        float s5 = p[5 * BA_TOKEN_CELLS];
-        float s6 = p[6 * BA_TOKEN_CELLS];
-        float s7 = p[7 * BA_TOKEN_CELLS];
-        sum += (s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7);
+    for (int b = 0; b < num_blocks; ++b, p += BA_TOKEN_CELLS) {
+        sum += *p;
     }
-    for (; b < num_blocks; ++b, p += BA_TOKEN_CELLS) sum += *p;
     if (cell < BA_CELLS_C) {
         c_wgrad[(cell & 31) * BA_CARD_IN + (cell >> 5)] = from_float(sum);
     } else {
-        int d = cell - BA_CELLS_C;
-        c_bgrad[d] = from_float(sum);
+        c_bgrad[cell - BA_CELLS_C] = from_float(sum);
     }
 }
 
