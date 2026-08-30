@@ -326,7 +326,6 @@ typedef struct SelectionContract {
     uint8_t valid;
     uint8_t reserved;
 } SelectionContract;
-typedef SelectionContract ObservedSelection;
 
 typedef struct LegalMasks {
     uint64_t primary[ACTION_TYPE_COUNT];

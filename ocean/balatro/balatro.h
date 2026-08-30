@@ -106,7 +106,7 @@ static inline void store_u64(unsigned char *out, uint64_t value) {
 
 static inline void store_selection(
         unsigned char *mask, int entry,
-        const ObservedSelection *selection) {
+        const SelectionContract *selection) {
     assert(selection && entry >= 0);
     if (!selection->valid) return;
     unsigned char *out = mask + POLICY_SELECTION_OFFSET +
@@ -307,7 +307,7 @@ void puf_step(Env *env) {
                 policy.primary = (uint8_t)__builtin_ctzll(primary);
         }
         if (action_is_legal) {
-            const ObservedSelection *selection =
+            const SelectionContract *selection =
                 cached_selection(legal, policy.type, policy.primary);
             if (!selection || !selection->valid) {
                 policy.selection_count = 0;
