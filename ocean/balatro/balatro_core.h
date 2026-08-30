@@ -441,19 +441,19 @@ typedef struct ObservationGlobals {
     int32_t  dollars;
     int32_t  reroll_cost;
     int32_t  round_earnings;
-    int16_t  chips_q8_8;
-    int16_t  blind_chips_q8_8;
-    int16_t  last_hand_score_q8_8;
-    int16_t  chips_over_blind_q8_8;
-    int16_t  interest_cap_q8_8;
-    int16_t  interest_amount_q8_8;
-    int16_t  blind_reward_q8_8;
-    int16_t  joker_rate_q8_8;
-    int16_t  tarot_rate_q8_8;
-    int16_t  planet_rate_q8_8;
-    int16_t  spectral_rate_q8_8;
-    int16_t  playing_card_rate_q8_8;
-    int16_t  edition_rate_q8_8;
+    float    chips_log2;
+    float    blind_chips_log2;
+    float    last_hand_score_log2;
+    float    chips_over_blind_log2;
+    uint16_t interest_cap;
+    uint16_t interest_amount;
+    uint16_t blind_reward;
+    uint8_t  joker_rate;
+    uint8_t  tarot_rate;
+    uint8_t  planet_rate;
+    uint8_t  spectral_rate;
+    uint8_t  playing_card_rate;
+    uint8_t  edition_rate;
     uint64_t redeemed_vouchers_mask;
 } ObservationGlobals;
 
@@ -462,8 +462,8 @@ typedef struct PokerHandStat {
     uint8_t  level;
     uint16_t total_plays;
     uint16_t round_plays;
-    int16_t  chips_q8_8;
-    int16_t  mult_q8_8;
+    float    chips_log2;
+    float    mult_log2;
 } PokerHandStat;
 
 typedef struct Observation {

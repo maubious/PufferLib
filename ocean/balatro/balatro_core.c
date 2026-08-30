@@ -42,26 +42,6 @@ static const uint16_t planet_centers[HAND_COUNT] = {
     CENTER_C_VENUS, CENTER_C_URANUS, CENTER_C_MERCURY,  CENTER_C_PLUTO,
 };
 
-static const int16_t q8_8_integer_lut[257] = {
-    0, 256, 406, 512, 594, 662, 719, 768, 812, 850, 886, 918, 947, 975, 1000, 1024,
-    1046, 1068, 1087, 1106, 1124, 1142, 1158, 1174, 1189, 1203, 1217, 1231, 1244, 1256, 1268, 1280,
-    1291, 1302, 1313, 1324, 1334, 1343, 1353, 1362, 1372, 1380, 1389, 1398, 1406, 1414, 1422, 1430,
-    1437, 1445, 1452, 1459, 1466, 1473, 1480, 1487, 1493, 1500, 1506, 1512, 1518, 1524, 1530, 1536,
-    1542, 1547, 1553, 1558, 1564, 1569, 1574, 1580, 1585, 1590, 1595, 1599, 1604, 1609, 1614, 1618,
-    1623, 1628, 1632, 1636, 1641, 1645, 1649, 1654, 1658, 1662, 1666, 1670, 1674, 1678, 1682, 1686,
-    1690, 1693, 1697, 1701, 1705, 1708, 1712, 1715, 1719, 1722, 1726, 1729, 1733, 1736, 1739, 1743,
-    1746, 1749, 1752, 1756, 1759, 1762, 1765, 1768, 1771, 1774, 1777, 1780, 1783, 1786, 1789, 1792,
-    1795, 1798, 1801, 1803, 1806, 1809, 1812, 1814, 1817, 1820, 1822, 1825, 1828, 1830, 1833, 1836,
-    1838, 1841, 1843, 1846, 1848, 1851, 1853, 1855, 1858, 1860, 1863, 1865, 1867, 1870, 1872, 1874,
-    1877, 1879, 1881, 1884, 1886, 1888, 1890, 1892, 1895, 1897, 1899, 1901, 1903, 1905, 1908, 1910,
-    1912, 1914, 1916, 1918, 1920, 1922, 1924, 1926, 1928, 1930, 1932, 1934, 1936, 1938, 1940, 1942,
-    1944, 1946, 1947, 1949, 1951, 1953, 1955, 1957, 1959, 1961, 1962, 1964, 1966, 1968, 1970, 1971,
-    1973, 1975, 1977, 1978, 1980, 1982, 1984, 1985, 1987, 1989, 1990, 1992, 1994, 1995, 1997, 1999,
-    2000, 2002, 2004, 2005, 2007, 2008, 2010, 2012, 2013, 2015, 2016, 2018, 2020, 2021, 2023, 2024,
-    2026, 2027, 2029, 2030, 2032, 2033, 2035, 2036, 2038, 2039, 2041, 2042, 2044, 2045, 2047, 2048,
-    2049,
-};
-
 typedef enum TargetEffect {
     TARGET_CUSTOM,
     TARGET_ENHANCEMENT,
@@ -1221,26 +1201,6 @@ static inline float observation_signed_log2(double value) {
     if (isnan(value)) return 0.0f;
     if (isinf(value)) return signbit(value) ? -1024.0f : 1024.0f;
     return (float)copysign(log2(1.0 + fabs(value)), value);
-}
-
-
-
-static int16_t quantize_q8_8(float value) {
-    if (!(value == value)) return 0;
-    if (value > 127.99609375f) value = 127.99609375f;
-    if (value < -128.0f) value = -128.0f;
-    float scaled = value * 256.0f;
-    return (int16_t)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
-}
-
-static inline int16_t observation_q8_8(double value) {
-    if (value == 0.0) return 0;
-    if (value >= -256.0 && value <= 256.0 && value == (double)(int)value) {
-        int integer = (int)value;
-        if (integer < 0) return (int16_t)-q8_8_integer_lut[-integer];
-        return (int16_t)q8_8_integer_lut[integer];
-    }
-    return quantize_q8_8(observation_signed_log2(value));
 }
 
 // ------------------
@@ -3620,8 +3580,8 @@ static void observation_poker_hand(const State *state, uint8_t hand, PokerHandSt
         .level = level > 255 ? 255 : (uint8_t)level,
         .total_plays = state->hand_plays[hand],
         .round_plays = state->hand_plays_round[hand],
-        .chips_q8_8 = quantize_q8_8(chips),
-        .mult_q8_8 = quantize_q8_8(mult),
+        .chips_log2 = chips,
+        .mult_log2 = mult,
     };
 }
 
@@ -3731,19 +3691,19 @@ int observe(const State *state, Observation *out, LegalMasks *legal) {
         .dollars = state->dollars,
         .reroll_cost = state->reroll_cost,
         .round_earnings = state->round_earnings,
-        .chips_q8_8 = observation_q8_8(state->chips),
-        .blind_chips_q8_8 = observation_q8_8(state->blind_chips),
-        .last_hand_score_q8_8 = observation_q8_8(state->last_hand_score),
-        .chips_over_blind_q8_8 = observation_q8_8(chips_over_blind),
-        .interest_cap_q8_8 = observation_q8_8(state->interest_cap),
-        .interest_amount_q8_8 = observation_q8_8(state->interest_amount),
-        .blind_reward_q8_8 = observation_q8_8(state->blind_reward),
-        .joker_rate_q8_8 = quantize_q8_8(state->joker_rate),
-        .tarot_rate_q8_8 = quantize_q8_8(state->tarot_rate),
-        .planet_rate_q8_8 = quantize_q8_8(state->planet_rate),
-        .spectral_rate_q8_8 = quantize_q8_8(state->spectral_rate),
-        .playing_card_rate_q8_8 = quantize_q8_8(state->playing_card_rate),
-        .edition_rate_q8_8 = quantize_q8_8(state->edition_rate),
+        .chips_log2 = observation_signed_log2(state->chips),
+        .blind_chips_log2 = observation_signed_log2(state->blind_chips),
+        .last_hand_score_log2 = observation_signed_log2(state->last_hand_score),
+        .chips_over_blind_log2 = observation_signed_log2(chips_over_blind),
+        .interest_cap = (uint16_t)(state->interest_cap < 0 ? 0 : state->interest_cap),
+        .interest_amount = (uint16_t)(state->interest_amount < 0 ? 0 : state->interest_amount),
+        .blind_reward = (uint16_t)(state->blind_reward < 0 ? 0 : state->blind_reward),
+        .joker_rate = (uint8_t)(state->joker_rate * 100.0f + 0.5f),
+        .tarot_rate = (uint8_t)(state->tarot_rate * 100.0f + 0.5f),
+        .planet_rate = (uint8_t)(state->planet_rate * 100.0f + 0.5f),
+        .spectral_rate = (uint8_t)(state->spectral_rate * 100.0f + 0.5f),
+        .playing_card_rate = (uint8_t)(state->playing_card_rate * 100.0f + 0.5f),
+        .edition_rate = (uint8_t)(state->edition_rate * 100.0f + 0.5f),
         .redeemed_vouchers_mask = redeemed_vouchers_mask,
     };
 

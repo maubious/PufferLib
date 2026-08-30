@@ -85,7 +85,7 @@ static constexpr int BA_BLOCK_AGENTS = 4;
 static constexpr int BA_CELLS_C = BA_TOKEN_W * BA_CARD_IN; // 704
 static constexpr int BA_TOKEN_CELLS = BA_CELLS_C + BA_TOKEN_W; // 736
 
-static_assert(sizeof(Observation) == 1725,
+static_assert(sizeof(Observation) == 1775,
     "Balatro encoder must be updated for the Observation layout");
 static_assert(BA_FIXED == 520 && BA_POOLED == 968 && BA_TOTAL == 2024,
     "Balatro encoder pooled layout mismatch");
@@ -159,6 +159,12 @@ __device__ __forceinline__ uint32_t ba_u32(
         | ((uint32_t)ba_byte(obs, base, offset + 1) << 8)
         | ((uint32_t)ba_byte(obs, base, offset + 2) << 16)
         | ((uint32_t)ba_byte(obs, base, offset + 3) << 24);
+}
+
+__device__ __forceinline__ float ba_float(
+        const unsigned char* obs, int64_t base, int offset) {
+    uint32_t u = ba_u32(obs, base, offset);
+    return __builtin_bit_cast(float, u);
 }
 
 __device__ __forceinline__ float ba_gelu(float x) {
@@ -329,10 +335,13 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
                         offsetof(ObservationGlobals, round_earnings),
                     };
                     value = (float)(int32_t)ba_u32(obs, in, base + i32_stat_offsets[local]) / 64.0f;
+                } else if ((local -= 3) < 4) {
+                    value = ba_float(obs, in, base + offsetof(ObservationGlobals, chips_log2) + 4 * local) / 16.0f;
+                } else if ((local -= 4) < 3) {
+                    value = (float)ba_u16(obs, in, base + offsetof(ObservationGlobals, interest_cap) + 2 * local) / 64.0f;
                 } else {
                     local -= 3;
-                    value = (float)ba_i16(obs, in,
-                        base + offsetof(ObservationGlobals, chips_q8_8) + 2 * local) / (256.0f * 16.0f);
+                    value = (float)ba_byte(obs, in, base + offsetof(ObservationGlobals, joker_rate) + local) / 100.0f;
                 }
             }
         } else if (feature < BA_OFF_VOUCHER) {
@@ -378,12 +387,12 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
             int rec = local / 6;
             int f = local % 6;
             int record = offsetof(Observation, poker_hands) + rec * sizeof(PokerHandStat);
-            if (f == 0) value = (float)ba_byte(obs, in, record + 1); // visible
-            else if (f == 1) value = (float)ba_byte(obs, in, record + 0) / 16.0f; // level
-            else if (f == 2) value = (float)ba_i16(obs, in, record + 4) / (256.0f * 128.0f); // chips_q8_8
-            else if (f == 3) value = (float)ba_i16(obs, in, record + 6) / (256.0f * 128.0f); // mult_q8_8
-            else if (f == 4) value = (float)ba_byte(obs, in, record + 3) / 256.0f; // total_plays
-            else value = (float)ba_byte(obs, in, record + 2) / 64.0f; // round_plays
+            if (f == 0) value = (float)ba_byte(obs, in, record + offsetof(PokerHandStat, visible));
+            else if (f == 1) value = (float)ba_byte(obs, in, record + offsetof(PokerHandStat, level)) / 16.0f;
+            else if (f == 2) value = ba_float(obs, in, record + offsetof(PokerHandStat, chips_log2)) / 16.0f;
+            else if (f == 3) value = ba_float(obs, in, record + offsetof(PokerHandStat, mult_log2)) / 16.0f;
+            else if (f == 4) value = (float)ba_u16(obs, in, record + offsetof(PokerHandStat, total_plays)) / 256.0f;
+            else value = (float)ba_u16(obs, in, record + offsetof(PokerHandStat, round_plays)) / 64.0f;
         } else {
             int local = feature - BA_OFF_TAGS;
             if (local == 0) {
