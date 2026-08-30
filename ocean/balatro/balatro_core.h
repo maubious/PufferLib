@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include "balatro_ids.h"
 
@@ -323,6 +324,21 @@ typedef struct LegalMasks {
     uint64_t hand_reorder_destination[OBS_MAX_HAND];
     uint64_t joker_reorder_destination[OBS_MAX_JOKERS];
 } LegalMasks;
+
+/* Selection entry for a (type, primary) pair, or NULL when the action
+   carries no selection (BUY_CARD, swaps, …). */
+static inline const ObservedSelection *cached_selection(
+        const LegalMasks *legal, uint8_t type, uint8_t primary) {
+    if (type == ACTION_PLAY_HAND) return &legal->play;
+    if (type == ACTION_DISCARD) return &legal->discard;
+    if (type == ACTION_USE_CONSUMABLE && primary < OBS_MAX_CONSUMABLES)
+        return &legal->consumable[primary];
+    if (type == ACTION_BUY_AND_USE && primary < OBS_MAX_SHOP_MAIN)
+        return &legal->shop[primary];
+    if (type == ACTION_PICK_PACK_CARD && primary < OBS_MAX_PACK_CARDS)
+        return &legal->pack[primary];
+    return NULL;
+}
 
 #define OBSERVATION_VOUCHER_BYTES ((CENTER_COUNT + 7) / 8)
 
