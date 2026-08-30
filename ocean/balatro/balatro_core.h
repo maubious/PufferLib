@@ -306,30 +306,42 @@ typedef struct State {
     uint64_t joker_active_flags;
 } State;
 
-typedef struct ObservedSelection {
+#define MAX_OBS_TOKENS 128
+
+typedef enum ItemZone {
+    ZONE_HAND = 0,
+    ZONE_JOKER = 1,
+    ZONE_CONSUMABLE = 2,
+    ZONE_SHOP_MAIN = 3,
+    ZONE_SHOP_VOUCHER = 4,
+    ZONE_SHOP_BOOSTER = 5,
+    ZONE_PACK_CARD = 6
+} ItemZone;
+
+typedef struct SelectionContract {
     uint64_t allowed_hand;
     uint64_t required_hand;
     uint8_t minimum;
     uint8_t maximum;
     uint8_t valid;
     uint8_t reserved;
-} ObservedSelection;
+} SelectionContract;
+typedef SelectionContract ObservedSelection;
 
 typedef struct LegalMasks {
-    uint8_t action_type[ACTION_TYPE_COUNT];
     uint64_t primary[ACTION_TYPE_COUNT];
-    ObservedSelection play;
-    ObservedSelection discard;
-    ObservedSelection consumable[OBS_MAX_CONSUMABLES];
-    ObservedSelection shop[OBS_MAX_SHOP_MAIN];
-    ObservedSelection pack[OBS_MAX_PACK_CARDS];
+    SelectionContract play;
+    SelectionContract discard;
+    SelectionContract consumable[OBS_MAX_CONSUMABLES];
+    SelectionContract shop[OBS_MAX_SHOP_MAIN];
+    SelectionContract pack[OBS_MAX_PACK_CARDS];
     uint64_t hand_reorder_destination[OBS_MAX_HAND];
     uint64_t joker_reorder_destination[OBS_MAX_JOKERS];
 } LegalMasks;
 
 /* Selection entry for a (type, primary) pair, or NULL when the action
    carries no selection (BUY_CARD, swaps, …). */
-static inline const ObservedSelection *cached_selection(
+static inline const SelectionContract *cached_selection(
         const LegalMasks *legal, uint8_t type, uint8_t primary) {
     if (type == ACTION_PLAY_HAND) return &legal->play;
     if (type == ACTION_DISCARD) return &legal->discard;
@@ -342,185 +354,131 @@ static inline const ObservedSelection *cached_selection(
     return NULL;
 }
 
-#define OBSERVATION_VOUCHER_BYTES ((CENTER_COUNT + 7) / 8)
-
 #pragma pack(push, 1)
+typedef struct CardToken {
+    uint16_t id;          // Playing card: (rank << 8 | suit) | Consumable/Joker/Voucher: center_id
+    uint8_t  zone;        // ItemZone enum
+    uint8_t  enhancement; // ENHANCEMENT_* (0..8)
+    uint8_t  edition;     // EDITION_* (0..4)
+    uint8_t  seal;        // SEAL_* (0..4)
+    uint8_t  flags;       // Debuffed, Eternal, Perishable, Rental, Forced
+    int8_t   dynamic_val; // Sell cost / accrued chips / remaining charges / perishable rounds
+} CardToken;
+
+typedef struct DeckSlot {
+    uint8_t  draw_count;       // Count in draw pile
+    uint8_t  hand_count;       // Count in current hand
+    uint8_t  discard_count;    // Count in discard pile
+    uint8_t  _pad;
+    uint16_t enhancement_mask; // Bitmask of present enhancements (1 << enh)
+    uint16_t modifiers_mask;   // Bits 0..4: Edition mask, Bits 5..9: Seal mask, Bit 10: Debuffed
+} DeckSlot;
+
+typedef struct DeckMatrix {
+    DeckSlot grid[13][4];             // 13 ranks (2..14) x 4 suits (0..3) = 52 * 8 = 416 bytes
+    uint16_t draw_enhancements[9];    // Total of each enhancement remaining in draw pile
+    uint16_t discard_enhancements[9]; // Total of each enhancement in discard pile
+    uint16_t total_deck_size;         // Total cards in (deck + hand + discard)
+} DeckMatrix;
+
 typedef struct ObservationGlobals {
     uint16_t deck_id;
     uint16_t blind_id;
     uint16_t next_boss_id;
     uint16_t next_voucher_id;
     uint16_t last_tarot_planet;
-    uint8_t stake;
-    uint8_t phase;
-    uint8_t blind_on_deck;
-    uint8_t blind_disabled;
-    uint8_t hand_sort_suit;
-    uint8_t most_played_hand;
-    uint8_t last_hand_type;
-    uint8_t blind_skipped_mask;
-    uint8_t blind_only_hand;
-    uint8_t boss_rerolled;
-    uint8_t free_rerolls;
-    uint8_t reroll_base;
-    uint8_t reroll_increase;
-    uint8_t discount_percent;
-    uint8_t hands_per_round;
-    uint8_t discards_per_round;
-    uint8_t base_hand_size;
-    uint8_t pack_kind;
-    uint8_t double_tag;
-    uint8_t active_tag;
-    uint8_t tag_hand_bonus;
-    uint8_t tag_force_rarity;
-    uint8_t tag_force_rarity_count;
-    uint8_t tag_force_edition;
-    uint8_t tag_force_edition_count;
-    uint8_t tag_voucher_pending;
-    uint8_t tag_coupon_pending;
-    uint8_t tag_coupon_active;
-    uint8_t tag_investment_pending;
-    uint8_t tag_d_six_pending;
-    uint8_t tag_d_six_active;
-    uint8_t ecto_penalty;
-    uint8_t gros_michel_extinct;
-    uint32_t ante;
-    uint32_t run_hands_played;
+    uint8_t  stake;
+    uint8_t  phase;
+    uint8_t  ante;
+    uint8_t  round;
+    uint8_t  blind_on_deck;
+    uint8_t  blind_disabled;
+    uint8_t  blind_only_hand;
+    uint8_t  blind_skipped_mask;
+    uint8_t  hand_sort_suit;
+    uint8_t  boss_rerolled;
+    uint8_t  free_rerolls;
+    uint8_t  reroll_base;
+    uint8_t  reroll_increase;
+    uint8_t  discount_percent;
+    uint8_t  hands_per_round;
+    uint8_t  discards_per_round;
+    uint8_t  base_hand_size;
+    uint8_t  pack_kind;
+    uint8_t  double_tag;
+    uint8_t  active_tag;
+    uint8_t  tag_hand_bonus;
+    uint8_t  tag_force_rarity;
+    uint8_t  tag_force_rarity_count;
+    uint8_t  tag_force_edition;
+    uint8_t  tag_force_edition_count;
+    uint8_t  tag_voucher_pending;
+    uint8_t  tag_coupon_pending;
+    uint8_t  tag_coupon_active;
+    uint8_t  tag_investment_pending;
+    uint8_t  tag_d_six_pending;
+    uint8_t  tag_d_six_active;
+    uint8_t  ecto_penalty;
+    uint8_t  gros_michel_extinct;
+    uint8_t  hand_size;
+    uint8_t  joker_slots;
+    uint8_t  consumable_slots;
+    uint8_t  skips;
+    uint8_t  pack_choices;
+    uint8_t  unused_discards;
+    uint8_t  most_played_hand;
+    uint8_t  last_hand_type;
+    uint8_t  blind_tags[2];
+    uint8_t  orbital_hands[2];
     uint16_t hands_left;
     uint16_t discards_left;
     uint16_t hands_played;
     uint16_t discards_used;
-    uint16_t hand_size;
-    uint16_t joker_slots;
-    uint16_t consumable_slots;
-    uint16_t skips;
-    uint16_t pack_choices;
-    uint16_t unused_discards;
     uint16_t blind_hands_mask;
     uint16_t tarots_used;
     uint16_t planet_usage_mask;
-    int16_t dollars_q8_8;
-    int16_t chips_q8_8;
-    int16_t blind_chips_q8_8;
-    int16_t last_hand_score_q8_8;
-    int16_t chips_over_blind_q8_8;
-    int16_t reroll_cost_q8_8;
-    int16_t round_earnings_q8_8;
-    int16_t interest_cap_q8_8;
-    int16_t interest_amount_q8_8;
-    int16_t blind_reward_q8_8;
-    int16_t joker_rate_q8_8;
-    int16_t tarot_rate_q8_8;
-    int16_t planet_rate_q8_8;
-    int16_t spectral_rate_q8_8;
-    int16_t playing_card_rate_q8_8;
-    int16_t edition_rate_q8_8;
-    uint8_t redeemed_vouchers[OBSERVATION_VOUCHER_BYTES];
+    uint32_t run_hands_played;
+    int32_t  dollars;
+    int32_t  reroll_cost;
+    int32_t  round_earnings;
+    int16_t  chips_q8_8;
+    int16_t  blind_chips_q8_8;
+    int16_t  last_hand_score_q8_8;
+    int16_t  chips_over_blind_q8_8;
+    int16_t  interest_cap_q8_8;
+    int16_t  interest_amount_q8_8;
+    int16_t  blind_reward_q8_8;
+    int16_t  joker_rate_q8_8;
+    int16_t  tarot_rate_q8_8;
+    int16_t  planet_rate_q8_8;
+    int16_t  spectral_rate_q8_8;
+    int16_t  playing_card_rate_q8_8;
+    int16_t  edition_rate_q8_8;
+    uint64_t redeemed_vouchers_mask;
 } ObservationGlobals;
 
-typedef struct ObservationVariant {
-    uint8_t rank;
-    uint8_t suit;
-    uint8_t enhancement;
-    uint8_t edition;
-    uint8_t seal;
-    uint8_t flags;
-    int16_t perma_bonus_q8_8;
-    uint16_t owned_count;
-    uint16_t draw_count;
-    uint16_t hand_count;
-    uint16_t discard_count;
-} ObservationVariant;
-
-typedef struct ObservationVariants {
-    uint16_t count;
-    ObservationVariant values[OBS_MAX_PLAYING_VARIANTS];
-} ObservationVariants;
-
-typedef struct ObservationHandCard {
-    uint16_t variant;
-    uint8_t flags;
-} ObservationHandCard;
-
-typedef struct ObservationHand {
-    uint16_t count;
-    ObservationHandCard values[OBS_MAX_HAND];
-} ObservationHand;
-
-typedef struct ObservationCard {
-    uint16_t center_id;
-    uint8_t rank;
-    uint8_t suit;
-    uint8_t enhancement;
-    uint8_t edition;
-    uint8_t seal;
-    uint8_t flags;
-    int16_t perma_bonus_q8_8;
-    int16_t cost_q8_8;
-    int16_t sell_cost_q8_8;
-    int16_t state_q8_8[4];
-} ObservationCard;
-
-#define DEFINE_OBSERVATION_CARD_ZONE(name, capacity) \
-    typedef struct name { uint16_t count; ObservationCard values[capacity]; } name
-DEFINE_OBSERVATION_CARD_ZONE(ObservationJokers, OBS_MAX_JOKERS);
-DEFINE_OBSERVATION_CARD_ZONE(ObservationConsumables, OBS_MAX_CONSUMABLES);
-DEFINE_OBSERVATION_CARD_ZONE(ObservationShopMain, OBS_MAX_SHOP_MAIN);
-DEFINE_OBSERVATION_CARD_ZONE(ObservationShopVouchers, OBS_MAX_SHOP_VOUCHERS);
-DEFINE_OBSERVATION_CARD_ZONE(ObservationShopBoosters, OBS_MAX_SHOP_BOOSTERS);
-DEFINE_OBSERVATION_CARD_ZONE(ObservationPack, OBS_MAX_PACK_CARDS);
-#undef DEFINE_OBSERVATION_CARD_ZONE
-
-typedef struct ObservationDeckSummary {
-    uint16_t rank[13];
-    uint16_t suit[4];
-    uint16_t rank_suit[4][13];
-    uint16_t enhancement[9];
-    uint16_t edition[5];
-    uint16_t seal[5];
-    uint16_t face_count;
-    uint16_t numbered_count;
-    uint16_t ace_count;
-    uint16_t stone_count;
-    uint16_t wild_count;
-    uint16_t steel_count;
-    uint16_t gold_count;
-    uint16_t glass_count;
-    uint16_t enhanced_count;
-    uint16_t unmodified_count;
-    uint16_t total_count;
-} ObservationDeckSummary;
-
-typedef struct ObservationTags {
-    uint16_t count;
-    uint8_t tag_id[OBS_MAX_TAGS];
-    uint8_t orbital_hand[OBS_MAX_TAGS];
-    uint8_t flags[OBS_MAX_TAGS];
-} ObservationTags;
-
-typedef struct ObservationPokerHand {
-    uint8_t visible;
-    uint32_t level;
-    int16_t chips_q8_8;
-    int16_t mult_q8_8;
-    uint32_t total_plays;
-    uint32_t round_plays;
-} ObservationPokerHand;
+typedef struct PokerHandStat {
+    uint8_t  visible;
+    uint8_t  level;
+    uint16_t total_plays;
+    uint16_t round_plays;
+    int16_t  chips_q8_8;
+    int16_t  mult_q8_8;
+} PokerHandStat;
 
 typedef struct Observation {
     ObservationGlobals globals;
-    ObservationVariants variants;
-    ObservationHand hand;
-    ObservationDeckSummary owned_deck;
-    ObservationDeckSummary draw_pile;
-    ObservationJokers jokers;
-    ObservationConsumables consumables;
-    ObservationShopMain shop;
-    ObservationShopVouchers shop_vouchers;
-    ObservationShopBoosters shop_boosters;
-    ObservationPack pack;
-    ObservationTags tags;
-    ObservationPokerHand poker_hands[HAND_COUNT];
+    DeckMatrix         deck_matrix;
+    PokerHandStat      poker_hands[HAND_COUNT];
+    uint8_t            hand_count;
+    uint8_t            joker_count;
+    uint8_t            consumable_count;
+    uint8_t            shop_count;
+    uint8_t            voucher_count;
+    uint8_t            booster_count;
+    uint8_t            pack_count;
+    uint8_t            total_tokens;
+    CardToken          tokens[MAX_OBS_TOKENS];
 } Observation;
 #pragma pack(pop)
 

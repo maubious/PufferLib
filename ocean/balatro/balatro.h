@@ -125,13 +125,12 @@ static int puffer_observe(Env *env) {
         return error;
     }
     for (int type = ACTION_SWAP_JOKERS_LEFT; type <= ACTION_SORT_HAND_SUIT; ++type) {
-        env->legal_masks.action_type[type] = 0;
         env->legal_masks.primary[type] = 0;
     }
     if (env->agents[0].action_mask) {
         memset(env->agents[0].action_mask, 0, ACTION_MASK_SIZE);
         for (int type = 0; type < ACTION_TYPE_COUNT; ++type) {
-            if (!env->legal_masks.action_type[type]) continue;
+            if (!env->legal_masks.primary[type]) continue;
             env->agents[0].action_mask[type] = 1;
             store_u64(env->agents[0].action_mask + POLICY_PRIMARY_OFFSET +
                 type * POLICY_PRIMARY_BYTES, env->legal_masks.primary[type]);
@@ -293,7 +292,7 @@ void puf_step(Env *env) {
        the forced set, sorting the selection); reject what cannot satisfy the
        mask contract. */
     if (policy.type >= ACTION_TYPE_COUNT || policy.selection_count > MAX_SELECTION ||
-        !legal->action_type[policy.type]) {
+        !legal->primary[policy.type]) {
         action_is_legal = 0;
     } else {
         int has_primary = policy.type >= ACTION_BUY_CARD &&

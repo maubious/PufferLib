@@ -319,13 +319,6 @@ static const float small_integer_log2p1[] = {
     4.0874629f,
 };
 
-typedef struct ObservationVariantBuild {
-    ObservationVariant variant;
-    uint64_t key;
-} ObservationVariantBuild;
-
-typedef ObservationDeckSummary DeckSummary;
-
 enum CenterSet {
     SET_DEFAULT = 1,
     SET_PLAYING = 1,
@@ -345,21 +338,6 @@ enum PackKind {
     PACK_SPECTRAL = 3,
     PACK_JOKER = 5
 };
-
-typedef struct PublicSnapshot {
-    ObservationVariantBuild variants[OBS_MAX_PLAYING_VARIANTS];
-    uint16_t hand_variant[OBS_MAX_HAND];
-    DeckSummary owned_deck;
-    DeckSummary draw_pile;
-    uint16_t variant_count;
-} PublicSnapshot;
-
-typedef struct ObservationZoneCounts {
-    uint16_t owned;
-    uint16_t draw;
-    uint16_t hand;
-    uint16_t discard;
-} ObservationZoneCounts;
 
 // ----------------------------------------------
 // --- keys, hashing, rng, ordering ---
@@ -873,10 +851,10 @@ static int blind_debuffs_card(const State *state, const Card *card) {
 int action_is_legal_masks(const LegalMasks *masks, const Action *action) {
     assert(masks && action);
     if (action->selection_count > MAX_SELECTION) return 0;
-    if (action->type >= ACTION_TYPE_COUNT || !masks->action_type[action->type] ||
+    if (action->type >= ACTION_TYPE_COUNT ||
         action->primary >= 64 || !(masks->primary[action->type] & (UINT64_C(1) << action->primary)))
         return 0;
-    const ObservedSelection *selection = cached_selection(masks, action->type, action->primary);
+    const SelectionContract *selection = cached_selection(masks, action->type, action->primary);
     if (!selection || !selection->valid) return action->selection_count == 0;
     if (action->selection_count < selection->minimum ||
         action->selection_count > selection->maximum)
@@ -976,32 +954,7 @@ static int consumable_no_target_legal(const State *state, uint16_t center_id) {
     }
 }
 
-static void deck_summary_add(DeckSummary *summary, const Card *card) {
-    int stone = card->enhancement == ENHANCEMENT_STONE;
-    if (!stone) {
-        if (card->rank >= 2 && card->rank <= 14) {
-            uint8_t rank = (uint8_t)(card->rank - 2);
-            summary->rank[rank]++;
-            if (card->suit < 4) summary->rank_suit[card->suit][rank]++;
-        }
-        if (card->suit < 4) summary->suit[card->suit]++;
-        summary->face_count += card->rank >= 11 && card->rank <= 13;
-        summary->numbered_count += card->rank >= 2 && card->rank <= 10;
-        summary->ace_count += card->rank == 14;
-    }
-    if (card->enhancement <= ENHANCEMENT_LUCKY) summary->enhancement[card->enhancement]++;
-    if (card->edition <= EDITION_NEGATIVE) summary->edition[card->edition]++;
-    if (card->seal <= SEAL_PURPLE) summary->seal[card->seal]++;
-    summary->stone_count += stone;
-    summary->wild_count += card->enhancement == ENHANCEMENT_WILD;
-    summary->steel_count += card->enhancement == ENHANCEMENT_STEEL;
-    summary->gold_count += card->enhancement == ENHANCEMENT_GOLD;
-    summary->glass_count += card->enhancement == ENHANCEMENT_GLASS;
-    summary->enhanced_count += card->enhancement != ENHANCEMENT_NONE;
-    summary->unmodified_count += card->enhancement == ENHANCEMENT_NONE && card->edition == EDITION_NONE &&
-                           card->seal == SEAL_NONE && card->perma_bonus == 0;
-    summary->total_count++;
-}
+
 
 
 static void joker_on_joker_effects(const State *state, uint8_t target_index, double *mult) {
@@ -1270,17 +1223,7 @@ static inline float observation_signed_log2(double value) {
     return (float)copysign(log2(1.0 + fabs(value)), value);
 }
 
-static uint64_t observation_variant_key(uint8_t rank, uint8_t suit, uint8_t enhancement,
-                                        uint8_t edition, uint8_t seal, int16_t perma_bonus,
-                                        uint8_t flags) {
-    uint64_t key = rank;
-    key = (key << 2) | suit;
-    key = (key << 4) | enhancement;
-    key = (key << 3) | edition;
-    key = (key << 3) | seal;
-    key = (key << 16) | (uint16_t)((int32_t)perma_bonus - INT16_MIN);
-    return (key << 7) | flags;
-}
+
 
 static int16_t quantize_q8_8(float value) {
     if (!(value == value)) return 0;
@@ -3523,7 +3466,6 @@ static uint64_t consumable_allowed_mask(const State *state, uint16_t center_id) 
 static void masks_add_discrete(LegalMasks *masks, Action action) {
     int primary = action.type >= ACTION_BUY_CARD && action.type <= ACTION_SWAP_HAND_RIGHT ? action.primary : 0;
     assert(action.type < ACTION_TYPE_COUNT && primary < 64);
-    masks->action_type[action.type] = 1;
     masks->primary[action.type] |= UINT64_C(1) << primary;
     if (action.type == ACTION_SWAP_HAND_LEFT && action.primary < OBS_MAX_HAND)
         masks->hand_reorder_destination[action.primary] |= UINT64_C(1) << (action.primary - 1);
@@ -3543,12 +3485,11 @@ static void legal_add_selection(LegalMasks *masks, uint8_t type, uint8_t primary
         return;
     int slot = type >= ACTION_BUY_CARD && type <= ACTION_SWAP_HAND_RIGHT ? primary : 0;
     assert(type < ACTION_TYPE_COUNT && slot < 64);
-    masks->action_type[type] = 1;
     masks->primary[type] |= UINT64_C(1) << slot;
-    ObservedSelection *selection =
-        (ObservedSelection *)cached_selection(masks, type, (uint8_t)slot);
+    SelectionContract *selection =
+        (SelectionContract *)cached_selection(masks, type, (uint8_t)slot);
     if (!selection) return;
-    *selection = (ObservedSelection){
+    *selection = (SelectionContract){
         .allowed_hand = allowed,
         .required_hand = required,
         .minimum = minimum,
@@ -3664,199 +3605,7 @@ static uint8_t public_playing_flags(const Card *card) {
     return flags;
 }
 
-
-static uint16_t find_observation_variant(const ObservationVariantBuild *variants, uint16_t count, const Card *card) {
-    uint64_t key = observation_variant_key(card->rank, card->suit, card->enhancement,
-                                           card->edition, card->seal, card->perma_bonus,
-                                           public_playing_flags(card));
-    uint16_t low = 0, high = count;
-    while (low < high) {
-        uint16_t middle = (uint16_t)(low + (high - low) / 2);
-        if (variants[middle].key < key)
-            low = (uint16_t)(middle + 1);
-        else
-            high = middle;
-    }
-    if (low < count && variants[low].key == key) return low;
-    return UINT16_MAX;
-}
-
-static void sort_observation_variants(ObservationVariantBuild *variants, uint16_t count) {
-    if (count < 2) return;
-    if (count < 32) {
-        for (uint16_t i = 1; i < count; ++i) {
-            ObservationVariantBuild value = variants[i];
-            uint64_t key = value.key;
-            uint16_t j = i;
-            while (j > 0 && variants[j - 1].key > key) {
-                variants[j] = variants[j - 1];
-                --j;
-            }
-            variants[j] = value;
-        }
-        return;
-    }
-    ObservationVariantBuild scratch[MAX_OBSERVED_CARDS];
-    radix_sort(variants, scratch, count, sizeof(*variants),
-               offsetof(ObservationVariantBuild, key), sizeof(uint64_t));
-}
-
-static inline int simple_variant_slot(const Card *card) {
-    uint8_t flags = public_playing_flags(card);
-    if (card->rank < 2 || card->rank > 14 || card->suit >= 4 ||
-        card->enhancement != ENHANCEMENT_NONE || card->edition != EDITION_NONE ||
-        card->seal != SEAL_NONE || card->perma_bonus != 0 ||
-        (flags != 0 && flags != PUBLIC_CARD_PLAYED_THIS_ANTE))
-        return -1;
-    return (((card->rank - 2) * 4 + card->suit) * 2) +
-           (flags == PUBLIC_CARD_PLAYED_THIS_ANTE);
-}
-
-static inline void snapshot_card_add(DeckSummary *summary,
-                                     ObservationZoneCounts counts[13 * 4 * 2],
-                                     ObservationVariantBuild *exceptional,
-                                     uint16_t *exceptional_count,
-                                     const Card *card, uint8_t zone, int *simple) {
-    int slot = simple_variant_slot(card);
-    if (slot < 0) {
-        *simple = 0;
-        deck_summary_add(summary, card);
-        exceptional[(*exceptional_count)++] = (ObservationVariantBuild){
-            .variant = {
-                .rank = card->rank,
-                .suit = card->suit,
-                .enhancement = card->enhancement,
-                .edition = card->edition,
-                .seal = card->seal,
-                .flags = public_playing_flags(card),
-                .perma_bonus_q8_8 = observation_q8_8(card->perma_bonus),
-                .owned_count = 1,
-                .draw_count = zone == 0,
-                .hand_count = zone == 1,
-                .discard_count = zone > 1,
-            },
-            .key = observation_variant_key(card->rank, card->suit, card->enhancement,
-                                           card->edition, card->seal, card->perma_bonus,
-                                           public_playing_flags(card)),
-        };
-        return;
-    }
-    deck_summary_add(summary, card);
-    ObservationZoneCounts *entry = &counts[slot];
-    entry->owned++;
-    if (zone == 0)
-        entry->draw++;
-    else if (zone == 1)
-        entry->hand++;
-    else
-        entry->discard++;
-}
-
-static void public_snapshot_from_state(const State *state, PublicSnapshot *snapshot) {
-    snapshot->owned_deck = (DeckSummary){0};
-    snapshot->draw_pile = (DeckSummary){0};
-    ObservationZoneCounts simple_counts[13 * 4 * 2] = {0};
-    ObservationVariantBuild exceptional[MAX_OBSERVED_CARDS];
-    uint16_t exceptional_count = 0;
-    int simple = 1;
-    const Card *zones[] = {state->deck, state->hand, state->discard};
-    const uint16_t zone_counts[] = {state->deck_count, state->hand_count, state->discard_count};
-    for (int zone = 0; zone < 3; ++zone) {
-        DeckSummary *summary = zone ? &snapshot->owned_deck : &snapshot->draw_pile;
-        for (uint16_t i = 0; i < zone_counts[zone]; ++i)
-            snapshot_card_add(summary, simple_counts, exceptional,
-                              &exceptional_count, &zones[zone][i], zone, &simple);
-        if (!zone) snapshot->owned_deck = snapshot->draw_pile;
-    }
-    if (simple) {
-        uint16_t slot_to_variant[13 * 4 * 2];
-        uint16_t count = 0;
-        for (uint16_t slot = 0; slot < 13 * 4 * 2; ++slot) {
-            const ObservationZoneCounts *counts = &simple_counts[slot];
-            if (!counts->owned) continue;
-            uint16_t card = (uint16_t)(slot / 2);
-            uint8_t rank = (uint8_t)(card / 4 + 2);
-            uint8_t suit = (uint8_t)(card % 4);
-            uint8_t flags = (slot & 1) ? PUBLIC_CARD_PLAYED_THIS_ANTE : 0;
-            ObservationVariantBuild *variant = &snapshot->variants[count];
-            *variant = (ObservationVariantBuild){
-                .variant = {
-                    .rank = rank,
-                    .suit = suit,
-                    .flags = flags,
-                    .owned_count = counts->owned,
-                    .draw_count = counts->draw,
-                    .hand_count = counts->hand,
-                    .discard_count = counts->discard,
-                },
-                .key = observation_variant_key(rank, suit, ENHANCEMENT_NONE, EDITION_NONE,
-                                               SEAL_NONE, 0, flags),
-            };
-            slot_to_variant[slot] = count++;
-        }
-        snapshot->variant_count = count;
-        for (uint8_t i = 0; i < state->hand_count; ++i)
-            snapshot->hand_variant[i] = slot_to_variant[simple_variant_slot(&state->hand[i])];
-        return;
-    }
-    sort_observation_variants(exceptional, exceptional_count);
-
-    uint16_t slot_to_variant[13 * 4 * 2];
-    uint16_t merged = 0;
-    uint16_t slot = 0;
-    uint16_t e = 0;
-    while (slot < 13 * 4 * 2 || e < exceptional_count) {
-        ObservationVariantBuild ordinary = {0};
-        int have_ordinary = 0;
-        while (slot < 13 * 4 * 2 && !simple_counts[slot].owned) ++slot;
-        if (slot < 13 * 4 * 2) {
-            const ObservationZoneCounts *counts = &simple_counts[slot];
-            uint16_t card = (uint16_t)(slot / 2);
-            uint8_t rank = (uint8_t)(card / 4 + 2);
-            uint8_t suit = (uint8_t)(card % 4);
-            uint8_t flags = (slot & 1) ? PUBLIC_CARD_PLAYED_THIS_ANTE : 0;
-            ordinary = (ObservationVariantBuild){
-                .variant = {
-                    .rank = rank,
-                    .suit = suit,
-                    .flags = flags,
-                    .owned_count = counts->owned,
-                    .draw_count = counts->draw,
-                    .hand_count = counts->hand,
-                    .discard_count = counts->discard,
-                },
-                .key = observation_variant_key(rank, suit, ENHANCEMENT_NONE, EDITION_NONE,
-                                               SEAL_NONE, 0, flags),
-            };
-            have_ordinary = 1;
-        }
-        if (have_ordinary && (e >= exceptional_count || ordinary.key <= exceptional[e].key)) {
-            snapshot->variants[merged] = ordinary;
-            slot_to_variant[slot] = merged++;
-            ++slot;
-            continue;
-        }
-        if (!have_ordinary && e >= exceptional_count) break;
-        ObservationVariantBuild *dst = &snapshot->variants[merged];
-        *dst = exceptional[e];
-        while (++e < exceptional_count && exceptional[e].key == dst->key) {
-            dst->variant.owned_count += exceptional[e].variant.owned_count;
-            dst->variant.draw_count += exceptional[e].variant.draw_count;
-            dst->variant.hand_count += exceptional[e].variant.hand_count;
-            dst->variant.discard_count += exceptional[e].variant.discard_count;
-        }
-        ++merged;
-    }
-    snapshot->variant_count = merged;
-    for (uint8_t i = 0; i < state->hand_count; ++i) {
-        int slot_index = simple_variant_slot(&state->hand[i]);
-        snapshot->hand_variant[i] = slot_index >= 0
-            ? slot_to_variant[slot_index]
-            : find_observation_variant(snapshot->variants, merged, &state->hand[i]);
-    }
-}
-
-static void observation_poker_hand(const State *state, uint8_t hand, ObservationPokerHand *out) {
+static void observation_poker_hand(const State *state, uint8_t hand, PokerHandStat *out) {
     static const float base_chips_log[HAND_COUNT] = {7.33091688f, 7.13955116f, 6.9188633f, 6.65821171f,
                                                      5.9307375f, 5.35755205f, 5.16992521f, 4.95419645f,
                                                      4.95419645f, 4.3923173f, 3.45943165f, 2.58496261f};
@@ -3866,31 +3615,24 @@ static void observation_poker_hand(const State *state, uint8_t hand, Observation
     uint32_t level = state->hand_levels[hand] ? state->hand_levels[hand] : 1;
     float chips = level == 1 ? base_chips_log[hand] : observation_signed_log2(base_chips[hand] + (double)level_chips[hand] * (level - 1));
     float mult = level == 1 ? base_mult_log[hand] : observation_signed_log2(base_mult[hand] + (double)level_mult[hand] * (level - 1));
-    *out = (ObservationPokerHand){
+    *out = (PokerHandStat){
         .visible = (uint8_t)(hand >= STRAIGHT_FLUSH || state->hand_plays[hand] != 0),
-        .level = level,
-        .chips_q8_8 = quantize_q8_8(chips),
-        .mult_q8_8 = quantize_q8_8(mult),
+        .level = level > 255 ? 255 : (uint8_t)level,
         .total_plays = state->hand_plays[hand],
         .round_plays = state->hand_plays_round[hand],
+        .chips_q8_8 = quantize_q8_8(chips),
+        .mult_q8_8 = quantize_q8_8(mult),
     };
 }
 
-static ObservationCard observation_card(const Card *card, int playing) {
-    ObservationCard out = {
-        .center_id = card->center_id,
-        .rank = card->rank,
-        .suit = card->suit,
-        .enhancement = card->enhancement,
-        .edition = card->edition,
-        .seal = card->seal,
-        .flags = playing ? public_playing_flags(card) : card->flags,
-    };
-    out.perma_bonus_q8_8 = observation_q8_8(card->perma_bonus);
-    out.cost_q8_8 = observation_q8_8(card->cost);
-    out.sell_cost_q8_8 = observation_q8_8(card->sell_cost);
-    for (int i = 0; i < 4; ++i) out.state_q8_8[i] = observation_q8_8(card->state[i]);
-    return out;
+static inline void write_card_token(CardToken *dst, const Card *card, uint8_t zone, int is_playing) {
+    dst->id = is_playing ? ((uint16_t)card->rank << 8 | (uint16_t)card->suit) : card->center_id;
+    dst->zone = zone;
+    dst->enhancement = card->enhancement;
+    dst->edition = card->edition;
+    dst->seal = card->seal;
+    dst->flags = is_playing ? public_playing_flags(card) : card->flags;
+    dst->dynamic_val = (int8_t)(card->sell_cost > 127 ? 127 : card->sell_cost < -128 ? -128 : card->sell_cost);
 }
 
 int state_layout_valid(const State *state) {
@@ -3909,66 +3651,6 @@ int observe(const State *state, Observation *out, LegalMasks *legal) {
     if (!state || !out || !legal) return ERR_ARGUMENT;
     if (!state_layout_valid(state)) return ERR_INVARIANT;
     *out = (Observation){0};
-    out->tags.count = 0;
-
-    PublicSnapshot snapshot;
-    public_snapshot_from_state(state, &snapshot);
-    for (uint16_t i = 0; i < snapshot.variant_count; ++i)
-        out->variants.values[i] = snapshot.variants[i].variant;
-    out->variants.count = snapshot.variant_count;
-    out->hand.count = state->hand_count;
-    for (uint8_t i = 0; i < state->hand_count; ++i) {
-        out->hand.values[i] = (ObservationHandCard){
-            .variant = snapshot.hand_variant[i],
-            .flags = public_playing_flags(&state->hand[i]),
-        };
-    }
-    out->owned_deck = snapshot.owned_deck;
-    out->draw_pile = snapshot.draw_pile;
-
-    ObservationCard *values[] = {
-        out->jokers.values, out->consumables.values, out->shop.values,
-        out->shop_vouchers.values, out->shop_boosters.values, out->pack.values,
-    };
-    uint16_t *counts_out[] = {
-        &out->jokers.count, &out->consumables.count, &out->shop.count,
-        &out->shop_vouchers.count, &out->shop_boosters.count, &out->pack.count,
-    };
-    const Card *cards[] = {
-        state->jokers, state->consumables, state->shop_main, state->shop_vouchers,
-        state->shop_boosters, state->pack_cards,
-    };
-    const uint8_t counts[] = {
-        state->joker_count, state->consumable_count, state->shop_main_count,
-        state->shop_voucher_count, state->shop_booster_count, state->pack_count,
-    };
-    for (int zone = 0; zone < 6; ++zone) {
-        *counts_out[zone] = counts[zone];
-        for (uint8_t i = 0; i < counts[zone]; ++i) {
-            int playing = 0;
-            if (zone == 2 || zone == 5) {
-                uint8_t set = card_set(&cards[zone][i]);
-                playing = set == SET_DEFAULT || set == SET_ENHANCED;
-            }
-            values[zone][i] = observation_card(&cards[zone][i], playing);
-        }
-    }
-
-    if (state->double_tag) {
-        uint16_t slot = out->tags.count++;
-        out->tags.tag_id[slot] = TAG_TAG_DOUBLE;
-        out->tags.flags[slot] = 1;
-    }
-    for (uint8_t blind = 0; blind < 2; ++blind)
-        if (state->blind_tags[blind] != TAG_NONE) {
-            uint16_t slot = out->tags.count++;
-            out->tags.tag_id[slot] = state->blind_tags[blind];
-            out->tags.orbital_hand[slot] = state->orbital_hands[blind];
-            out->tags.flags[slot] = (uint8_t)(1u << (blind + 1));
-        }
-
-    for (uint8_t hand = 0; hand < HAND_COUNT; ++hand)
-        observation_poker_hand(state, hand, &out->poker_hands[hand]);
 
     uint16_t next_voucher_id = 0;
     for (uint8_t i = 0; i < state->shop_voucher_count; ++i)
@@ -3977,34 +3659,82 @@ int observe(const State *state, Observation *out, LegalMasks *legal) {
             break;
         }
     double chips_over_blind = state->blind_chips ? state->chips / state->blind_chips : 0.0;
-#define OBS_GLOBAL_FIELDS(X) \
-    X(blind_id) X(next_boss_id) X(last_tarot_planet) X(phase) X(blind_on_deck) \
-    X(blind_disabled) X(hand_sort_suit) X(most_played_hand) X(last_hand_type) \
-    X(blind_skipped_mask) X(blind_only_hand) X(boss_rerolled) X(free_rerolls) \
-    X(reroll_base) X(reroll_increase) X(discount_percent) X(hands_per_round) \
-    X(discards_per_round) X(base_hand_size) X(pack_kind) X(double_tag) \
-    X(active_tag) X(tag_hand_bonus) X(tag_force_rarity) X(tag_force_rarity_count) \
-    X(tag_force_edition) X(tag_force_edition_count) X(tag_voucher_pending) \
-    X(tag_coupon_pending) X(tag_coupon_active) X(tag_investment_pending) \
-    X(tag_d_six_pending) X(tag_d_six_active) X(ecto_penalty) X(gros_michel_extinct) \
-    X(ante) X(run_hands_played) X(hands_left) X(discards_left) X(hands_played) \
-    X(discards_used) X(hand_size) X(joker_slots) X(consumable_slots) X(skips) \
-    X(pack_choices) X(unused_discards) X(blind_hands_mask) X(tarots_used) \
-    X(planet_usage_mask)
-    ObservationGlobals globals = {
+
+    uint64_t redeemed_vouchers_mask = 0;
+    size_t voucher_count = 0;
+    const uint16_t *vouchers = center_pool(SET_VOUCHER, &voucher_count);
+    for (size_t i = 0; i < voucher_count; ++i) {
+        uint16_t id = vouchers[i];
+        if ((state->used_centers[id / 8] >> (id % 8)) & 1u) {
+            if (id >= CENTER_V_ANTIMATTER && (id - CENTER_V_ANTIMATTER) < 64)
+                redeemed_vouchers_mask |= (UINT64_C(1) << (id - CENTER_V_ANTIMATTER));
+        }
+    }
+
+    out->globals = (ObservationGlobals){
         .deck_id = state->config.deck,
-        .stake = state->config.stake,
+        .blind_id = state->blind_id,
+        .next_boss_id = state->next_boss_id,
         .next_voucher_id = next_voucher_id,
-#define COPY_GLOBAL(field) .field = state->field,
-        OBS_GLOBAL_FIELDS(COPY_GLOBAL)
-#undef COPY_GLOBAL
-        .dollars_q8_8 = observation_q8_8(state->dollars),
+        .last_tarot_planet = state->last_tarot_planet,
+        .stake = state->config.stake,
+        .phase = state->phase,
+        .ante = state->ante,
+        .round = state->round,
+        .blind_on_deck = state->blind_on_deck,
+        .blind_disabled = state->blind_disabled,
+        .blind_only_hand = state->blind_only_hand,
+        .blind_skipped_mask = state->blind_skipped_mask,
+        .hand_sort_suit = state->hand_sort_suit,
+        .boss_rerolled = state->boss_rerolled,
+        .free_rerolls = state->free_rerolls,
+        .reroll_base = state->reroll_base,
+        .reroll_increase = state->reroll_increase,
+        .discount_percent = state->discount_percent,
+        .hands_per_round = state->hands_per_round,
+        .discards_per_round = state->discards_per_round,
+        .base_hand_size = state->base_hand_size,
+        .pack_kind = state->pack_kind,
+        .double_tag = state->double_tag,
+        .active_tag = state->active_tag,
+        .tag_hand_bonus = state->tag_hand_bonus,
+        .tag_force_rarity = state->tag_force_rarity,
+        .tag_force_rarity_count = state->tag_force_rarity_count,
+        .tag_force_edition = state->tag_force_edition,
+        .tag_force_edition_count = state->tag_force_edition_count,
+        .tag_voucher_pending = state->tag_voucher_pending,
+        .tag_coupon_pending = state->tag_coupon_pending,
+        .tag_coupon_active = state->tag_coupon_active,
+        .tag_investment_pending = state->tag_investment_pending,
+        .tag_d_six_pending = state->tag_d_six_pending,
+        .tag_d_six_active = state->tag_d_six_active,
+        .ecto_penalty = state->ecto_penalty,
+        .gros_michel_extinct = state->gros_michel_extinct,
+        .hand_size = state->hand_size,
+        .joker_slots = state->joker_slots,
+        .consumable_slots = state->consumable_slots,
+        .skips = state->skips,
+        .pack_choices = state->pack_choices,
+        .unused_discards = state->unused_discards,
+        .most_played_hand = state->most_played_hand,
+        .last_hand_type = state->last_hand_type,
+        .blind_tags = {state->blind_tags[0], state->blind_tags[1]},
+        .orbital_hands = {state->orbital_hands[0], state->orbital_hands[1]},
+        .hands_left = state->hands_left,
+        .discards_left = state->discards_left,
+        .hands_played = state->hands_played,
+        .discards_used = state->discards_used,
+        .blind_hands_mask = state->blind_hands_mask,
+        .tarots_used = state->tarots_used,
+        .planet_usage_mask = state->planet_usage_mask,
+        .run_hands_played = state->run_hands_played,
+        .dollars = state->dollars,
+        .reroll_cost = state->reroll_cost,
+        .round_earnings = state->round_earnings,
         .chips_q8_8 = observation_q8_8(state->chips),
         .blind_chips_q8_8 = observation_q8_8(state->blind_chips),
         .last_hand_score_q8_8 = observation_q8_8(state->last_hand_score),
         .chips_over_blind_q8_8 = observation_q8_8(chips_over_blind),
-        .reroll_cost_q8_8 = observation_q8_8(state->reroll_cost),
-        .round_earnings_q8_8 = observation_q8_8(state->round_earnings),
         .interest_cap_q8_8 = observation_q8_8(state->interest_cap),
         .interest_amount_q8_8 = observation_q8_8(state->interest_amount),
         .blind_reward_q8_8 = observation_q8_8(state->blind_reward),
@@ -4014,16 +3744,103 @@ int observe(const State *state, Observation *out, LegalMasks *legal) {
         .spectral_rate_q8_8 = quantize_q8_8(state->spectral_rate),
         .playing_card_rate_q8_8 = quantize_q8_8(state->playing_card_rate),
         .edition_rate_q8_8 = quantize_q8_8(state->edition_rate),
+        .redeemed_vouchers_mask = redeemed_vouchers_mask,
     };
-#undef OBS_GLOBAL_FIELDS
-    size_t voucher_count = 0;
-    const uint16_t *vouchers = center_pool(SET_VOUCHER, &voucher_count);
-    for (size_t i = 0; i < voucher_count; ++i) {
-        uint16_t id = vouchers[i];
-        if ((state->used_centers[id / 8] >> (id % 8)) & 1u)
-            globals.redeemed_vouchers[id / 8] |= (uint8_t)(1u << (id % 8));
+
+    // DeckMatrix population
+    for (uint16_t i = 0; i < state->deck_count; ++i) {
+        const Card *c = &state->deck[i];
+        if (c->enhancement == ENHANCEMENT_STONE) {
+            out->deck_matrix.draw_enhancements[ENHANCEMENT_STONE]++;
+        } else if (c->rank >= 2 && c->rank <= 14 && c->suit < 4) {
+            DeckSlot *s = &out->deck_matrix.grid[c->rank - 2][c->suit];
+            s->draw_count++;
+            s->enhancement_mask |= (1u << c->enhancement);
+            s->modifiers_mask |= (1u << c->edition);
+            s->modifiers_mask |= (1u << (5 + c->seal));
+            if (c->flags & CARD_DEBUFFED) s->modifiers_mask |= (1u << 10);
+        }
+        if (c->enhancement != ENHANCEMENT_NONE && c->enhancement < 9)
+            out->deck_matrix.draw_enhancements[c->enhancement]++;
     }
-    out->globals = globals;
+    for (uint8_t i = 0; i < state->hand_count; ++i) {
+        const Card *c = &state->hand[i];
+        if (c->rank >= 2 && c->rank <= 14 && c->suit < 4) {
+            DeckSlot *s = &out->deck_matrix.grid[c->rank - 2][c->suit];
+            s->hand_count++;
+            s->enhancement_mask |= (1u << c->enhancement);
+            s->modifiers_mask |= (1u << c->edition);
+            s->modifiers_mask |= (1u << (5 + c->seal));
+            if (c->flags & CARD_DEBUFFED) s->modifiers_mask |= (1u << 10);
+        }
+    }
+    for (uint16_t i = 0; i < state->discard_count; ++i) {
+        const Card *c = &state->discard[i];
+        if (c->enhancement == ENHANCEMENT_STONE) {
+            out->deck_matrix.discard_enhancements[ENHANCEMENT_STONE]++;
+        } else if (c->rank >= 2 && c->rank <= 14 && c->suit < 4) {
+            DeckSlot *s = &out->deck_matrix.grid[c->rank - 2][c->suit];
+            s->discard_count++;
+            s->enhancement_mask |= (1u << c->enhancement);
+            s->modifiers_mask |= (1u << c->edition);
+            s->modifiers_mask |= (1u << (5 + c->seal));
+            if (c->flags & CARD_DEBUFFED) s->modifiers_mask |= (1u << 10);
+        }
+        if (c->enhancement != ENHANCEMENT_NONE && c->enhancement < 9)
+            out->deck_matrix.discard_enhancements[c->enhancement]++;
+    }
+    out->deck_matrix.total_deck_size = state->deck_count + state->hand_count + state->discard_count;
+
+    // Poker hands
+    for (uint8_t hand = 0; hand < HAND_COUNT; ++hand)
+        observation_poker_hand(state, hand, &out->poker_hands[hand]);
+
+    // Tokens packing (Phase-First Floors)
+    uint8_t token_idx = 0;
+
+    // 0: Hand
+    out->hand_count = state->hand_count;
+    for (uint8_t i = 0; i < state->hand_count && token_idx < MAX_OBS_TOKENS; ++i)
+        write_card_token(&out->tokens[token_idx++], &state->hand[i], ZONE_HAND, 1);
+
+    // 1: Jokers
+    out->joker_count = state->joker_count;
+    for (uint8_t i = 0; i < state->joker_count && token_idx < MAX_OBS_TOKENS; ++i)
+        write_card_token(&out->tokens[token_idx++], &state->jokers[i], ZONE_JOKER, 0);
+
+    // 2: Consumables
+    out->consumable_count = state->consumable_count;
+    for (uint8_t i = 0; i < state->consumable_count && token_idx < MAX_OBS_TOKENS; ++i)
+        write_card_token(&out->tokens[token_idx++], &state->consumables[i], ZONE_CONSUMABLE, 0);
+
+    // 3: Shop Main
+    out->shop_count = state->shop_main_count;
+    for (uint8_t i = 0; i < state->shop_main_count && token_idx < MAX_OBS_TOKENS; ++i) {
+        uint8_t set = card_set(&state->shop_main[i]);
+        int is_playing = set == SET_DEFAULT || set == SET_ENHANCED;
+        write_card_token(&out->tokens[token_idx++], &state->shop_main[i], ZONE_SHOP_MAIN, is_playing);
+    }
+
+    // 4: Shop Vouchers
+    out->voucher_count = state->shop_voucher_count;
+    for (uint8_t i = 0; i < state->shop_voucher_count && token_idx < MAX_OBS_TOKENS; ++i)
+        write_card_token(&out->tokens[token_idx++], &state->shop_vouchers[i], ZONE_SHOP_VOUCHER, 0);
+
+    // 5: Shop Boosters
+    out->booster_count = state->shop_booster_count;
+    for (uint8_t i = 0; i < state->shop_booster_count && token_idx < MAX_OBS_TOKENS; ++i)
+        write_card_token(&out->tokens[token_idx++], &state->shop_boosters[i], ZONE_SHOP_BOOSTER, 0);
+
+    // 6: Pack Cards
+    out->pack_count = state->pack_count;
+    for (uint8_t i = 0; i < state->pack_count && token_idx < MAX_OBS_TOKENS; ++i) {
+        uint8_t set = card_set(&state->pack_cards[i]);
+        int is_playing = set == SET_PLAYING || set == SET_ENHANCED;
+        write_card_token(&out->tokens[token_idx++], &state->pack_cards[i], ZONE_PACK_CARD, is_playing);
+    }
+
+    out->total_tokens = token_idx;
+
     return legal_masks(state, legal);
 }
 
