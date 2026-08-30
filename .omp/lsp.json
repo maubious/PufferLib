@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "clangd": {
+      "command": "clangd",
+      "fileTypes": [".c", ".h"]
+    }
+  }
+}
