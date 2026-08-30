@@ -801,21 +801,17 @@ static int matador_debuff_bonus(const State *state) {
 }
 
 static int remove_selected(State *state, const Action *action, Card played[MAX_SELECTION]) {
+    uint64_t mask = 0;
+    for (uint8_t j = 0; j < action->selection_count; ++j)
+        if (action->selection[j] < state->hand_count) mask |= (1ull << action->selection[j]);
     uint8_t out_count = 0, keep_count = 0;
-    Card keep[MAX_HAND];
     for (uint8_t i = 0; i < state->hand_count; ++i) {
-        int selected = 0;
-        for (uint8_t j = 0; j < action->selection_count; ++j)
-            if (action->selection[j] == i) {
-                selected = 1;
-                break;
-            }
-        if (selected)
-            played[out_count++] = state->hand[i];
-        else
-            keep[keep_count++] = state->hand[i];
+        if (mask & (1ull << i)) {
+            if (out_count < MAX_SELECTION) played[out_count++] = state->hand[i];
+        } else {
+            state->hand[keep_count++] = state->hand[i];
+        }
     }
-    memcpy(state->hand, keep, sizeof(Card) * keep_count);
     state->hand_count = keep_count;
     return out_count;
 }
