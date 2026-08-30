@@ -31,6 +31,8 @@ extern "C" {
 #define MAX_SELECTION 5
 #define MAX_RNG_STREAMS 256
 #define ACTION_TYPE_COUNT 23
+#define MAX_OBSERVED_CARDS \
+    (OBS_MAX_PLAYING_CARDS + OBS_MAX_HAND + OBS_MAX_PLAYING_CARDS)
 
 typedef enum Error {
     OK = 0,
