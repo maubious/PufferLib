@@ -2625,27 +2625,21 @@ static int joker_repetitions(const State *state, const ScoreContext *context, co
     int repetitions = 0;
     for (size_t j = 0; j < context->source_count; ++j) {
         const Card *joker = &state->jokers[context->sources[j]];
-        switch (joker->center_id) {
-        case CENTER_J_HACK:
-            if (card->rank >= 2 && card->rank <= 5) repetitions++;
-            break;
-        case CENTER_J_SOCK_AND_BUSKIN:
-            if (is_face(card, pareidolia)) repetitions++;
-            break;
-        case CENTER_J_HANGING_CHAD: {
-            size_t first = 0;
-            while (first < 5 && !(scoring_mask & (1u << first))) first++;
-            if (card_index == first) repetitions += 2;
-            break;
-        }
-        case CENTER_J_DUSK:
-            if (state->hands_left == 0) repetitions++;
-            break;
-        case CENTER_J_SELZER:
-            repetitions++;
-            break;
-        default:
-            break;
+        const JokerSignature *sig = &JOKER_SIGNATURES[joker->center_id];
+        if (sig->retriggers) {
+            if (joker->center_id == CENTER_J_HANGING_CHAD) {
+                size_t first = 0;
+                while (first < 5 && !(scoring_mask & (1u << first))) first++;
+                if (card_index == first) repetitions += sig->retriggers;
+            } else if (sig->condition == SIG_COND_NONE) {
+                repetitions += sig->retriggers;
+            } else if (sig->condition == SIG_COND_LAST_HAND && state->hands_left == 0) {
+                repetitions += sig->retriggers;
+            } else if (sig->condition == SIG_COND_FACE && is_face(card, pareidolia)) {
+                repetitions += sig->retriggers;
+            } else if (sig->condition == SIG_COND_RANK_SET && card->rank >= 2 && card->rank <= 14 && (sig->rank_mask & (1u << (card->rank - 2)))) {
+                repetitions += sig->retriggers;
+            }
         }
     }
     return repetitions;
