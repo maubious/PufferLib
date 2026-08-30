@@ -4053,6 +4053,23 @@ static void play_or_discard(State *state, const Action *action) {
     if (!state->terminal && state->phase == PHASE_SELECTING_HAND) {
         draw_after_play(state);
         apply_drawn_to_hand_boss(state, action->type == ACTION_PLAY_HAND);
+        if (state->hand_count == 0) {
+            int saved = 0;
+            for (uint8_t j = 0; j < state->joker_count; ++j)
+                if (!(state->jokers[j].flags & CARD_DEBUFFED) && state->jokers[j].center_id == CENTER_J_MR_BONES &&
+                    state->chips / state->blind_chips >= 0.25) {
+                    remove_joker_at(state, j);
+                    saved = 1;
+                    break;
+                }
+            if (saved) {
+                state->blind_reward = 0;
+                finish_blind(state);
+            } else {
+                state->terminal = 1;
+                state->phase = PHASE_GAME_OVER;
+            }
+        }
     }
 }
 

@@ -736,20 +736,21 @@ __global__ void sample_logits(
             float logsumexp = max_l + __logf(sum);
             float rand_val = curand_uniform(&state);
             float cumsum = 0.0f;
-            int sampled = A0 - 1;
+            int sampled = -1;
             for (int a = 0; a < A0; ++a) {
                 if (mask_byte(action_mask, mask_base, a) == 0) continue;
                 cumsum += expf(cache0[a] - logsumexp);
                 if (rand_val < cumsum) { sampled = a; break; }
             }
-            if (rand_val >= cumsum) {
-                for (int a = A0 - 1; a >= 0; --a) {
+            if (sampled < 0) {
+                for (int a = 0; a < A0; ++a) {
                     if (mask_byte(action_mask, mask_base, a) != 0) {
                         sampled = a;
                         break;
                     }
                 }
             }
+            if (sampled < 0) sampled = 0;
             actions[action_base] = from_float((float)sampled);
             total_log_prob += cache0[sampled] - logsumexp;
             logits_offset += A0;
@@ -760,12 +761,27 @@ __global__ void sample_logits(
             int A1 = act_sizes[1];
             actions[action_base + 1] = from_float(0.0f);
             if (ar_head_active(&ar, 1)) {
+                #ifdef BALATRO_POINTER_DECODER
+                constexpr int A1_LOCAL = POLICY_PRIMARY_COUNT;
+                float cache1[A1_LOCAL];
+                int primary_slice = policy_primary_head_offset(ar.type);
+                assert(primary_slice >= 0);
+                int primary_offset = primary_slice * POLICY_PRIMARY_COUNT;
+                #else
                 float cache1[PPO_MAX_HEAD_A];
+                int primary_offset = 0;
+                int A1_LOCAL = A1;
+                #endif
                 float max_l = -INFINITY, sum = 0.0f;
-                for (int a = 0; a < A1; ++a) {
+                for (int a = 0; a < A1_LOCAL; ++a) {
+                    int physical = primary_offset + a;
                     float l = ar_option_legal(&ar, action_mask, mask_base, 1, a)
-                        ? to_float(logits[logits_base + logits_offset + a]) +
+                        ? to_float(logits[logits_base + logits_offset + physical]) +
+                            #ifdef BALATRO_POINTER_DECODER
+                            0.0f
+                            #else
                             ar_cond_bias(&ar, condition, 1, a)
+                            #endif
                         : -1e4f;
                     cache1[a] = l;
                     if (l > max_l) { sum *= __expf(max_l - l); max_l = l; }
@@ -774,20 +790,21 @@ __global__ void sample_logits(
                 float logsumexp = max_l + __logf(sum);
                 float rand_val = curand_uniform(&state);
                 float cumsum = 0.0f;
-                int sampled = A1 - 1;
-                for (int a = 0; a < A1; ++a) {
+                int sampled = -1;
+                for (int a = 0; a < A1_LOCAL; ++a) {
                     if (!ar_option_legal(&ar, action_mask, mask_base, 1, a)) continue;
                     cumsum += expf(cache1[a] - logsumexp);
                     if (rand_val < cumsum) { sampled = a; break; }
                 }
-                if (rand_val >= cumsum) {
-                    for (int a = A1 - 1; a >= 0; --a) {
+                if (sampled < 0) {
+                    for (int a = 0; a < A1_LOCAL; ++a) {
                         if (ar_option_legal(&ar, action_mask, mask_base, 1, a)) {
                             sampled = a;
                             break;
                         }
                     }
                 }
+                if (sampled < 0) sampled = 0;
                 actions[action_base + 1] = from_float((float)sampled);
                 total_log_prob += cache1[sampled] - logsumexp;
             }
@@ -813,20 +830,21 @@ __global__ void sample_logits(
                 float logsumexp = max_l + __logf(sum);
                 float rand_val = curand_uniform(&state);
                 float cumsum = 0.0f;
-                int sampled = A2 - 1;
+                int sampled = -1;
                 for (int a = 0; a < A2; ++a) {
                     if (!ar_option_legal(&ar, action_mask, mask_base, 2, a)) continue;
                     cumsum += expf(cache2[a] - logsumexp);
                     if (rand_val < cumsum) { sampled = a; break; }
                 }
-                if (rand_val >= cumsum) {
-                    for (int a = A2 - 1; a >= 0; --a) {
+                if (sampled < 0) {
+                    for (int a = 0; a < A2; ++a) {
                         if (ar_option_legal(&ar, action_mask, mask_base, 2, a)) {
                             sampled = a;
                             break;
                         }
                     }
                 }
+                if (sampled < 0) sampled = 0;
                 actions[action_base + 2] = from_float((float)sampled);
                 total_log_prob += cache2[sampled] - logsumexp;
             }
@@ -855,24 +873,25 @@ __global__ void sample_logits(
             float logsumexp = max_l + __logf(sum);
             float rand_val = curand_uniform(&state);
             float cumsum = 0.0f;
-            int sampled = A - 1;
+            int sampled = -1;
             for (int a = 0; a < A; ++a) {
                 if (!ar_option_legal(&ar, action_mask, mask_base, h, a)) continue;
                 cumsum += expf(cache[a] - logsumexp);
                 if (rand_val < cumsum) { sampled = a; break; }
             }
-            if (rand_val >= cumsum) {
-                for (int a = A - 1; a >= 0; --a) {
+            if (sampled < 0) {
+                for (int a = 0; a < A; ++a) {
                     if (ar_option_legal(&ar, action_mask, mask_base, h, a)) {
                         sampled = a;
                         break;
                     }
                 }
             }
+            if (sampled < 0) sampled = 0;
             actions[action_base + h] = from_float((float)sampled);
             total_log_prob += cache[sampled] - logsumexp;
             logits_offset += A;
-            ar_ctx_advance(&ar, actions, action_base);
+            ar_ctx_advance(&ar, actions, action_base, condition);
         }
 #else
         for (int h = 0; h < num_atns; h++) {
@@ -2344,10 +2363,11 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     pufferl->is_continuous = is_continuous;
     vec->num_policies = num_policies;
     vec->policy_layout = (int*)calloc(1, (vec->num_policies + 1) * sizeof(int));
+#ifdef POLICY_MASK_SIZE
+    vec->mask_size = POLICY_MASK_SIZE;
+#else
     int mask_size = dict_get(&vec_kwargs, "action_mask_size");
     vec->mask_size = mask_size > 0 ? mask_size : act_n;
-#ifdef POLICY_MASK_SIZE
-    assert(vec->mask_size == POLICY_MASK_SIZE);
 #endif
 
     // Device env IO (EnvBuf).
@@ -2373,13 +2393,6 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 
     env_setup(pufferl, vec, &vec_kwargs, env_kwargs);
     pufferl->vec = vec;
-
-#ifdef PUFFER_BALATRO
-    // Max-pooled dominant-entity features in the balatro encoder
-    // (env.max_pool; 0 = sums only). Must be set before any forward.
-    DictItem* max_pool = dict_find(env_kwargs, "max_pool");
-    ba_set_use_max_pool(max_pool ? (max_pool->value != 0.0) : 0);
-#endif
 
     // Best-trajectory state curriculum. Gated on config (num_start_states>0
     // plus a nonzero fresh/CL share) and env support (PUFFER_CURRICULUM).
