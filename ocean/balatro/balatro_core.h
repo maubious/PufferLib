@@ -124,6 +124,27 @@ typedef enum CardSet {
     SET_BOOSTER = 8,
 } CardSet;
 
+typedef struct CenterDefinition {
+    uint16_t id;
+    uint8_t set;
+    uint8_t rarity;
+    int16_t cost;
+    float weight;
+    uint8_t base_available;
+    uint8_t kind;
+    uint8_t pack_extra;
+    uint8_t pack_choose;
+    uint16_t requires;
+    float extra;
+    uint8_t target_effect;
+    uint8_t target_value;
+    uint8_t target_max;
+    uint8_t target_min;
+    uint8_t voucher_effect;
+} CenterDefinition;
+
+extern const CenterDefinition centers[CENTER_COUNT];
+
 typedef enum CardFlag {
     CARD_DEBUFFED = 1u << 0,
     CARD_ETERNAL = 1u << 1,
@@ -506,9 +527,13 @@ typedef struct StepResult {
 void default_config(Config *config);
 int init(State *state, const Config *config, uint64_t seed);
 int apply_step(State *state, const Action *action, const LegalMasks *masks, StepResult *out);
+int can_afford(const State *state, int32_t cost);
 
 int observe(const State *state, Observation *out, LegalMasks *legal);
 uint64_t state_hash(const State *state);
+HandType classify_hand(const Card *cards, size_t count, uint8_t *scoring_mask,
+    int four_fingers, int shortcut, int smeared);
+void hand_base_stats(HandType hand, int level, int *out_chips, int *out_mult);
 
 #ifdef __cplusplus
 }

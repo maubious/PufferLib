@@ -49,6 +49,14 @@ static Action first_action(const LegalMasks *masks) {
 }
 
 int main(void) {
+    State credit_state = {0};
+    credit_state.jokers[0] = (Card){.center_id = CENTER_J_CREDIT_CARD};
+    credit_state.joker_count = 1;
+    assert(can_afford(&credit_state, 20));
+    assert(!can_afford(&credit_state, 21));
+    credit_state.jokers[0].flags = CARD_DEBUFFED;
+    assert(!can_afford(&credit_state, 1));
+
     Env env = {0};
     Dict kwargs = {0};
     unsigned char observation[OBS_SIZE];
@@ -61,6 +69,8 @@ int main(void) {
     timeout->value = 1.0;
     DictItem *potential = dict_item(&kwargs, "potential_scale");
     potential->value = 255.0;
+    DictItem *reorder = dict_item(&kwargs, "reorder_actions");
+    reorder->value = 1.0;
     env.agents[0].observations = observation;
     env.agents[0].actions = actions;
     env.agents[0].rewards = &reward;
@@ -68,16 +78,30 @@ int main(void) {
     env.agents[0].action_mask = action_mask;
     puf_init(&env, &kwargs);
     assert(env.config.potential_scale == 255);
+    assert(env.reorder_actions == 1);
     puf_reset(&env);
-    assert(env.legal_masks.primary[ACTION_SWAP_HAND_LEFT] == 0);
-    assert(env.legal_masks.primary[ACTION_SWAP_HAND_RIGHT] == 0);
-    assert(env.legal_masks.primary[ACTION_SORT_HAND_RANK] == 0);
-    assert(env.legal_masks.primary[ACTION_SORT_HAND_SUIT] == 0);
-    assert(env.legal_masks.primary[ACTION_SWAP_JOKERS_LEFT] == 0);
-    assert(env.legal_masks.primary[ACTION_SWAP_JOKERS_RIGHT] == 0);
     assert(action_mask[ACTION_SELECT_BLIND] == 1);
     assert(mask_u64(action_mask, POLICY_PRIMARY_OFFSET +
         ACTION_SELECT_BLIND * POLICY_PRIMARY_BYTES) == 1);
+
+    Action select_action = {.type = ACTION_SELECT_BLIND};
+    StepResult select_result = {0};
+    assert(apply_step(&env.state, &select_action, &env.legal_masks, &select_result) == OK);
+    assert(puffer_observe(&env) == OK);
+    assert(env.legal_masks.primary[ACTION_SWAP_HAND_LEFT]);
+    assert(env.legal_masks.primary[ACTION_SWAP_HAND_RIGHT]);
+    assert(env.legal_masks.primary[ACTION_SORT_HAND_RANK] == 1);
+    assert(env.legal_masks.primary[ACTION_SORT_HAND_SUIT] == 1);
+    assert(action_mask[ACTION_SWAP_HAND_LEFT] == 1);
+    assert(action_mask[ACTION_SORT_HAND_RANK] == 1);
+    env.reorder_actions = 0;
+    assert(puffer_observe(&env) == OK);
+    assert(env.legal_masks.primary[ACTION_SWAP_HAND_LEFT]);
+    assert(env.legal_masks.primary[ACTION_SORT_HAND_RANK] == 1);
+    assert(action_mask[ACTION_SWAP_HAND_LEFT] == 0);
+    assert(action_mask[ACTION_SORT_HAND_RANK] == 0);
+    env.reorder_actions = 1;
+    puf_reset(&env);
 
     /* A one-step limit must truncate a nonterminal initial blind-select step. */
     Action timeout_action = {.type = ACTION_SELECT_BLIND};

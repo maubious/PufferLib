@@ -57,25 +57,6 @@ typedef enum VoucherEffect {
     VOUCHER_ANTE_DISCARDS
 } VoucherEffect;
 
-typedef struct CenterDefinition {
-    uint16_t id;
-    uint8_t set;
-    uint8_t rarity;
-    int16_t cost;
-    float weight;
-    uint8_t base_available;
-    uint8_t kind;
-    uint8_t pack_extra;
-    uint8_t pack_choose;
-    uint16_t requires;
-    float extra;
-    uint8_t target_effect;
-    uint8_t target_value;
-    uint8_t target_max;
-    uint8_t target_min;
-    uint8_t voucher_effect;
-} CenterDefinition;
-
 typedef struct ScoreResult {
     uint8_t hand_type;
     uint8_t scoring_mask;
@@ -970,6 +951,17 @@ HandType classify_hand(const Card *cards, size_t count, uint8_t *scoring_mask,
     while (high && !rank_masks[high]) high--;
     if (high) *scoring_mask = rank_masks[high] & (uint8_t)(-(int8_t)rank_masks[high]);
     return HIGH_CARD;
+}
+
+void hand_base_stats(HandType hand, int level, int *out_chips, int *out_mult) {
+    if (hand < 0 || hand >= HAND_COUNT) {
+        if (out_chips) *out_chips = 0;
+        if (out_mult) *out_mult = 0;
+        return;
+    }
+    uint8_t lvl = level > 0 ? (uint8_t)level : 1;
+    if (out_chips) *out_chips = base_chips[hand] + level_chips[hand] * (lvl - 1);
+    if (out_mult) *out_mult = base_mult[hand] + level_mult[hand] * (lvl - 1);
 }
 
 static int joker_cache_bit(uint16_t center_id) {

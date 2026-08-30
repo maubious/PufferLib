@@ -3602,7 +3602,10 @@ static PuffeRL* eval_make(Ini* ini, TrainContext* ctx, int mode) {
     int render = mode == EVAL_RENDER;
     int match = mode == EVAL_MATCH;
     long eval_agents = puf_ini_get(ini, "base", "eval_agents");
-    if (!render && eval_agents != -1) {
+    if (render) {
+        puf_ini_put(ini, "vec.total_agents", "1");
+        puf_ini_put(ini, "vec.num_buffers", "1");
+    } else if (eval_agents != -1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "%ld", eval_agents);
         puf_ini_put(ini, "vec.total_agents", buf);
@@ -4072,11 +4075,14 @@ int main(int argc, char** argv) {
     } else if (strcmp(mode, "sweep") == 0) {
         run_sweep(&ini, argv[0]);
     } else if (strcmp(mode, "eval") == 0) {
-        run_eval(&ini, &ctx, EVAL_SCORE, 1);
+        long render = puf_ini_get(&ini, "base", "render");
+        run_eval(&ini, &ctx, render ? EVAL_RENDER : EVAL_SCORE, 1);
+    } else if (strcmp(mode, "render") == 0) {
+        run_eval(&ini, &ctx, EVAL_RENDER, 1);
     } else if (strcmp(mode, "match") == 0) {
         run_eval(&ini, &ctx, EVAL_MATCH, 1);
     } else {
-        assert(0 && "unknown mode (train|eval|match|sweep)");
+        assert(0 && "unknown mode (train|eval|match|sweep|render)");
     }
 
     puf_ini_free(&ini);

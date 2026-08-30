@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "raylib.h"
 #include "pufferenv.h"
 #include "balatro_core.h"
 #include "policy.h"
@@ -25,6 +26,47 @@
 #define TIMEOUT_REWARD (-1.0f)
 
 typedef unsigned char obs_t;
+
+typedef struct ScoreAnim {
+    bool pending;
+    bool active;
+    float t;
+    float duration;
+    Card played[MAX_SELECTION];
+    int played_count;
+    HandType hand_type;
+    int level;
+    int base_chips;
+    int base_mult;
+    double total;
+    double chips_before;
+    double blind_target;
+    bool blind_beaten;
+    bool bust;
+} ScoreAnim;
+
+typedef struct Client {
+    int width;
+    int height;
+    bool auto_play;
+    int auto_play_timer;
+    int selected_count;
+    uint8_t selected_indices[MAX_SELECTION];
+
+    bool show_tooltip;
+    char tooltip_title[64];
+    char tooltip_type[64];
+    char tooltip_desc[160];
+    char tooltip_stats[64];
+    Vector2 tooltip_pos;
+    Texture2D puffer;
+
+    bool paused;
+    bool show_run_menu;
+    int step_delay_frames;
+    int step_cooldown;
+    ScoreAnim score_anim;
+} Client;
 
 typedef struct Log {
 	float score;
@@ -87,6 +129,8 @@ typedef struct Env {
     float invalid_action_reward;
     uint8_t deck_config;
     uint8_t stake_config;
+    uint8_t reorder_actions;
+    Client *client;
 } Env;
 
 static inline void log_episode_end(Env *env, int won) {
@@ -127,12 +171,12 @@ static int puffer_observe(Env *env) {
         memset(out, 0, OBS_SIZE * sizeof(*out));
         return error;
     }
-    for (int type = ACTION_SWAP_JOKERS_LEFT; type <= ACTION_SORT_HAND_SUIT; ++type) {
-        env->legal_masks.primary[type] = 0;
-    }
     if (env->agents[0].action_mask) {
         memset(env->agents[0].action_mask, 0, ACTION_MASK_SIZE);
         for (int type = 0; type < ACTION_TYPE_COUNT; ++type) {
+            if (!env->reorder_actions && type >= ACTION_SWAP_JOKERS_LEFT &&
+                type <= ACTION_SORT_HAND_SUIT)
+                continue;
             if (!env->legal_masks.primary[type]) continue;
             env->agents[0].action_mask[type] = 1;
             store_u64(env->agents[0].action_mask + POLICY_PRIMARY_OFFSET +
@@ -260,6 +304,7 @@ void puf_init(Env *env, Dict *kwargs) {
     DictItem *invalid_action_reward = dict_find(kwargs, "invalid_action_reward");
     DictItem *fast_rng = dict_find(kwargs, "fast_rng");
     DictItem *potential_scale = dict_find(kwargs, "potential_scale");
+    DictItem *reorder_actions = dict_find(kwargs, "reorder_actions");
 #define FLOAT_REWARD_OPT(name, field, cmp) do { \
     DictItem *item = dict_find(kwargs, name); \
     if (item) { assert(item->value cmp 0.0); env->config.field = (float)item->value; } \
@@ -271,6 +316,7 @@ void puf_init(Env *env, Dict *kwargs) {
     FLOAT_REWARD_OPT("loss_penalty", loss_penalty, >=);
 #undef FLOAT_REWARD_OPT
     env->config.shaped_reward = shaped ? (shaped->value != 0.0) : 1;
+    env->reorder_actions = reorder_actions && reorder_actions->value != 0.0;
     env->config.potential_scale = 0;
     if (potential_scale) {
         assert(potential_scale->value >= 0.0 && potential_scale->value <= UINT8_MAX);
@@ -365,7 +411,22 @@ static void truncate_episode(Env *env) {
     env->agents[0].terminals[0] = 1.0f;
 }
 
+static void score_anim_capture(Client *client, const State *state, const Action *action);
+static void score_anim_start(Client *client, const State *state);
+
 void puf_step(Env *env) {
+    if (env->client && env->client->score_anim.active) {
+        env->agents[0].rewards[0] = 0.0f;
+        env->agents[0].terminals[0] = 0.0f;
+        return;
+    }
+    if (env->client && env->client->step_cooldown > 0) {
+        env->client->step_cooldown--;
+        env->agents[0].rewards[0] = 0.0f;
+        env->agents[0].terminals[0] = 0.0f;
+        return;
+    }
+
     Action policy = {0};
     policy.type = (uint8_t)env->agents[0].actions[0];
     policy.primary = (uint8_t)env->agents[0].actions[1];
@@ -439,10 +500,19 @@ void puf_step(Env *env) {
     if (env->episode_steps < UINT32_MAX) env->episode_steps++;
     if (policy.type < ACTION_TYPE_COUNT)
         env->log.action_counts[policy.type] += 1.0f;
+    if (action_is_legal && policy.type == ACTION_PLAY_HAND && env->client) {
+        score_anim_capture(env->client, &env->state, &policy);
+    }
     StepResult result = {0};
     int error = action_is_legal
         ? apply_step(&env->state, &policy, &env->legal_masks, &result)
         : ERR_ACTION;
+    if (error == OK && policy.type == ACTION_PLAY_HAND && env->client) {
+        score_anim_start(env->client, &env->state);
+    }
+    if (error == OK && env->client) {
+        env->client->step_cooldown = env->client->step_delay_frames;
+    }
     if (error != OK) {
         env->log.invalid_actions += 1.0f;
         env->agents[0].rewards[0] = env->invalid_action_reward;
@@ -481,8 +551,18 @@ void puf_step(Env *env) {
     }
 }
 
-void puf_render(Env *env) { (void)env; }
-void puf_close(Env *env) { (void)env; }
+#include "balatro_render.h"
+
+void puf_render(Env *env) {
+    balatro_render(env);
+}
+
+void puf_close(Env *env) {
+    if (env && env->client) {
+        close_client(env->client);
+        env->client = NULL;
+    }
+}
 
 void puf_log(Log *log, Dict *out) {
     dict_set(out, "score", log->score);
