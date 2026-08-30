@@ -909,42 +909,23 @@ HandType classify_hand(const Card *cards, size_t count, uint8_t *scoring_mask,
                 flush_mask |= (uint8_t)(1u << i);
         }
     uint8_t straight_mask = 0;
-    for (int high = 14; high >= need && !straight_mask; --high) {
+    int max_gap = shortcut ? 2 : 1;
+    for (int start = 14; start >= need; --start) {
+        int length = 0, last = start + 1;
         uint8_t mask = 0;
-        int d = 0;
-        while (d < need && rank_masks[high - d]) mask |= rank_masks[high - d++];
-        if (d == need) straight_mask = mask;
-    }
-    if (!straight_mask && rank_masks[14]) {
-        uint8_t wheel_mask = rank_masks[14];
-        int wheel_ok = 1;
-        for (int rank = 2; rank <= need; ++rank) {
-            if (!rank_masks[rank]) wheel_ok = 0;
-            wheel_mask |= rank_masks[rank];
-        }
-        if (wheel_ok) straight_mask = wheel_mask;
-    }
-    if (!straight_mask && shortcut) {
-        static const uint8_t order[] = {14, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
-        int length = 0, last = -3;
-        uint8_t mask = 0;
-        for (int position = 0; position < (int)sizeof(order); ++position) {
-            uint8_t rank = order[position];
-            if (!rank_masks[rank]) continue;
-            if (length && position - last > 2) {
-                length = 0;
-                mask = 0;
-            }
-            if (!(mask & rank_masks[rank])) {
-                mask |= rank_masks[rank];
-                length++;
-            }
-            last = position;
+        for (int r = start; r >= 1; --r) {
+            uint8_t r_mask = (r == 1) ? rank_masks[14] : rank_masks[r];
+            if (!r_mask) continue;
+            if (last - r > max_gap) break;
+            mask |= r_mask;
+            length++;
+            last = r;
             if (length >= need) {
                 straight_mask = mask;
                 break;
             }
         }
+        if (straight_mask) break;
     }
     int five = 0, four = 0, three = 0, pair1 = 0, pair2 = 0;
     for (int rank = 14; rank >= 2; --rank) {
