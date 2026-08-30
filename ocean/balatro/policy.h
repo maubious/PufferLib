@@ -1,7 +1,7 @@
 #ifndef PUFFER_POLICY_H
 #define PUFFER_POLICY_H
 
-#include <balatro_core.h>
+#include "balatro_core.h"
 
 #define POLICY_PRIMARY_COUNT 64
 #define POLICY_PRIMARY_BYTES 8
@@ -13,7 +13,6 @@
     (POLICY_PRIMARY_OFFSET + POLICY_PRIMARY_BYTES * ACTION_TYPE_COUNT)
 #define POLICY_SELECTION_SIZE \
     (POLICY_SELECTION_OFFSET + POLICY_SELECTION_ENTRIES * POLICY_SELECTION_BYTES)
-#define POLICY_MASK_SIZE POLICY_SELECTION_SIZE
 /* Per-option card attributes for the AR selection heads: one byte per hand
    slot, (suit << 4) | rank, written by the env from the live hand. Lets the
    decoder condition selection scores on the set's suit/rank structure
@@ -22,7 +21,6 @@
 #define POLICY_CARD_ATTR_BYTES 64
 #define POLICY_CARD_ATTR_SUIT_SHIFT 4
 #define POLICY_CARD_ATTR_RANK_MASK 0x0F
-#undef POLICY_MASK_SIZE
 #define POLICY_MASK_SIZE \
     (POLICY_CARD_ATTR_OFFSET + POLICY_CARD_ATTR_BYTES)
 

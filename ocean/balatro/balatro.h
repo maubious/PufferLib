@@ -7,12 +7,13 @@
    (src/curriculum.cu is compiled in when this is defined). */
 #define PUFFER_CURRICULUM
 
+#include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "pufferenv.h"
-#include <balatro_core.h>
+#include "balatro_core.h"
 #include "policy.h"
 
 #define OBS_SIZE ((int)sizeof(Observation))
@@ -85,33 +86,18 @@ typedef struct Env {
     float invalid_action_reward;
 } Env;
 
-static inline float hand_level_sum(const State *state) {
-    float levels = 0.0f;
-    for (int i = 0; i < HAND_COUNT; ++i) levels += (float)state->hand_levels[i];
-    return levels;
-}
-
 static inline void log_episode_end(Env *env, int won) {
     const State *state = &env->state;
     env->log.end_dollars += (float)state->dollars;
     if (won) env->log.end_dollars_won += (float)state->dollars;
     env->log.end_jokers += (float)state->joker_count;
     env->log.end_consumables += (float)state->consumable_count;
-    env->log.end_hand_levels += hand_level_sum(state);
+    float hand_levels = 0.0f;
+    for (int i = 0; i < HAND_COUNT; ++i)
+        hand_levels += (float)state->hand_levels[i];
+    env->log.end_hand_levels += hand_levels;
     env->log.end_deck += (float)state->deck_count;
     env->log.ep_length += (float)env->episode_steps;
-}
-
-static inline void disable_move_actions(LegalMasks *legal) {
-    static const int move_actions[] = {
-        ACTION_SWAP_HAND_LEFT, ACTION_SWAP_HAND_RIGHT,
-        ACTION_SORT_HAND_RANK, ACTION_SORT_HAND_SUIT,
-        ACTION_SWAP_JOKERS_LEFT, ACTION_SWAP_JOKERS_RIGHT,
-    };
-    for (unsigned int i = 0; i < sizeof(move_actions) / sizeof(move_actions[0]); ++i) {
-        legal->action_type[move_actions[i]] = 0;
-        legal->primary[move_actions[i]] = 0;
-    }
 }
 
 static inline void store_u64(unsigned char *out, uint64_t value) {
@@ -121,7 +107,8 @@ static inline void store_u64(unsigned char *out, uint64_t value) {
 static inline void store_selection(
         unsigned char *mask, int entry,
         const ObservedSelection *selection) {
-    if (!selection || !selection->valid || entry < 0) return;
+    assert(selection && entry >= 0);
+    if (!selection->valid) return;
     unsigned char *out = mask + POLICY_SELECTION_OFFSET +
         entry * POLICY_SELECTION_BYTES;
     out[0] = selection->minimum;
@@ -130,59 +117,54 @@ static inline void store_selection(
     store_u64(out + 10, selection->required_hand);
 }
 
-static void puffer_mask(const LegalMasks *legal, unsigned char *mask,
-        const State *state) {
-    memset(mask, 0, ACTION_MASK_SIZE);
-
-    for (int type = 0; type < ACTION_TYPE_COUNT; ++type) {
-        if (!legal->action_type[type]) continue;
-        mask[type] = 1;
-        store_u64(mask + POLICY_PRIMARY_OFFSET +
-            type * POLICY_PRIMARY_BYTES, legal->primary[type]);
-    }
-
-    /* Per-option card attrs for the AR selection heads: (suit << 4) | rank per
-       hand slot. Zero past hand_count; options are masked illegal there. */
-    int attr_n = state->hand_count < POLICY_CARD_ATTR_BYTES
-        ? state->hand_count : POLICY_CARD_ATTR_BYTES;
-    for (int i = 0; i < attr_n; ++i) {
-        mask[POLICY_CARD_ATTR_OFFSET + i] =
-            (unsigned char)((state->hand[i].suit << POLICY_CARD_ATTR_SUIT_SHIFT)
-                | (state->hand[i].rank & POLICY_CARD_ATTR_RANK_MASK));
-    }
-
-    store_selection(mask,
-        policy_selection_entry(ACTION_PLAY_HAND, 0),
-        &legal->play);
-    store_selection(mask,
-        policy_selection_entry(ACTION_DISCARD, 0),
-        &legal->discard);
-    for (int i = 0; i < OBS_MAX_CONSUMABLES; ++i)
-        store_selection(mask,
-            policy_selection_entry(ACTION_USE_CONSUMABLE, i),
-            &legal->consumable[i]);
-    for (int i = 0; i < OBS_MAX_SHOP_MAIN; ++i)
-        store_selection(mask,
-            policy_selection_entry(ACTION_BUY_AND_USE, i),
-            &legal->shop[i]);
-    for (int i = 0; i < OBS_MAX_PACK_CARDS; ++i)
-        store_selection(mask,
-            policy_selection_entry(ACTION_PICK_PACK_CARD, i),
-            &legal->pack[i]);
-}
-
 static int puffer_observe(Env *env) {
     obs_t *out = (obs_t *)env->agents[0].observations;
     int error = observe(&env->state, (Observation *)out, &env->legal_masks);
-    if (error == OK) {
-        disable_move_actions(&env->legal_masks);
-        if (env->agents[0].action_mask)
-            puffer_mask(&env->legal_masks, env->agents[0].action_mask,
-                &env->state);
-    } else {
+    if (error != OK) {
         memset(out, 0, OBS_SIZE * sizeof(*out));
+        return error;
     }
-    return error;
+    for (int type = ACTION_SWAP_JOKERS_LEFT; type <= ACTION_SORT_HAND_SUIT; ++type) {
+        env->legal_masks.action_type[type] = 0;
+        env->legal_masks.primary[type] = 0;
+    }
+    if (env->agents[0].action_mask) {
+        memset(env->agents[0].action_mask, 0, ACTION_MASK_SIZE);
+        for (int type = 0; type < ACTION_TYPE_COUNT; ++type) {
+            if (!env->legal_masks.action_type[type]) continue;
+            env->agents[0].action_mask[type] = 1;
+            store_u64(env->agents[0].action_mask + POLICY_PRIMARY_OFFSET +
+                type * POLICY_PRIMARY_BYTES, env->legal_masks.primary[type]);
+        }
+        /* Per-option card attrs for the AR selection heads: (suit << 4) | rank per
+           hand slot. Zero past hand_count; options are masked illegal there. */
+        int attr_n = env->state.hand_count < POLICY_CARD_ATTR_BYTES
+            ? env->state.hand_count : POLICY_CARD_ATTR_BYTES;
+        for (int i = 0; i < attr_n; ++i) {
+            env->agents[0].action_mask[POLICY_CARD_ATTR_OFFSET + i] =
+                (unsigned char)((env->state.hand[i].suit << POLICY_CARD_ATTR_SUIT_SHIFT)
+                    | (env->state.hand[i].rank & POLICY_CARD_ATTR_RANK_MASK));
+        }
+        store_selection(env->agents[0].action_mask,
+            policy_selection_entry(ACTION_PLAY_HAND, 0),
+            &env->legal_masks.play);
+        store_selection(env->agents[0].action_mask,
+            policy_selection_entry(ACTION_DISCARD, 0),
+            &env->legal_masks.discard);
+        for (int i = 0; i < OBS_MAX_CONSUMABLES; ++i)
+            store_selection(env->agents[0].action_mask,
+                policy_selection_entry(ACTION_USE_CONSUMABLE, i),
+                &env->legal_masks.consumable[i]);
+        for (int i = 0; i < OBS_MAX_SHOP_MAIN; ++i)
+            store_selection(env->agents[0].action_mask,
+                policy_selection_entry(ACTION_BUY_AND_USE, i),
+                &env->legal_masks.shop[i]);
+        for (int i = 0; i < OBS_MAX_PACK_CARDS; ++i)
+            store_selection(env->agents[0].action_mask,
+                policy_selection_entry(ACTION_PICK_PACK_CARD, i),
+                &env->legal_masks.pack[i]);
+    }
+    return OK;
 }
 
 /* State-curriculum restore hook (src/curriculum.cu): rebuild the observation
@@ -208,90 +190,6 @@ static inline const ObservedSelection *cached_selection(
     return NULL;
 }
 
-static inline int cached_action_is_legal(const Env *env,
-        const Action *policy) {
-    if (!policy || policy->type >= ACTION_TYPE_COUNT ||
-        policy->selection_count > MAX_SELECTION)
-        return 0;
-    uint8_t type = policy->type;
-    uint8_t primary = (uint8_t)policy->primary;
-    int has_primary = type >= ACTION_BUY_CARD &&
-                      type <= ACTION_SWAP_HAND_RIGHT;
-    if (!has_primary && primary != 0) return 0;
-    uint8_t observed_primary = has_primary ? primary : 0;
-    const LegalMasks *legal = &env->legal_masks;
-    if (!legal->action_type[type] || observed_primary >= 64 ||
-        !(legal->primary[type] & (UINT64_C(1) << observed_primary)))
-        return 0;
-
-    const ObservedSelection *selection =
-        cached_selection(legal, type, observed_primary);
-    if (!selection || !selection->valid)
-        return policy->selection_count == 0;
-    if (policy->selection_count < selection->minimum ||
-        policy->selection_count > selection->maximum)
-        return 0;
-
-    uint64_t selected = 0;
-    for (uint8_t i = 0; i < policy->selection_count; ++i) {
-        uint8_t index = policy->selection[i];
-        if (index >= MAX_HAND || index >= env->state.hand_count ||
-            (i && policy->selection[i - 1] >= index))
-            return 0;
-        selected |= UINT64_C(1) << index;
-    }
-    return selected && !(selected & ~selection->allowed_hand) &&
-           (selected & selection->required_hand) == selection->required_hand;
-}
-
-static inline void canonicalize_policy_action(
-        const Env *env, Action *policy) {
-    if (!policy || policy->type >= ACTION_TYPE_COUNT) return;
-    int has_primary = policy->type >= ACTION_BUY_CARD &&
-                      policy->type <= ACTION_SWAP_HAND_RIGHT;
-    if (!has_primary) {
-        policy->primary = 0;
-    } else {
-        uint64_t primary = env->legal_masks.primary[policy->type];
-        if (!primary) return;
-        if (policy->primary >= 64 || !(primary & (UINT64_C(1) << policy->primary)))
-            policy->primary = (uint8_t)__builtin_ctzll(primary);
-    }
-    const ObservedSelection *selection = cached_selection(
-        &env->legal_masks, policy->type, policy->primary);
-    if (!selection || !selection->valid) {
-        policy->selection_count = 0;
-        return;
-    }
-
-    uint8_t target = policy->selection_count;
-    if (target < selection->minimum) target = selection->minimum;
-    if (target > selection->maximum) target = selection->maximum;
-    uint8_t required_count = (uint8_t)__builtin_popcountll(selection->required_hand);
-    if (target < required_count) target = required_count;
-    uint64_t chosen = selection->required_hand;
-    for (uint8_t i = 0; i < policy->selection_count &&
-                        __builtin_popcountll(chosen) < target; ++i) {
-        uint8_t index = policy->selection[i];
-        if (index >= env->state.hand_count || index >= MAX_HAND) continue;
-        uint64_t bit = UINT64_C(1) << index;
-        if (selection->allowed_hand & bit) chosen |= bit;
-    }
-    uint64_t allowed = selection->allowed_hand & ~chosen;
-    while (__builtin_popcountll(chosen) < target && allowed) {
-        int index = __builtin_ctzll(allowed);
-        chosen |= UINT64_C(1) << index;
-        allowed &= allowed - 1;
-    }
-    policy->selection_count = 0;
-    for (int index = 0; index < MAX_HAND &&
-                        policy->selection_count < target; ++index) {
-        if (chosen & (UINT64_C(1) << index))
-            policy->selection[policy->selection_count++] = (uint8_t)index;
-    }
-}
-
-
 void puf_init(Env *env, Dict *kwargs) {
     env->num_agents = 1;
     env->tag = 0;
@@ -304,7 +202,39 @@ void puf_init(Env *env, Dict *kwargs) {
     DictItem *max_episode_steps = dict_find(kwargs, "max_episode_steps");
     DictItem *invalid_action_reward = dict_find(kwargs, "invalid_action_reward");
     DictItem *fast_rng = dict_find(kwargs, "fast_rng");
+    DictItem *potential_scale = dict_find(kwargs, "potential_scale");
+    DictItem *progress_reward = dict_find(kwargs, "progress_reward");
+    DictItem *blind_bonus = dict_find(kwargs, "blind_bonus");
+    DictItem *ante_bonus = dict_find(kwargs, "ante_bonus");
+    DictItem *win_bonus = dict_find(kwargs, "win_bonus");
+    DictItem *loss_penalty = dict_find(kwargs, "loss_penalty");
     env->config.shaped_reward = shaped ? (shaped->value != 0.0) : 1;
+    env->config.potential_scale = 0;
+    if (potential_scale) {
+        assert(potential_scale->value >= 0.0 && potential_scale->value <= UINT8_MAX);
+        assert(potential_scale->value == (double)(uint8_t)potential_scale->value);
+        env->config.potential_scale = (uint8_t)potential_scale->value;
+    }
+    if (progress_reward) {
+        assert(progress_reward->value >= 0.0);
+        env->config.progress_reward = (float)progress_reward->value;
+    }
+    if (blind_bonus) {
+        assert(blind_bonus->value >= 0.0);
+        env->config.blind_bonus = (float)blind_bonus->value;
+    }
+    if (ante_bonus) {
+        assert(ante_bonus->value > 0.0);
+        env->config.ante_bonus = (float)ante_bonus->value;
+    }
+    if (win_bonus) {
+        assert(win_bonus->value >= 0.0);
+        env->config.win_bonus = (float)win_bonus->value;
+    }
+    if (loss_penalty) {
+        assert(loss_penalty->value >= 0.0);
+        env->config.loss_penalty = (float)loss_penalty->value;
+    }
     /* Fast splitmix RNG by default (training). Set fast_rng=0 for the
        bit-compatible reference-game RNG used by the differential tools. */
     env->config.fast_rng = fast_rng ? (fast_rng->value != 0.0) : 1;
@@ -382,31 +312,118 @@ void puf_step(Env *env) {
     policy.type = (uint8_t)env->agents[0].actions[0];
     policy.primary = (uint8_t)env->agents[0].actions[1];
     policy.selection_count = (uint8_t)env->agents[0].actions[2];
-    if (policy.selection_count > MAX_SELECTION)
-        policy.selection_count = MAX_SELECTION;
+    assert(policy.selection_count <= MAX_SELECTION);
     for (int i = 0; i < MAX_SELECTION; ++i)
         policy.selection[i] = (uint8_t)env->agents[0].actions[3 + i];
-    canonicalize_policy_action(env, &policy);
+    do {
+        if (policy.type >= ACTION_TYPE_COUNT)
+            break;
+        int has_primary = policy.type >= ACTION_BUY_CARD &&
+                          policy.type <= ACTION_SWAP_HAND_RIGHT;
+        if (!has_primary) {
+            policy.primary = 0;
+        } else {
+            uint64_t primary = env->legal_masks.primary[policy.type];
+            if (!primary)
+                break;
+            if (policy.primary >= 64 || !(primary & (UINT64_C(1) << policy.primary)))
+                policy.primary = (uint8_t)__builtin_ctzll(primary);
+        }
+        const ObservedSelection *selection = cached_selection(
+            &env->legal_masks, policy.type, policy.primary);
+        if (!selection || !selection->valid) {
+            policy.selection_count = 0;
+            break;
+        }
+        uint8_t target = policy.selection_count;
+        if (target < selection->minimum) target = selection->minimum;
+        if (target > selection->maximum) target = selection->maximum;
+        uint8_t required_count = (uint8_t)__builtin_popcountll(selection->required_hand);
+        if (target < required_count) target = required_count;
+        uint64_t chosen = selection->required_hand;
+        for (uint8_t i = 0; i < policy.selection_count &&
+                            __builtin_popcountll(chosen) < target; ++i) {
+            uint8_t index = policy.selection[i];
+            if (index >= env->state.hand_count || index >= MAX_HAND) continue;
+            uint64_t bit = UINT64_C(1) << index;
+            if (selection->allowed_hand & bit) chosen |= bit;
+        }
+        uint64_t allowed = selection->allowed_hand & ~chosen;
+        while (__builtin_popcountll(chosen) < target && allowed) {
+            int index = __builtin_ctzll(allowed);
+            chosen |= UINT64_C(1) << index;
+            allowed &= allowed - 1;
+        }
+        policy.selection_count = 0;
+        for (int index = 0; index < MAX_HAND &&
+                            policy.selection_count < target; ++index) {
+            if (chosen & (UINT64_C(1) << index))
+                policy.selection[policy.selection_count++] = (uint8_t)index;
+        }
+    } while (0);
+    int action_is_legal = 1;
+    do {
+        if (policy.type >= ACTION_TYPE_COUNT ||
+            policy.selection_count > MAX_SELECTION) {
+            action_is_legal = 0;
+            break;
+        }
+        uint8_t type = policy.type;
+        uint8_t primary = (uint8_t)policy.primary;
+        int has_primary = type >= ACTION_BUY_CARD &&
+                          type <= ACTION_SWAP_HAND_RIGHT;
+        if (!has_primary && primary != 0) {
+            action_is_legal = 0;
+            break;
+        }
+        uint8_t observed_primary = has_primary ? primary : 0;
+        const LegalMasks *legal = &env->legal_masks;
+        if (!legal->action_type[type] || observed_primary >= 64 ||
+            !(legal->primary[type] & (UINT64_C(1) << observed_primary))) {
+            action_is_legal = 0;
+            break;
+        }
+        const ObservedSelection *selection =
+            cached_selection(legal, type, observed_primary);
+        if (!selection || !selection->valid) {
+            action_is_legal = policy.selection_count == 0;
+            break;
+        }
+        if (policy.selection_count < selection->minimum ||
+            policy.selection_count > selection->maximum) {
+            action_is_legal = 0;
+            break;
+        }
+        uint64_t selected = 0;
+        for (uint8_t i = 0; i < policy.selection_count; ++i) {
+            uint8_t index = policy.selection[i];
+            if (index >= MAX_HAND || index >= env->state.hand_count ||
+                (i && policy.selection[i - 1] >= index)) {
+                action_is_legal = 0;
+                break;
+            }
+            selected |= UINT64_C(1) << index;
+        }
+        if (!action_is_legal)
+            break;
+        action_is_legal = selected && !(selected & ~selection->allowed_hand) &&
+            (selected & selection->required_hand) == selection->required_hand;
+    } while (0);
     env->agents[0].rewards[0] = 0.0f;
     env->agents[0].terminals[0] = 0.0f;
     if (env->episode_steps < UINT32_MAX) env->episode_steps++;
     if (policy.type < ACTION_TYPE_COUNT)
         env->log.action_counts[policy.type] += 1.0f;
     StepResult result = {0};
-    int error;
-    if (!cached_action_is_legal(env, &policy)) {
-        env->log.invalid_actions += 1.0f;
-        env->agents[0].rewards[0] = env->invalid_action_reward;
-        env->episode_reward += env->invalid_action_reward;
-        if (episode_timed_out(env)) truncate_episode(env);
-        return;
-    }
-    error = apply_step(&env->state, &policy, &env->legal_masks, &result);
+    int error = action_is_legal
+        ? apply_step(&env->state, &policy, &env->legal_masks, &result)
+        : ERR_ACTION;
     if (error != OK) {
         env->log.invalid_actions += 1.0f;
         env->agents[0].rewards[0] = env->invalid_action_reward;
         env->episode_reward += env->invalid_action_reward;
-        if (episode_timed_out(env)) truncate_episode(env);
+        if (episode_timed_out(env))
+            truncate_episode(env);
         else if (error != ERR_ACTION) {
             /* step validates before mutating the state. An invalid action
                therefore leaves the cached observation and legal mask current. */
