@@ -1412,6 +1412,46 @@ static uint8_t resolved_joker_source(const State *state, uint8_t start) {
     return UINT8_MAX;
 }
 
+static inline uint8_t roll_aura_edition(double roll) {
+    return roll > 0.85 ? EDITION_POLYCHROME : roll > 0.50 ? EDITION_HOLO : EDITION_FOIL;
+}
+
+static inline uint8_t center_enhancement(uint16_t center_id) {
+    switch (center_id) {
+    case CENTER_M_BONUS: return ENHANCEMENT_BONUS;
+    case CENTER_M_MULT:  return ENHANCEMENT_MULT;
+    case CENTER_M_WILD:  return ENHANCEMENT_WILD;
+    case CENTER_M_GLASS: return ENHANCEMENT_GLASS;
+    case CENTER_M_STEEL: return ENHANCEMENT_STEEL;
+    case CENTER_M_STONE: return ENHANCEMENT_STONE;
+    case CENTER_M_GOLD:  return ENHANCEMENT_GOLD;
+    case CENTER_M_LUCKY: return ENHANCEMENT_LUCKY;
+    default: return ENHANCEMENT_NONE;
+    }
+}
+
+static void roll_standard_edition(State *state, const char *prefix, Card *card) {
+    char stream[32];
+    key_with_u64(stream, sizeof(stream), prefix, state->ante);
+    double edition = pseudorandom(state, stream);
+    if (edition > 1.0 - 0.012 * state->edition_rate)
+        card->edition = EDITION_POLYCHROME;
+    else if (edition > 1.0 - 0.04 * state->edition_rate)
+        card->edition = EDITION_HOLO;
+    else if (edition > 1.0 - 0.08 * state->edition_rate)
+        card->edition = EDITION_FOIL;
+}
+
+static void roll_standard_seal(State *state, const char *prefix, Card *card) {
+    char stream[32];
+    key_with_u64(stream, sizeof(stream), prefix, state->ante);
+    double seal = pseudorandom(state, stream);
+    card->seal = seal > 0.75 ? SEAL_RED
+               : seal > 0.50 ? SEAL_BLUE
+               : seal > 0.25 ? SEAL_GOLD
+               : SEAL_PURPLE;
+}
+
 static void roll_joker_edition(State *state, const char *append, Card *card) {
     char stream[32];
     KeyBuilder key;
@@ -1525,32 +1565,7 @@ Card create_pooled_card(State *state, uint8_t set, const char *append, int pack_
         key_append_u64(&key, state->ante);
     size_t front = (size_t)floor(pseudorandom(state, stream) * 52.0);
         set_playing_card(&card, (uint8_t)front);
-        switch (card.center_id) {
-        case CENTER_M_BONUS:
-            card.enhancement = ENHANCEMENT_BONUS;
-            break;
-        case CENTER_M_MULT:
-            card.enhancement = ENHANCEMENT_MULT;
-            break;
-        case CENTER_M_WILD:
-            card.enhancement = ENHANCEMENT_WILD;
-            break;
-        case CENTER_M_GLASS:
-            card.enhancement = ENHANCEMENT_GLASS;
-            break;
-        case CENTER_M_STEEL:
-            card.enhancement = ENHANCEMENT_STEEL;
-            break;
-        case CENTER_M_STONE:
-            card.enhancement = ENHANCEMENT_STONE;
-            break;
-        case CENTER_M_GOLD:
-            card.enhancement = ENHANCEMENT_GOLD;
-            break;
-        case CENTER_M_LUCKY:
-            card.enhancement = ENHANCEMENT_LUCKY;
-            break;
-        }
+        card.enhancement = center_enhancement(card.center_id);
     }
     if (set == SET_JOKER) {
         initialize_joker_card(state, &card);
@@ -1594,10 +1609,7 @@ static Card create_shop_card(State *state) {
     Card card = create_pooled_card(state, set, "sho", 0);
     if ((set == SET_DEFAULT || set == SET_ENHANCED) && center_used(state, CENTER_V_ILLUSION) &&
         pseudorandom(state, "illusion") > 0.8) {
-        double edition = pseudorandom(state, "illusion");
-        card.edition = edition > 0.85 ? EDITION_POLYCHROME
-                       : edition > 0.5 ? EDITION_HOLO
-                                       : EDITION_FOIL;
+        card.edition = roll_aura_edition(pseudorandom(state, "illusion"));
         price_card(state, &card);
     }
     return card;
@@ -1755,9 +1767,7 @@ void apply_consumable(State *state, const Action *action, Card card) {
         }
         if (state->phase == PHASE_SELECTING_HAND) sort_hand(state, state->hand_sort_suit != 0);
     } else if (card.center_id == CENTER_C_AURA && action->selection_count) {
-        double roll = pseudorandom(state, "aura");
-        uint8_t edition = roll > 0.85 ? EDITION_POLYCHROME : roll > 0.50 ? EDITION_HOLO : EDITION_FOIL;
-        state->hand[action->selection[0]].edition = edition;
+        state->hand[action->selection[0]].edition = roll_aura_edition(pseudorandom(state, "aura"));
     } else if (card.center_id == CENTER_C_ECTOPLASM) {
         uint8_t eligible[MAX_JOKERS];
         uint8_t count = sorted_editionless_jokers(state, eligible);
@@ -1794,9 +1804,7 @@ void apply_consumable(State *state, const Action *action, Card card) {
         uint8_t count = sorted_editionless_jokers(state, eligible);
         if (count && pseudorandom(state, "wheel_of_fortune") < adjust_probability(state, 0.25)) {
             size_t pick = (size_t)floor(pseudorandom(state, "wheel_of_fortune") * count);
-            double edition = pseudorandom(state, "wheel_of_fortune");
-            state->jokers[eligible[pick]].edition = edition > 0.85 ? EDITION_POLYCHROME
-                                               : edition > 0.50 ? EDITION_HOLO : EDITION_FOIL;
+            state->jokers[eligible[pick]].edition = roll_aura_edition(pseudorandom(state, "wheel_of_fortune"));
             price_card(state, &state->jokers[eligible[pick]]);
         }
     } else if (card.center_id == CENTER_C_FOOL) {
@@ -2011,24 +2019,12 @@ static int open_pack_center(State *state, uint16_t center_id) {
                 key_with_u64(stream, sizeof(stream), "Enhancedsta", state->ante);
                 size_t index = (size_t)(pseudorandom(state, stream) * count);
                 card.center_id = pool[index];
-                card.enhancement = (uint8_t)(index + 1);
+                card.enhancement = center_enhancement(card.center_id);
             }
-            key_with_u64(stream, sizeof(stream), "standard_edition", state->ante);
-            double edition = pseudorandom(state, stream);
-            if (edition > 1.0 - 0.012 * state->edition_rate)
-                card.edition = EDITION_POLYCHROME;
-            else if (edition > 1.0 - 0.04 * state->edition_rate)
-                card.edition = EDITION_HOLO;
-            else if (edition > 1.0 - 0.08 * state->edition_rate)
-                card.edition = EDITION_FOIL;
+            roll_standard_edition(state, "standard_edition", &card);
             key_with_u64(stream, sizeof(stream), "stdseal", state->ante);
             if (pseudorandom(state, stream) > 0.8) {
-                key_with_u64(stream, sizeof(stream), "stdsealtype", state->ante);
-                double seal = pseudorandom(state, stream);
-                card.seal = seal > 0.75 ? SEAL_RED
-                    : seal > 0.5 ? SEAL_BLUE
-                    : seal > 0.25 ? SEAL_GOLD
-                    : SEAL_PURPLE;
+                roll_standard_seal(state, "stdsealtype", &card);
             }
             card.sort_id = ++state->next_sort_id;
             card.cost = card.sell_cost = 1;
@@ -3895,8 +3891,7 @@ static void start_blind(State *state) {
     if (joker_active(state, CENTER_J_CERTIFICATE) && state->hand_count < MAX_HAND &&
         can_add_playing_cards(state, 1)) {
         Card certificate = random_playing_card(state, "cert_fr");
-        double seal = pseudorandom(state, "certsl");
-        certificate.seal = seal > 0.75 ? SEAL_RED : seal > 0.5 ? SEAL_BLUE : seal > 0.25 ? SEAL_GOLD : SEAL_PURPLE;
+        roll_standard_seal(state, "certsl", &certificate);
         if (blind_debuffs_card(state, &certificate)) certificate.flags |= CARD_DEBUFFED;
         state->hand[state->hand_count++] = certificate;
         playing_card_added(state, 1);
