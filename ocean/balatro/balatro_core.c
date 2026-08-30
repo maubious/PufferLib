@@ -2948,17 +2948,14 @@ static void main_jokers(State *state, const ScoreContext *context, HandType hand
             *mult += sell_total;
             break;
         }
-        case CENTER_J_WEE:
-            *chips += joker->state[0];
-            break;
-        case CENTER_J_POPCORN: {
-            int current = joker->state[0] > 0 ? joker->state[0] : 20;
-            *mult += current;
-            break;
-        }
         case CENTER_J_FLASH:
         case CENTER_J_RED_CARD:
+        case CENTER_J_CEREMONIAL:
             *mult += joker->state[0];
+            break;
+        case CENTER_J_WEE:
+        case CENTER_J_CASTLE:
+            *chips += joker->state[0];
             break;
         case CENTER_J_RAMEN: {
             if (joker->state[1]) break;
@@ -2978,12 +2975,6 @@ static void main_jokers(State *state, const ScoreContext *context, HandType hand
                 joker->state[0] = current - 5;
             break;
         }
-        case CENTER_J_CASTLE:
-            *chips += joker->state[0];
-            break;
-        case CENTER_J_CEREMONIAL:
-            *mult += joker->state[0];
-            break;
         case CENTER_J_TODO_LIST:
             if (joker->state[1] == (int32_t)hand) *dollars += 4;
             break;
