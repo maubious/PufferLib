@@ -3251,14 +3251,6 @@ static void masks_add_discrete(LegalMasks *masks, Action action) {
     int primary = action.type >= ACTION_BUY_CARD && action.type <= ACTION_SWAP_HAND_RIGHT ? action.primary : 0;
     assert(action.type < ACTION_TYPE_COUNT && primary < 64);
     masks->primary[action.type] |= UINT64_C(1) << primary;
-    if (action.type == ACTION_SWAP_HAND_LEFT && action.primary < OBS_MAX_HAND)
-        masks->hand_reorder_destination[action.primary] |= UINT64_C(1) << (action.primary - 1);
-    else if (action.type == ACTION_SWAP_HAND_RIGHT && action.primary < OBS_MAX_HAND)
-        masks->hand_reorder_destination[action.primary] |= UINT64_C(1) << (action.primary + 1);
-    else if (action.type == ACTION_SWAP_JOKERS_LEFT && action.primary < OBS_MAX_JOKERS)
-        masks->joker_reorder_destination[action.primary] |= UINT64_C(1) << (action.primary - 1);
-    else if (action.type == ACTION_SWAP_JOKERS_RIGHT && action.primary < OBS_MAX_JOKERS)
-        masks->joker_reorder_destination[action.primary] |= UINT64_C(1) << (action.primary + 1);
 }
 
 static void legal_add_selection(LegalMasks *masks, uint8_t type, uint8_t primary, uint8_t minimum,

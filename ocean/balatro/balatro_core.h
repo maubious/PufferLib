@@ -335,8 +335,6 @@ typedef struct LegalMasks {
     SelectionContract consumable[OBS_MAX_CONSUMABLES];
     SelectionContract shop[OBS_MAX_SHOP_MAIN];
     SelectionContract pack[OBS_MAX_PACK_CARDS];
-    uint64_t hand_reorder_destination[OBS_MAX_HAND];
-    uint64_t joker_reorder_destination[OBS_MAX_JOKERS];
 } LegalMasks;
 
 /* Selection entry for a (type, primary) pair, or NULL when the action
