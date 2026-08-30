@@ -869,10 +869,14 @@ static double shaped_transition_reward(const State *state,
     return reward;
 }
 
+static inline void swap_cards(Card *a, Card *b) {
+    Card tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
 void swap_jokers(State *state, uint8_t left, uint8_t right) {
-    Card card = state->jokers[left];
-    state->jokers[left] = state->jokers[right];
-    state->jokers[right] = card;
+    swap_cards(&state->jokers[left], &state->jokers[right]);
 }
 
 HandType classify_hand(const Card *cards, size_t count, uint8_t *scoring_mask,
@@ -1352,6 +1356,12 @@ static void joker_removed(State *state, const Card *joker) {
     }
 }
 
+static void trigger_campfire(State *state, uint8_t skip_index) {
+    for (uint8_t j = 0; j < state->joker_count; ++j)
+        if (j != skip_index && !(state->jokers[j].flags & CARD_DEBUFFED) && state->jokers[j].center_id == CENTER_J_CAMPFIRE)
+            state->jokers[j].state[0] = (state->jokers[j].state[0] > 100 ? state->jokers[j].state[0] : 100) + 25;
+}
+
 int sell_joker(State *state, uint8_t index) {
     if (!state || index >= state->joker_count || (state->jokers[index].flags & CARD_ETERNAL)) return ERR_ACTION;
     Card card = state->jokers[index];
@@ -1380,9 +1390,7 @@ int sell_joker(State *state, uint8_t index) {
         state->blind_disabled = 1;
         clear_card_debuffs(state);
     }
-    for (uint8_t j = 0; j < state->joker_count; ++j)
-        if (j != index && !(state->jokers[j].flags & CARD_DEBUFFED) && state->jokers[j].center_id == CENTER_J_CAMPFIRE)
-            state->jokers[j].state[0] = (state->jokers[j].state[0] > 100 ? state->jokers[j].state[0] : 100) + 25;
+    trigger_campfire(state, index);
     ZONE_REMOVE(state->jokers, state->joker_count, index);
     refresh_joker_cache(state);
     return OK;
@@ -1893,9 +1901,7 @@ void sell_consumable(State *state, uint8_t index) {
     Card card = state->consumables[index];
     state->dollars += card.sell_cost;
     consumable_removed(state, &card);
-    for (uint8_t j = 0; j < state->joker_count; ++j)
-        if (!(state->jokers[j].flags & CARD_DEBUFFED) && state->jokers[j].center_id == CENTER_J_CAMPFIRE)
-            state->jokers[j].state[0] = (state->jokers[j].state[0] > 100 ? state->jokers[j].state[0] : 100) + 25;
+    trigger_campfire(state, UINT8_MAX);
     ZONE_REMOVE(state->consumables, state->consumable_count, index);
 }
 
@@ -4192,15 +4198,13 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
     case ACTION_SWAP_HAND_LEFT:
     case ACTION_SWAP_HAND_RIGHT: {
         uint8_t other = action->type == ACTION_SWAP_HAND_LEFT ? action->primary - 1 : action->primary + 1;
-        Card card = state->hand[action->primary];
-        state->hand[action->primary] = state->hand[other];
-        state->hand[other] = card;
+        swap_cards(&state->hand[action->primary], &state->hand[other]);
         break;
     }
     case ACTION_SWAP_JOKERS_LEFT:
     case ACTION_SWAP_JOKERS_RIGHT: {
         uint8_t other = action->type == ACTION_SWAP_JOKERS_LEFT ? action->primary - 1 : action->primary + 1;
-        swap_jokers(state, action->primary, other);
+        swap_cards(&state->jokers[action->primary], &state->jokers[other]);
         break;
     }
     case ACTION_CASH_OUT: {
