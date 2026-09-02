@@ -16,18 +16,15 @@
 #include <float.h>
 #include <math.h>
 #include <stdlib.h>
-#include <algorithm>
 #include <string.h>
 
 #define PROTEIN_EPSILON 1e-6f
 #define PROTEIN_NUM_COST_RATIOS 6
 #define PROTEIN_ACQ_MAX_CAP 65536
 #define PROTEIN_COST_QUANTILE 0.97f
+#define PROTEIN_MIN_OBS_NO_FAIL 100
 #define PROTEIN_COST_GROWTH 1.01f
-#define PROTEIN_COST_SIGMA 0.15f
-#define PROTEIN_COST_LIMIT_Z 1.6448536f
 #define PROTEIN_CLF_ITERS 100
-#define PROTEIN_NOISE_FLOOR 1e-3f
 #define PROTEIN_THRESHOLD_COST_CAP 1.2f
 #define PROTEIN_THRESHOLD_FALLBACK 0.9f
 #define NOISE_PRIOR_MU (-4.60517f)
@@ -94,6 +91,11 @@ static inline float space_unnormalize(const Space *s, float norm) {
     return val;
 }
 
+static inline float space_canonicalize(const Space *s, float norm) {
+    float val = space_unnormalize(s, norm);
+    return space_normalize(s, val);
+}
+
 // Softplus + Matern32+linear kernel
 __host__ __device__ __forceinline__ float softplus(float x) {
     return (x > 20.0 ? x : log1p(exp(x))) + SP_LB;
@@ -106,18 +108,6 @@ __host__ __device__ __forceinline__ float softplus_grad(float x) {
     return 1.0 / (1.0 + exp(-x));
 }
 
-__host__ __device__ __forceinline__ float norm_cdf(float x) {
-    return 0.5f * (1.0f + erff(x * 0.7071067811865475f));
-}
-
-__host__ __device__ __forceinline__ float norm_pdf(float x) {
-    return expf(-0.5f * x * x) * 0.3989422804014327f;
-}
-static int float_cmp(const void *a, const void *b) {
-    float fa = *(const float *)a, fb = *(const float *)b;
-    return (fa > fb) - (fa < fb);
-}
-
 typedef struct {
     int n_params;
     float *raw_params;
@@ -127,7 +117,7 @@ static inline int gp_grid(int n) {
     return (n + GP_BLOCK - 1) / GP_BLOCK;
 }
 
-// Gram / cross-covariance: K = sigma_f * (x·x' + offset + Matern32(r))
+// Gram / cross-covariance: K = sigma_f * (x·x'/d + offset + Matern32(r))
 __global__ void matern32lin_k_kernel(const float *__restrict__ X1,
         const float *__restrict__ X2, float *__restrict__ K,
         const float *__restrict__ inv_ells, int n, int m, int d, float sigma_f,
@@ -144,36 +134,12 @@ __global__ void matern32lin_k_kernel(const float *__restrict__ X1,
         float diff = (xr - xc) * inv_ells[k];
         r2 += diff * diff;
     }
-    if (r2 < 0.0) {
-        r2 = 0.0;
-    }
     float u = sqrt(3.0) * sqrt(r2);
-    float val = sigma_f * (dot + offset + (1.0 + u) * exp(-u));
+    float val = sigma_f * (dot / d + offset + (1.0 + u) * exp(-u));
     if (diag_noise != 0.0 && row == col) {
         val += diag_noise;
     }
     K[col * n + row] = val;
-}
-
-__global__ void gp_k_diag_var(const float *__restrict__ V,
-        const float *__restrict__ Xte, float *__restrict__ stds, int n, int m,
-        int d, float sigma_f, float offset, const float *inv_ells) {
-    int col = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    if (col >= m) {
-        return;
-    }
-    (void)inv_ells;
-    float dot = 0.0f;
-    for (int k = 0; k < d; k++) {
-        float x = Xte[col * d + k];
-        dot += x * x;
-    }
-    float var = sigma_f * (dot + offset + 1.0f);
-    for (int k = 0; k < n; k++) {
-        float v = V[col * n + k];
-        var -= v * v;
-    }
-    stds[col] = sqrtf(fmaxf(var, PROTEIN_EPSILON));
 }
 
 // Write constant onto diagonal (stride n+1). Used to form I for spotrs → K^{-1}.
@@ -217,9 +183,6 @@ __global__ void matern32lin_mll_grad_fuse(const float *__restrict__ X,
             float t = (xr - xc) * inv_ells[k];
             r2 += t * t;
         }
-        if (r2 < 0.0f) {
-            r2 = 0.0f;
-        }
         float u = sqrtf(3.0f) * sqrtf(r2);
         float e = expf(-u);
         float W = alpha[row] * alpha[col] - Kinv[col * n + row];
@@ -229,7 +192,7 @@ __global__ void matern32lin_mll_grad_fuse(const float *__restrict__ X,
             sh[dd * nthreads + tid] =
                 W * (sigma_f * 3.0f * diff * diff * inv * inv * inv * e);
         }
-        sh[d * nthreads + tid] = W * (dot + offset + (1.0f + u) * e);
+        sh[d * nthreads + tid] = W * (dot / d + offset + (1.0f + u) * e);
         sh[(d + 1) * nthreads + tid] = W;
     }
     int bid = blockIdx.y * gridDim.x + blockIdx.x;
@@ -237,15 +200,17 @@ __global__ void matern32lin_mll_grad_fuse(const float *__restrict__ X,
 }
 
 typedef struct {
-    int dim, n, cap, initialized;
+    int dim, n, cap;
     float *d_X, *d_y, *d_L, *d_alpha, *d_work;
     int lwork;
     int *d_info;
-    float raw_noise, target_mean, target_scale;
+    float raw_noise;
+    float mean;
+    float noise_prior_mu;
     cublasHandle_t cublas;
     cusolverDnHandle_t cusolver;
     GPKernel *kernel;
-    float *d_inv_ells, *d_diag, *d_Kinv, *d_partials, *d_Ks, *d_stds;
+    float *d_inv_ells, *d_diag, *d_Kinv, *d_partials, *d_Ks, *d_ones;
     float *h_kg, *h_diag, *h_partials;
 } GaussianProcess;
 
@@ -282,9 +247,9 @@ static void gp_init(GaussianProcess *gp, int dim, int cap, int pred_m, float noi
     k->raw_params[SF_IDX(n_params)] = inv_softplus(1.0f);
     k->raw_params[OFF_IDX(n_params)] = inv_softplus(1.0f);
     gp->kernel = k;
-    assert(noise > PROTEIN_NOISE_FLOOR);
-    gp->raw_noise = inv_softplus(noise - PROTEIN_NOISE_FLOOR);
-    gp->target_scale = 1.0f;
+    gp->raw_noise = inv_softplus(noise);
+    gp->mean = 0.0f;
+    gp->noise_prior_mu = NOISE_PRIOR_MU;
     cudaMalloc(&gp->d_X, cap * dim * sizeof(float));
     cudaMalloc(&gp->d_y, cap * sizeof(float));
     cudaMalloc(&gp->d_L, cap * cap * sizeof(float));
@@ -296,7 +261,9 @@ static void gp_init(GaussianProcess *gp, int dim, int cap, int pred_m, float noi
     cudaMalloc(&gp->d_partials, nblocks * nsum * sizeof(float));
     // Dominant device buffer: cap × acq_cap floats (×2 GPs)
     assert(cudaMalloc(&gp->d_Ks, cap * pred_m * sizeof(float)) == cudaSuccess);
-    assert(cudaMalloc(&gp->d_stds, pred_m * sizeof(float)) == cudaSuccess);
+    cudaMalloc(&gp->d_ones, sizeof(float));
+    float one = 1.0f;
+    cudaMemcpy(gp->d_ones, &one, sizeof(float), cudaMemcpyHostToDevice);
     gp->h_kg = (float *)malloc(n_params * sizeof(float));
     gp->h_diag = (float *)malloc(cap * sizeof(float));
     gp->h_partials = (float *)malloc(nblocks * nsum * sizeof(float));
@@ -319,7 +286,7 @@ static int run_potrf(GaussianProcess *gp, float *d_K, int n, cudaStream_t stream
 
 static int gp_recompute(GaussianProcess *gp, cudaStream_t stream) {
     int n = gp->n;
-    float noise = PROTEIN_NOISE_FLOOR + softplus(gp->raw_noise);
+    float noise = softplus(gp->raw_noise);
     matern32lin_build_K(gp, gp->d_X, gp->d_X, n, n, noise, gp->d_L, stream);
     int info = run_potrf(gp, gp->d_L, n, stream);
     if (info != 0) {
@@ -329,8 +296,11 @@ static int gp_recompute(GaussianProcess *gp, cudaStream_t stream) {
     if (info != 0) {
         return -2;
     }
+    // alpha = K^{-1}(y - mean)
     cudaMemcpyAsync(gp->d_alpha, gp->d_y, n * sizeof(float), cudaMemcpyDeviceToDevice, stream);
     cublasSetStream(gp->cublas, stream);
+    float neg_mean = -gp->mean;
+    cublasSaxpy(gp->cublas, n, &neg_mean, gp->d_ones, 0, gp->d_alpha, 1);
     cublasStrsv(gp->cublas, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
         n, gp->d_L, n, gp->d_alpha, 1);
     cublasStrsv(gp->cublas, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT,
@@ -338,26 +308,15 @@ static int gp_recompute(GaussianProcess *gp, cudaStream_t stream) {
     return 0;
 }
 
-static void gp_predict(GaussianProcess *gp, const float *d_Xte, float *d_means,
-        float *d_stds, int m, cudaStream_t stream) {
+static void gp_predict(GaussianProcess *gp, const float *d_Xte, float *d_means, int m,
+        cudaStream_t stream) {
     int n = gp->n;
-    const float one = 1.0f, zero = 0.0f;
+    const float one = 1.0, zero = 0.0;
     cublasSetStream(gp->cublas, stream);
     matern32lin_build_K(gp, gp->d_X, d_Xte, n, m, 0.0f, gp->d_Ks, stream);
-    cublasSgemv(gp->cublas, CUBLAS_OP_T, n, m, &one, gp->d_Ks, n,
-        gp->d_alpha, 1, &zero, d_means, 1);
-    if (d_stds == NULL) {
-        return;
-    }
-    cublasStrsm(gp->cublas, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER,
-        CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, n, m, &one, gp->d_L, n,
-        gp->d_Ks, n);
-    int np = gp->kernel->n_params;
-    float sigma_f = softplus(gp->kernel->raw_params[SF_IDX(np)]);
-    float offset = softplus(gp->kernel->raw_params[OFF_IDX(np)]);
-    gp_k_diag_var<<<(m + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-        gp->d_Ks, d_Xte, d_stds, n, m, gp->dim, sigma_f, offset,
-        gp->d_inv_ells);
+    cublasSgemv(gp->cublas, CUBLAS_OP_T, n, m, &one, gp->d_Ks, n, gp->d_alpha, 1,
+        &zero, d_means, 1);
+    cublasSaxpy(gp->cublas, m, &gp->mean, gp->d_ones, 0, d_means, 1);
 }
 
 // Train kernel hyperparameters with Adam (score GP and cost GP).
@@ -369,39 +328,12 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
     cudaMemcpyAsync(gp->d_y, y, n_data * sizeof(float),
         cudaMemcpyHostToDevice, stream);
     gp->n = n_data;
-    if (!gp->initialized) {
-        int sample_n = n_data < 256 ? n_data : 256;
-        assert(sample_n > 1);
-        int pair_n = sample_n * (sample_n - 1) / 2;
-        float *distances = (float *)malloc(pair_n * sizeof(float));
-        for (int d = 0; d < gp->dim; d++) {
-            int count = 0;
-            for (int i = 0; i < sample_n; i++) {
-                int row_i = i * n_data / sample_n;
-                for (int j = i + 1; j < sample_n; j++) {
-                    int row_j = j * n_data / sample_n;
-                    distances[count++] =
-                        fabsf(X[row_i * gp->dim + d] - X[row_j * gp->dim + d]);
-                }
-            }
-            assert(count == pair_n);
-            qsort(distances, pair_n, sizeof(float), float_cmp);
-            float median = distances[pair_n / 2];
-            if (pair_n % 2 == 0) {
-                median = 0.5f * (distances[pair_n / 2 - 1] + median);
-            }
-            gp->kernel->raw_params[d] =
-                inv_softplus(fmaxf(median, 0.05f));
-        }
-        free(distances);
-        gp->initialized = 1;
-    }
     if (gp_recompute(gp, stream) != 0) {
         return 0.0f;
     }
 
     int n_kp = gp->kernel->n_params;
-    int n_opt = n_kp + 1;
+    int n_opt = n_kp + 2;
     int d = gp->dim;
     int nsum = d + 2;
     float loss = 0.0f;
@@ -415,8 +347,10 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
         const GPKernel *k = gp->kernel;
         int np = k->n_params;
         cublasSetStream(gp->cublas, stream);
-        float data_fit;
+        float data_fit, sum_alpha;
         cublasSdot(gp->cublas, n, gp->d_y, 1, gp->d_alpha, 1, &data_fit);
+        cublasSdot(gp->cublas, n, gp->d_alpha, 1, gp->d_ones, 0, &sum_alpha);
+        data_fit -= gp->mean * sum_alpha;
         gp_k_extract_diag<<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE,
             BLOCK_SIZE, 0, stream>>>(gp->d_L, gp->d_diag, n);
         cudaMemcpyAsync(gp->h_diag, gp->d_diag, n * sizeof(float),
@@ -473,20 +407,26 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
             inv_n * sigma_f * h_sums[d + 1] * softplus_grad(k->raw_params[OFF_IDX(np)]);
 
         float mll = (-0.5f * data_fit - log_det - 0.5f * n * logf(2.0f * M_PI)) / n;
-        float noise_val = PROTEIN_NOISE_FLOOR + softplus(gp->raw_noise);
+        float noise_val = softplus(gp->raw_noise);
         float ln_noise = logf(noise_val);
         float sig = softplus_grad(gp->raw_noise);
-        float z = (ln_noise - NOISE_PRIOR_MU) / NOISE_PRIOR_SIGMA;
-        float np_grad = ((-z / NOISE_PRIOR_SIGMA - 1.0f) * sig / noise_val
-            + 1.0f - sig) / n;
-        loss = -mll - (-0.5f * z * z - ln_noise - logf(NOISE_PRIOR_SIGMA)
-            - log1pf(expf(-gp->raw_noise))) / n;
+        float z = (ln_noise - gp->noise_prior_mu) / NOISE_PRIOR_SIGMA;
+        float np_grad = ((-z / NOISE_PRIOR_SIGMA - 1.0f) * sig / noise_val) / n;
+        loss = -mll - (-0.5f * z * z - ln_noise - logf(NOISE_PRIOR_SIGMA)) / n;
 
         (*opt_t)++;
         float bc1 = 1.0f - powf(beta1, (*opt_t));
         float bc2 = 1.0f - powf(beta2, (*opt_t));
+        float d_mean = sum_alpha / n;
         for (int i = 0; i < n_opt; i++) {
-            float g = (i < n_kp) ? -gp->h_kg[i] : -d_noise - np_grad;
+            float g;
+            if (i < n_kp) {
+                g = -gp->h_kg[i];
+            } else if (i == n_kp) {
+                g = -d_noise - np_grad;
+            } else {
+                g = -d_mean;
+            }
             opt_m[i] = beta1 * opt_m[i] + (1.0f - beta1) * g;
             opt_v[i] = beta2 * opt_v[i] + (1.0f - beta2) * g * g;
             float m_hat = opt_m[i] / bc1;
@@ -495,8 +435,10 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
             float step = lr * m_hat / (sqrtf(opt_vmax[i]) + 1e-8f);
             if (i < n_kp) {
                 gp->kernel->raw_params[i] -= step;
-            } else {
+            } else if (i == n_kp) {
                 gp->raw_noise -= step;
+            } else {
+                gp->mean -= step;
             }
         }
     }
@@ -528,14 +470,7 @@ __global__ void protein_k_sample(float *__restrict__ candidates,
         float s = scales[d] * global_scale;
         float val = s * (2.0f * curand_uniform(&state) - 1.0f)
             + centers[center * dim + d];
-        float phase = fmodf(val + 1.0f, 4.0f);
-        if (phase < 0.0f) {
-            phase += 4.0f;
-        }
-        if (phase > 2.0f) {
-            phase = 4.0f - phase;
-        }
-        val = phase - 1.0f;
+        val = fmaxf(-1.0f, fminf(1.0f, val));
         candidates[i * dim + d] = val;
     }
     if (cost_dim >= 0 && !isnan(fixed_cost)) {
@@ -545,11 +480,8 @@ __global__ void protein_k_sample(float *__restrict__ candidates,
 }
 
 typedef struct {
-    float score_loss, cost_loss, predicted_score, predicted_std;
-    float predicted_cost, predicted_cost_std, predicted_cost_upper, rating;
-    float best_score, latent_std, expected_improvement, target_cost;
-    float cost_weight, limit_probability, valid_probability, nearest_distance;
-    int boundary_count, n_pareto, n_gp_obs, n_candidates, is_random;
+    float score_loss, cost_loss, predicted_score, predicted_cost, rating;
+    int n_pareto, n_gp_obs, n_candidates, is_random;
 } ProteinSweepInfo;
 
 typedef struct {
@@ -570,7 +502,6 @@ typedef struct {
     int use_success_prob;
     int prune_pareto;
     int use_logit;
-    int use_quantile;
     float global_search_scale;
     float max_suggestion_cost;
     float expansion_rate;
@@ -579,14 +510,16 @@ typedef struct {
     int success_cap;
     int failure_cap;
     int top_k;
+    int select_k; // top-K rated candidates sampled uniformly; 1 = argmax
+    int (*valid)(const float *sample, void *data);
+    void *valid_data;
     unsigned long long rng_seed;
     // Internal
     float *succ_params, *succ_scores, *succ_costs;
     float *fail_params, *fail_scores, *fail_costs;
-    int succ_n, fail_n, n_top, completed_successes, dim, cost_dim;
+    int succ_n, fail_n, n_top, dim, cost_dim;
     int *top_idx;
     float min_score, max_score, log_c_min, log_c_max;
-    float log_rate_min, log_rate_max;
     int acq_cap;
     float *d_scales, *d_candidates, *d_pred_y, *d_pred_c;
     curandStatePhilox4_32_10_t *d_rng;
@@ -607,9 +540,10 @@ typedef struct {
     int *pareto_buf, *pruned_buf;
     float *centers_buf;
     // suggest scratch (sized to caps; ext_buf/kept_buf also pinball + classifier)
-    float *log_c_buf, *log_rate_buf, *score_sort_buf;
-    float *gp_observed_costs, *ext_buf, *h_cands, *h_pred;
+    float *log_c_buf, *ext_buf, *h_cands, *h_pred;
     int *kept_buf, *kd_idx, *kd_keep;
+    float *h_ratings;
+    int *h_topk;
     KDNode *kd_nodes;
     float *d_centers;
 } ProteinSweep;
@@ -620,8 +554,7 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     int dim = sw->space->num;
     sw->dim = dim;
     sw->cost_dim = sw->space->cost_idx;
-    sw->succ_n = sw->fail_n = sw->n_top = sw->completed_successes = 0;
-    sw->suggestion_idx = 0;
+    sw->succ_n = sw->fail_n = sw->n_top = sw->suggestion_idx = 0;
     sw->cm_fitted = sw->clf_fitted = sw->pool_remaining = 0;
     sw->opt_t_score = sw->opt_t_cost = 0;
     sw->upper_cost_threshold = -FLT_MAX;
@@ -630,8 +563,6 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     sw->max_score = -FLT_MAX;
     sw->log_c_min = FLT_MAX;
     sw->log_c_max = -FLT_MAX;
-    sw->log_rate_min = FLT_MAX;
-    sw->log_rate_max = -FLT_MAX;
     sw->clf_bias = 0.0f;
     sw->cm_A = sw->cm_B = sw->cm_max_score = sw->cm_upper = 0.0f;
 
@@ -652,6 +583,12 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     if (acq_cap < sw->infer_batch_size) acq_cap = sw->infer_batch_size;
     if (acq_cap > PROTEIN_ACQ_MAX_CAP) acq_cap = PROTEIN_ACQ_MAX_CAP;
     sw->acq_cap = acq_cap;
+    if (sw->select_k < 1) {
+        sw->select_k = 1;
+    }
+    if (sw->select_k > acq_cap) {
+        sw->select_k = acq_cap;
+    }
     int max_ext = sw->success_cap + sw->failure_cap;
     int kd_cap = max_ext > acq_cap ? max_ext : acq_cap;
     float scales[dim];
@@ -669,9 +606,10 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
         sw->d_rng, acq_cap, sw->rng_seed);
 
     sw->clf_w = (float *)calloc(dim, sizeof(float));
-    gp_init(&sw->gp_score, dim, sw->gp_max_obs, acq_cap, 0.01f);
+    gp_init(&sw->gp_score, dim, sw->gp_max_obs, acq_cap, 0.05f);
     gp_init(&sw->gp_cost, dim, sw->gp_max_obs, acq_cap, 0.01f);
-    sw->n_opt = sw->gp_score.kernel->n_params + 1;
+    sw->gp_score.noise_prior_mu = -3.0f;
+    sw->n_opt = sw->gp_score.kernel->n_params + 2;
     sw->opt_m = (float *)calloc(6 * sw->n_opt, sizeof(float));
 
     curandCreateGeneratorHost(&sw->sobol, CURAND_RNG_QUASI_SCRAMBLED_SOBOL32);
@@ -685,13 +623,12 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     sw->pruned_buf = sw->pareto_buf + sw->success_cap;
     sw->centers_buf = (float *)malloc(max_centers * dim * sizeof(float));
     sw->log_c_buf = (float *)malloc(sw->success_cap * sizeof(float));
-    sw->log_rate_buf = (float *)malloc(sw->success_cap * sizeof(float));
-    sw->score_sort_buf = (float *)malloc(sw->success_cap * sizeof(float));
-    sw->gp_observed_costs = (float *)malloc(sw->gp_max_obs * sizeof(float));
     sw->ext_buf = (float *)malloc(max_ext * (dim + 2) * sizeof(float));
     sw->kept_buf = (int *)malloc(kd_cap * sizeof(int));
     sw->h_cands = (float *)malloc(acq_cap * dim * sizeof(float));
-    sw->h_pred = (float *)malloc(4 * acq_cap * sizeof(float));
+    sw->h_pred = (float *)malloc(2 * acq_cap * sizeof(float));
+    sw->h_ratings = (float *)malloc(acq_cap * sizeof(float));
+    sw->h_topk = (int *)malloc(sw->select_k * sizeof(int));
     sw->kd_idx = (int *)malloc(kd_cap * sizeof(int));
     sw->kd_nodes = (KDNode *)malloc(2 * kd_cap * sizeof(KDNode));
     sw->kd_keep = (int *)malloc(kd_cap * sizeof(int));
@@ -701,87 +638,62 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
 
 static float logit_transform(float value) {
     value = fmaxf(1e-9f, fminf(1.0f - 1e-9f, value));
-    float logit = logf(value / (1.0f - value));
-    return fmaxf(-5.0f, fminf(100.0f, logit));
+    return fmaxf(-5.0f, logf(value / (1.0f - value)));
 }
 
-static float transform_score(const ProteinSweep *sw, float score) {
-    if (sw->use_logit) {
-        score = logit_transform(score);
+// Class-balanced logistic regression (L2-regularized, fixed schedule).
+static int fit_weighted_logistic(const float *X, const int *y, int n, int dim,
+        float *w, float *bias) {
+    int n_pos = 0;
+    for (int i = 0; i < n; i++) {
+        n_pos += y[i];
     }
-    return score * sw->space->optimize_direction;
-}
-
-static float restore_score(const ProteinSweep *sw, float score) {
-    score *= sw->space->optimize_direction;
-    if (sw->use_logit) {
-        score = 1.0f / (1.0f + expf(-score));
+    int n_neg = n - n_pos;
+    if (n_pos == 0 || n_neg == 0) {
+        return 0;
     }
-    return score;
-}
-
-// Empirical-CDF target warp: maps a score to its (0, 1) rank among the sorted
-// observed scores. Ties get the mid-rank so duplicated scores do not stack at
-// one quantile. The GP then models a near-uniform target where symmetric
-// Gaussian error is plausible even for ceiling-limited right-skewed metrics.
-static float score_to_quantile(int n_sorted, const float *sorted_scores,
-        float score) {
-    int lo = (int)(std::lower_bound(sorted_scores, sorted_scores + n_sorted, score)
-        - sorted_scores);
-    int hi = (int)(std::upper_bound(sorted_scores, sorted_scores + n_sorted, score)
-        - sorted_scores);
-    float mid = 0.5f * (float)(lo + hi);
-    return fminf(fmaxf(mid / (float)n_sorted, PROTEIN_EPSILON), 1.0f - PROTEIN_EPSILON);
-}
-
-// Inverse warp for reporting: quantile -> native score by linear interpolation
-// on the ECDF step function.
-static float quantile_to_score(int n_sorted, const float *sorted_scores,
-        float q) {
-    float pos = fminf(fmaxf(q * (float)n_sorted - 0.5f, 0.0f),
-        (float)(n_sorted - 1));
-    int i = (int)pos;
-    int j = i + 1 < n_sorted ? i + 1 : n_sorted - 1;
-    return sorted_scores[i] + (sorted_scores[j] - sorted_scores[i]) * (pos - (float)i);
-}
-
-static void rebuild_top(ProteinSweep *sw) {
-    sw->n_top = 0;
-    for (int idx = 0; idx < sw->succ_n; idx++) {
-        if (sw->cost_dim >= 0
-                && (sw->succ_params[idx * sw->dim + sw->cost_dim] < -1.0f
-                    || sw->succ_params[idx * sw->dim + sw->cost_dim] > 1.0f)) {
-            continue;
+    float w_pos = n / (2.0f * n_pos);
+    float w_neg = n / (2.0f * n_neg);
+    memset(w, 0, dim * sizeof(float));
+    *bias = 0.0f;
+    float grad[dim];
+    for (int iter = 0; iter < PROTEIN_CLF_ITERS; iter++) {
+        float lr = 0.1f / (1.0f + 0.01f * iter);
+        for (int d = 0; d < dim; d++) {
+            grad[d] = 0.0f;
         }
-        int insert = sw->n_top;
-        while (insert > 0
-                && sw->succ_scores[idx] > sw->succ_scores[sw->top_idx[insert - 1]]) {
-            insert--;
+        float grad_b = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float z = *bias;
+            for (int d = 0; d < dim; d++) {
+                z += X[i * dim + d] * w[d];
+            }
+            float sig = 1.0f / (1.0f + expf(-z));
+            float err = (y[i] ? w_pos : w_neg) * (sig - y[i]) / n;
+            for (int d = 0; d < dim; d++) {
+                grad[d] += err * X[i * dim + d];
+            }
+            grad_b += err;
         }
-        if (insert >= sw->top_k) {
-            continue;
+        for (int d = 0; d < dim; d++) {
+            w[d] -= lr * (grad[d] + w[d]);
         }
-        int end = sw->n_top < sw->top_k ? sw->n_top : sw->top_k - 1;
-        for (int j = end; j > insert; j--) {
-            sw->top_idx[j] = sw->top_idx[j - 1];
-        }
-        sw->top_idx[insert] = idx;
-        if (sw->n_top < sw->top_k) {
-            sw->n_top++;
-        }
+        *bias -= lr * grad_b;
     }
-    for (int i = 1; i < sw->n_top; i++) {
-        assert(sw->succ_scores[sw->top_idx[i - 1]]
-            >= sw->succ_scores[sw->top_idx[i]]);
-    }
+    return 1;
 }
 
 void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
-        float score, float cost, int is_failure, int is_terminal) {
-    if (isfinite(score)) {
-        score = transform_score(sw, score);
+        float score, float cost, int is_failure) {
+    if (sw->use_logit) {
+        score = logit_transform(score);
     }
     int dim = sw->dim;
+    float canon_params[dim];
+    for (int d = 0; d < dim; d++) {
+        canon_params[d] = space_canonicalize(&sw->space->spaces[d], norm_params[d]);
+    }
+    norm_params = canon_params;
     if (is_failure || !isfinite(score)) {
         if (sw->fail_n >= sw->failure_cap) {
             return;
@@ -791,9 +703,6 @@ void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
         sw->fail_scores[i] = score;
         sw->fail_costs[i] = cost;
         return;
-    }
-    if (is_terminal) {
-        sw->completed_successes++;
     }
     for (int i = 0; i < sw->succ_n; i++) {
         float dist2 = 0.0f;
@@ -805,9 +714,11 @@ void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
             memcpy(&sw->succ_params[i * dim], norm_params, dim * sizeof(float));
             sw->succ_scores[i] = score;
             sw->succ_costs[i] = cost;
-            rebuild_top(sw);
             return;
         }
+    }
+    if (sw->cost_dim >= 0 && norm_params[sw->cost_dim] <= -1.0f) {
+        return;
     }
     if (sw->succ_n >= sw->success_cap) {
         return;
@@ -816,22 +727,42 @@ void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
     memcpy(&sw->succ_params[idx * dim], norm_params, dim * sizeof(float));
     sw->succ_scores[idx] = score;
     sw->succ_costs[idx] = cost;
-    rebuild_top(sw);
+    if (sw->n_top >= sw->top_k
+            && score <= sw->succ_scores[sw->top_idx[sw->n_top - 1]]) {
+        return;
+    }
+    if (sw->n_top < sw->top_k) {
+        sw->top_idx[sw->n_top++] = idx;
+    } else {
+        sw->top_idx[sw->n_top - 1] = idx;
+    }
+    for (int j = sw->n_top - 1; j > 0; j--) {
+        if (sw->succ_scores[sw->top_idx[j]] <= sw->succ_scores[sw->top_idx[j - 1]]) {
+            break;
+        }
+        int tmp = sw->top_idx[j];
+        sw->top_idx[j] = sw->top_idx[j - 1];
+        sw->top_idx[j - 1] = tmp;
+    }
 }
 
 int protein_sweep_should_stop(const ProteinSweep *sw, float score, float cost) {
-    float threshold = -FLT_MAX;
-    if (sw->cm_fitted) {
-        float min_allowed = sw->cm_upper * 0.3f + 10.0f;
-        if (cost < min_allowed) {
-            threshold = -FLT_MAX;
-        } else if (cost > PROTEIN_THRESHOLD_COST_CAP * sw->cm_upper) {
-            threshold = PROTEIN_THRESHOLD_FALLBACK * sw->cm_max_score;
-        } else {
-            threshold = sw->cm_A + sw->cm_B * logf(cost);
-        }
+    if (sw->use_logit) {
+        score = logit_transform(score);
     }
-    score = transform_score(sw, score);
+    if (!sw->cm_fitted) {
+        return 0;
+    }
+    float min_allowed = sw->cm_upper * 0.3f + 10.0f;
+    if (cost < min_allowed) {
+        return 0;
+    }
+    float threshold;
+    if (cost > PROTEIN_THRESHOLD_COST_CAP * sw->cm_upper) {
+        threshold = PROTEIN_THRESHOLD_FALLBACK * sw->cm_max_score;
+    } else {
+        threshold = sw->cm_A + sw->cm_B * logf(cost);
+    }
     return score < threshold;
 }
 
@@ -844,18 +775,26 @@ static float noise01(void) {
 static void sobol_fallback(ProteinSweep *sw, float *out, int is_fixed_cost,
         float fixed_cost_norm) {
     int dim = sw->dim, cost_dim = sw->cost_dim;
-    curandGenerateUniform(sw->sobol, out, dim);
-    for (int d = 0; d < dim; d++) {
-        out[d] = 2.0f * out[d] - 1.0f;
-    }
-    if (cost_dim < 0) {
-        return;
-    }
-    if (is_fixed_cost) {
-        out[cost_dim] = fixed_cost_norm;
-    } else {
-        out[cost_dim] = fmaxf(-1.0f,
-            fminf(1.0f, sw->cost_random_suggestion + noise01()));
+    for (int attempt = 0; attempt < 1000; attempt++) {
+        curandGenerateUniform(sw->sobol, out, dim);
+        for (int d = 0; d < dim; d++) {
+            out[d] = 2.0f * out[d] - 1.0f;
+            float val = space_unnormalize(&sw->space->spaces[d], out[d]);
+            out[d] = space_normalize(&sw->space->spaces[d], val);
+        }
+        if (cost_dim >= 0) {
+            if (is_fixed_cost) {
+                out[cost_dim] = fixed_cost_norm;
+            } else {
+                float target = fmaxf(-1.0f,
+                    fminf(1.0f, sw->cost_random_suggestion + noise01()));
+                float val = space_unnormalize(&sw->space->spaces[cost_dim], target);
+                out[cost_dim] = space_normalize(&sw->space->spaces[cost_dim], val);
+            }
+        }
+        if (!sw->valid || sw->valid(out, sw->valid_data)) {
+            return;
+        }
     }
 }
 
@@ -931,10 +870,10 @@ static void kd_remove_near(const KDTree *t, int node, const float *q, float r,
         return;
     }
     float dv = q[nd->split_dim] - nd->split_val;
-    if (nd->left >= 0 && dv <= r) {
+    if (dv <= r) {
         kd_remove_near(t, nd->left, q, r, r2, self, keep);
     }
-    if (nd->right >= 0 && dv >= -r) {
+    if (dv >= -r) {
         kd_remove_near(t, nd->right, q, r, r2, self, keep);
     }
 }
@@ -965,6 +904,10 @@ static int filter_near_duplicates(ProteinSweep *sw, const float *X,
     return count;
 }
 
+static int float_cmp(const void *a, const void *b) {
+    float fa = *(const float *)a, fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
 
 static float pinball(float a, float b, const float *x,
         const float *y, int n, float q) {
@@ -990,7 +933,7 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     int dim = sw->dim, cost_dim = sw->cost_dim;
     int is_fixed_cost = !isnan(fixed_cost_norm);
 
-    if (sw->completed_successes < sw->num_random_samples || sw->succ_n == 0) {
+    if (sw->suggestion_idx <= sw->num_random_samples || sw->succ_n == 0) {
         sobol_fallback(sw, out, is_fixed_cost, fixed_cost_norm);
         info.is_random = 1;
         return info;
@@ -998,46 +941,34 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
 
     // sample observations for GP
     sw->min_score = sw->max_score = sw->succ_scores[0];
-    int n_sampleable = 0;
-    for (int i = 0; i < sw->succ_n; i++) {
+    sw->log_c_min = logf(fmaxf(sw->succ_costs[0], PROTEIN_EPSILON));
+    sw->log_c_buf[0] = sw->log_c_min;
+    for (int i = 1; i < sw->succ_n; i++) {
         float s = sw->succ_scores[i];
         sw->min_score = fminf(sw->min_score, s);
         sw->max_score = fmaxf(sw->max_score, s);
-        float log_cost = logf(fmaxf(sw->succ_costs[i], PROTEIN_EPSILON));
-        float log_steps = 0.0f;
-        if (cost_dim >= 0) {
-            float steps = space_unnormalize(&sw->space->spaces[cost_dim],
-                sw->succ_params[i * dim + cost_dim]);
-            log_steps = logf(steps);
-        }
-        if (cost_dim < 0 || (sw->succ_params[i * dim + cost_dim] >= -1.0f
-                && sw->succ_params[i * dim + cost_dim] <= 1.0f)) {
-            sw->log_c_buf[n_sampleable] = log_cost;
-            sw->log_rate_buf[n_sampleable] = log_cost - log_steps;
-            n_sampleable++;
-        }
+        sw->log_c_buf[i] = logf(fmaxf(sw->succ_costs[i], PROTEIN_EPSILON));
+        sw->log_c_min = fminf(sw->log_c_min, sw->log_c_buf[i]);
     }
-    assert(n_sampleable > 0);
-    qsort(sw->log_c_buf, n_sampleable, sizeof(float), float_cmp);
-    qsort(sw->log_rate_buf, n_sampleable, sizeof(float), float_cmp);
-    float qidx = PROTEIN_COST_QUANTILE * (n_sampleable - 1);
-    int qlo = (int)qidx;
-    int qhi = qlo + 1 < n_sampleable ? qlo + 1 : n_sampleable - 1;
+    qsort(sw->log_c_buf, sw->succ_n, sizeof(float), float_cmp);
+    float qidx = PROTEIN_COST_QUANTILE * (sw->succ_n - 1);
+    int qlo = (int)qidx, qhi = qlo + 1 < sw->succ_n ? qlo + 1 : sw->succ_n - 1;
     float qfrac = qidx - qlo;
-    sw->log_c_min = sw->log_c_buf[0];
     sw->log_c_max = sw->log_c_buf[qlo] * (1.0f - qfrac) + sw->log_c_buf[qhi] * qfrac;
-    float low_idx = (1.0f - PROTEIN_COST_QUANTILE) * (n_sampleable - 1);
-    int low_lo = (int)low_idx;
-    int low_hi = low_lo + 1 < n_sampleable ? low_lo + 1 : n_sampleable - 1;
-    float low_frac = low_idx - low_lo;
-    sw->log_rate_min = sw->log_rate_buf[low_lo] * (1.0f - low_frac)
-        + sw->log_rate_buf[low_hi] * low_frac;
-    sw->log_rate_max = sw->log_rate_buf[qlo] * (1.0f - qfrac)
-        + sw->log_rate_buf[qhi] * qfrac;
 
-    int combined_n = sw->succ_n;
+    int use_failures = (sw->succ_n < PROTEIN_MIN_OBS_NO_FAIL && sw->fail_n > 0);
+    int combined_n = use_failures ? sw->fail_n + sw->succ_n : sw->succ_n;
     int ext_dim = dim + 2;
     int ci = 0;
+    if (use_failures) {
+        for (int i = 0; i < sw->fail_n; i++) {
+            memcpy(&sw->ext_buf[ci * ext_dim], &sw->fail_params[i * dim],
+                dim * sizeof(float));
+            sw->ext_buf[ci * ext_dim + dim] = sw->min_score;
+            sw->ext_buf[ci * ext_dim + dim + 1] = sw->fail_costs[i];
+            ci++;
+        }
+    }
     for (int i = 0; i < sw->succ_n; i++) {
         memcpy(&sw->ext_buf[ci * ext_dim], &sw->succ_params[i * dim],
             dim * sizeof(float));
@@ -1067,59 +998,17 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
             dim * sizeof(float));
         sw->gp_train_y[i] = sw->ext_buf[idx * ext_dim + dim];
         sw->gp_train_c[i] = sw->ext_buf[idx * ext_dim + dim + 1];
-        sw->gp_observed_costs[i] = sw->gp_train_c[i];
     }
     int n_gp = n_kept;
 
     float min_score = sw->min_score, max_score = sw->max_score;
     float log_c_min = sw->log_c_min, log_c_max = sw->log_c_max;
-    float log_rate_min = sw->log_rate_min, log_rate_max = sw->log_rate_max;
     float score_range = fabsf(max_score - min_score) + PROTEIN_EPSILON;
     float cost_range = log_c_max - log_c_min + PROTEIN_EPSILON;
-    float rate_range = log_rate_max - log_rate_min + PROTEIN_EPSILON;
-    memcpy(sw->score_sort_buf, sw->succ_scores, (size_t)sw->succ_n * sizeof(float));
-    qsort(sw->score_sort_buf, sw->succ_n, sizeof(float), float_cmp);
     for (int i = 0; i < n_gp; i++) {
-        if (sw->use_quantile) {
-            sw->gp_train_y[i] = score_to_quantile(sw->succ_n, sw->score_sort_buf,
-                sw->gp_train_y[i]);
-        } else {
-            sw->gp_train_y[i] = (sw->gp_train_y[i] - min_score) / score_range;
-        }
-        float log_steps = 0.0f;
-        if (cost_dim >= 0) {
-            float steps = space_unnormalize(&sw->space->spaces[cost_dim],
-                sw->gp_train_params[i * dim + cost_dim]);
-            log_steps = logf(steps);
-        }
-        float log_rate = logf(fmaxf(sw->gp_train_c[i], PROTEIN_EPSILON)) - log_steps;
-        sw->gp_train_c[i] = (log_rate - log_rate_min) / rate_range;
-    }
-    float score_mean = 0.0f;
-    float rate_mean = 0.0f;
-    for (int i = 0; i < n_gp; i++) {
-        score_mean += sw->gp_train_y[i];
-        rate_mean += sw->gp_train_c[i];
-    }
-    sw->gp_score.target_mean = score_mean / n_gp;
-    sw->gp_cost.target_mean = rate_mean / n_gp;
-    float score_variance = 0.0f;
-    float rate_variance = 0.0f;
-    for (int i = 0; i < n_gp; i++) {
-        float score_delta = sw->gp_train_y[i] - sw->gp_score.target_mean;
-        float rate_delta = sw->gp_train_c[i] - sw->gp_cost.target_mean;
-        score_variance += score_delta * score_delta;
-        rate_variance += rate_delta * rate_delta;
-    }
-    sw->gp_score.target_scale = fmaxf(sqrtf(score_variance / n_gp),
-        PROTEIN_EPSILON);
-    sw->gp_cost.target_scale = fmaxf(sqrtf(rate_variance / n_gp),
-        PROTEIN_EPSILON);
-    for (int i = 0; i < n_gp; i++) {
-        sw->gp_train_y[i] = (sw->gp_train_y[i] - sw->gp_score.target_mean)
-            / sw->gp_score.target_scale;
-        sw->gp_train_c[i] = (sw->gp_train_c[i] - sw->gp_cost.target_mean)
-            / sw->gp_cost.target_scale;
+        sw->gp_train_y[i] = (sw->gp_train_y[i] - min_score) / score_range;
+        float lc = logf(fmaxf(sw->gp_train_c[i], PROTEIN_EPSILON));
+        sw->gp_train_c[i] = (lc - log_c_min) / cost_range;
     }
 
     // Train GPs
@@ -1138,19 +1027,14 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     }
 
     // Pareto front + prune
-    n_sampleable = 0;
     for (int i = 0; i < sw->succ_n; i++) {
-        if (cost_dim < 0 || (sw->succ_params[i * dim + cost_dim] >= -1.0f
-                && sw->succ_params[i * dim + cost_dim] <= 1.0f)) {
-            sw->pruned_buf[n_sampleable++] = i;
-        }
+        sw->pruned_buf[i] = i;
     }
-    assert(n_sampleable > 0);
     g_pareto_costs = sw->succ_costs;
-    qsort(sw->pruned_buf, n_sampleable, sizeof(int), pareto_cmp);
+    qsort(sw->pruned_buf, sw->succ_n, sizeof(int), pareto_cmp);
     int n_pareto = 0;
     float max_ps = -FLT_MAX;
-    for (int i = 0; i < n_sampleable; i++) {
+    for (int i = 0; i < sw->succ_n; i++) {
         int idx = sw->pruned_buf[i];
         if (sw->succ_scores[idx] > max_ps + PROTEIN_EPSILON) {
             sw->pareto_buf[n_pareto++] = idx;
@@ -1194,9 +1078,6 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
             sw->upper_cost_threshold = pruned_max_cost;
         } else if (pruned_max_cost > sw->upper_cost_threshold) {
             sw->upper_cost_threshold *= PROTEIN_COST_GROWTH;
-        } else {
-            sw->upper_cost_threshold +=
-                0.05f * (pruned_max_cost - sw->upper_cost_threshold);
         }
     }
 
@@ -1324,6 +1205,12 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
             n_centers++;
         }
     }
+    for (int i = 0; i < n_centers; i++) {
+        for (int d = 0; d < dim; d++) {
+            sw->centers_buf[i * dim + d] = space_canonicalize(
+                &sw->space->spaces[d], sw->centers_buf[i * dim + d]);
+        }
+    }
 
     // Target cost
     float target_cost = 0.0f;
@@ -1342,48 +1229,6 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         target_cost = (1.0f + sw->expansion_rate) * ratio;
     }
 
-    gp_predict(&sw->gp_score, sw->gp_score.d_X, sw->d_pred_y, NULL,
-        n_gp, sw->stream);
-    cudaMemcpyAsync(sw->h_pred, sw->d_pred_y, n_gp * sizeof(float),
-        cudaMemcpyDeviceToHost, sw->stream);
-    cudaStreamSynchronize(sw->stream);
-    float best_norm = -FLT_MAX;
-    float nearest_cost = FLT_MAX;
-    float nearest_score = -FLT_MAX;
-    for (int i = 0; i < n_gp; i++) {
-        if (cost_dim >= 0 && (sw->gp_train_params[i * dim + cost_dim] < -1.0f
-                || sw->gp_train_params[i * dim + cost_dim] > 1.0f)) {
-            continue;
-        }
-        float mean = sw->h_pred[i] * sw->gp_score.target_scale
-            + sw->gp_score.target_mean;
-        float distance;
-        int eligible;
-        if (is_fixed_cost && cost_dim >= 0) {
-            distance = fabsf(sw->gp_train_params[i * dim + cost_dim] - fixed_cost_norm);
-            eligible = distance <= 0.1f;
-        } else if (!is_fixed_cost) {
-            float cn = (logf(fmaxf(sw->gp_observed_costs[i], PROTEIN_EPSILON))
-                - log_c_min) / cost_range;
-            distance = fabsf(cn - target_cost);
-            eligible = cn <= target_cost + PROTEIN_COST_SIGMA;
-        } else {
-            distance = 0.0f;
-            eligible = 1;
-        }
-        if (eligible) {
-            best_norm = fmaxf(best_norm, mean);
-        }
-        if (distance < nearest_cost) {
-            nearest_cost = distance;
-            nearest_score = mean;
-        }
-    }
-    if (best_norm == -FLT_MAX) {
-        best_norm = nearest_score;
-    }
-    assert(isfinite(best_norm));
-
     // Sample candidates
     int n_total = n_centers * sw->suggestions_per_pareto;
     if (n_total > sw->acq_cap) {
@@ -1399,6 +1244,25 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     cudaMemcpyAsync(sw->h_cands, sw->d_candidates, n_total * dim * sizeof(float),
         cudaMemcpyDeviceToHost, sw->stream);
     cudaStreamSynchronize(sw->stream);
+    for (int i = 0; i < n_total; i++) {
+        for (int d = 0; d < dim; d++) {
+            float val = space_unnormalize(&sw->space->spaces[d], sw->h_cands[i * dim + d]);
+            sw->h_cands[i * dim + d] = space_normalize(&sw->space->spaces[d], val);
+        }
+    }
+    if (sw->valid) {
+        int valid_cands = 0;
+        for (int i = 0; i < n_total; i++) {
+            if (sw->valid(&sw->h_cands[i * dim], sw->valid_data)) {
+                if (valid_cands != i) {
+                    memcpy(&sw->h_cands[valid_cands * dim], &sw->h_cands[i * dim],
+                        dim * sizeof(float));
+                }
+                valid_cands++;
+            }
+        }
+        n_total = valid_cands;
+    }
     int n_cands = filter_near_duplicates(
         sw, sw->h_cands, n_total, dim, PROTEIN_EPSILON, sw->kept_buf);
     if (n_cands < n_total) {
@@ -1406,6 +1270,8 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
             memmove(&sw->h_cands[i * dim], &sw->h_cands[sw->kept_buf[i] * dim],
                 dim * sizeof(float));
         }
+    }
+    if (n_cands > 0) {
         cudaMemcpyAsync(sw->d_candidates, sw->h_cands, n_cands * dim * sizeof(float),
             cudaMemcpyHostToDevice, sw->stream);
     }
@@ -1416,9 +1282,9 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         return info;
     }
 
-    // Success classifier
+    // Success (validity) classifier: OOM failures vs successful runs.
     sw->clf_fitted = 0;
-    if (sw->use_success_prob && sw->succ_n > 9 && sw->fail_n > 1) {
+    if (sw->use_success_prob && sw->succ_n > 9 && sw->fail_n > 9) {
         int n_s = sw->succ_n, n_f = sw->fail_n, n_clf = n_s + n_f;
         float *X = sw->ext_buf;
         int *yy = sw->kept_buf;
@@ -1430,206 +1296,79 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         for (int i = 0; i < n_f; i++) {
             yy[n_s + i] = 0;
         }
-        int n_pos = 0;
-        for (int i = 0; i < n_clf; i++) {
-            n_pos += yy[i];
-        }
-        int n_neg = n_clf - n_pos;
-        if (n_pos > 0 && n_neg > 0) {
-            float w_pos = n_clf / (2.0f * n_pos);
-            float w_neg = n_clf / (2.0f * n_neg);
-            memset(sw->clf_w, 0, dim * sizeof(float));
-            sw->clf_bias = 0.0f;
-            float grad[dim];
-            for (int iter = 0; iter < PROTEIN_CLF_ITERS; iter++) {
-                float lr = 0.1f / (1.0f + 0.01f * iter);
-                for (int d = 0; d < dim; d++) {
-                    grad[d] = 0.0f;
-                }
-                float grad_b = 0.0f;
-                for (int i = 0; i < n_clf; i++) {
-                    float z = sw->clf_bias;
-                    for (int d = 0; d < dim; d++) {
-                        z += X[i * dim + d] * sw->clf_w[d];
-                    }
-                    float sig = 1.0f / (1.0f + expf(-z));
-                    float err = (yy[i] ? w_pos : w_neg) * (sig - yy[i]) / n_clf;
-                    for (int d = 0; d < dim; d++) {
-                        grad[d] += err * X[i * dim + d];
-                    }
-                    grad_b += err;
-                }
-                for (int d = 0; d < dim; d++) {
-                    sw->clf_w[d] -= lr * (grad[d] + sw->clf_w[d]);
-                }
-                sw->clf_bias -= lr * grad_b;
-            }
-            sw->clf_fitted = 1;
-        }
+        sw->clf_fitted = fit_weighted_logistic(X, yy, n_clf, dim,
+            sw->clf_w, &sw->clf_bias);
     }
 
+
     // GP predict + score/argmax
-    gp_predict(&sw->gp_score, sw->d_candidates, sw->d_pred_y,
-        sw->gp_score.d_stds, n_cands, sw->stream);
-    gp_predict(&sw->gp_cost, sw->d_candidates, sw->d_pred_c,
-        sw->gp_cost.d_stds,
-        n_cands, sw->stream);
+    gp_predict(&sw->gp_score, sw->d_candidates, sw->d_pred_y, n_cands, sw->stream);
+    gp_predict(&sw->gp_cost, sw->d_candidates, sw->d_pred_c, n_cands, sw->stream);
     cudaMemcpyAsync(sw->h_pred, sw->d_pred_y, n_cands * sizeof(float),
         cudaMemcpyDeviceToHost, sw->stream);
     cudaMemcpyAsync(sw->h_pred + n_cands, sw->d_pred_c, n_cands * sizeof(float),
         cudaMemcpyDeviceToHost, sw->stream);
-    cudaMemcpyAsync(sw->h_pred + 2 * n_cands, sw->gp_score.d_stds,
-        n_cands * sizeof(float), cudaMemcpyDeviceToHost, sw->stream);
-    cudaMemcpyAsync(sw->h_pred + 3 * n_cands, sw->gp_cost.d_stds,
-        n_cands * sizeof(float), cudaMemcpyDeviceToHost, sw->stream);
     cudaStreamSynchronize(sw->stream);
 
     int best = 0;
     float best_s = -FLT_MAX;
-    float best_ei = 0.0f;
-    float best_cost_weight = 1.0f;
-    float best_limit_probability = 1.0f;
-    float best_valid_probability = 1.0f;
+    int opt_dir = sw->space->optimize_direction;
     for (int i = 0; i < n_cands; i++) {
-        float mu = sw->h_pred[i] * sw->gp_score.target_scale
-            + sw->gp_score.target_mean;
-        float sd = sw->h_pred[2 * n_cands + i] * sw->gp_score.target_scale;
-        float z = mu - best_norm;
-        float t = z / sd;
-        float expected_improvement = z * norm_cdf(t) + sd * norm_pdf(t);
-        float cost_weight = 1.0f;
-        float limit_probability = 1.0f;
-        float valid_probability = 1.0f;
-        float s = expected_improvement;
+        float s = opt_dir * sw->h_pred[i];
         if (!is_fixed_cost) {
-            float rate_norm = sw->h_pred[n_cands + i] * sw->gp_cost.target_scale
-                + sw->gp_cost.target_mean;
-            float log_steps = 0.0f;
-            if (cost_dim >= 0) {
-                float steps = space_unnormalize(&sw->space->spaces[cost_dim],
-                    sw->h_cands[i * dim + cost_dim]);
-                log_steps = logf(steps);
-            }
-            float log_cost = rate_norm * rate_range + log_rate_min + log_steps;
-            float log_cost_sd = sqrtf(sw->h_pred[3 * n_cands + i]
-                    * sw->h_pred[3 * n_cands + i]
-                    + PROTEIN_NOISE_FLOOR + softplus(sw->gp_cost.raw_noise))
-                * sw->gp_cost.target_scale * rate_range;
-            float cn = (log_cost - log_c_min) / cost_range;
-            float cn_sd = log_cost_sd / cost_range;
-            float target_var = PROTEIN_COST_SIGMA * PROTEIN_COST_SIGMA
-                + cn_sd * cn_sd;
-            cost_weight = PROTEIN_COST_SIGMA / sqrtf(target_var)
-                * expf(-0.5f * (cn - target_cost) * (cn - target_cost) / target_var);
-            limit_probability = norm_cdf(
-                (logf(sw->max_suggestion_cost) - log_cost) / log_cost_sd);
-            s *= cost_weight * limit_probability;
+            float cn = sw->h_pred[n_cands + i];
+            float c = expf(cn * (log_c_max - log_c_min) + log_c_min);
+            s *= (c < sw->max_suggestion_cost ? 1.0f : 0.0f)
+                * (1.0f - fabsf(target_cost - cn));
         }
         if (sw->clf_fitted) {
-            float clf_z = sw->clf_bias;
+            float z = sw->clf_bias;
             for (int d = 0; d < dim; d++) {
-                clf_z += sw->h_cands[i * dim + d] * sw->clf_w[d];
+                z += sw->h_cands[i * dim + d] * sw->clf_w[d];
             }
-            valid_probability = 1.0f / (1.0f + expf(-clf_z));
-            s *= valid_probability;
+            s *= 1.0f / (1.0f + expf(-z));
         }
+        sw->h_ratings[i] = s;
         if (s > best_s) {
             best_s = s;
             best = i;
-            best_ei = expected_improvement;
-            best_cost_weight = cost_weight;
-            best_limit_probability = limit_probability;
-            best_valid_probability = valid_probability;
         }
     }
-    memcpy(out, &sw->h_cands[best * dim], dim * sizeof(float));
-    float y_norm = sw->h_pred[best] * sw->gp_score.target_scale
-        + sw->gp_score.target_mean;
-    float score_pred_sd = sqrtf(sw->h_pred[2 * n_cands + best]
-            * sw->h_pred[2 * n_cands + best]
-            + PROTEIN_NOISE_FLOOR + softplus(sw->gp_score.raw_noise))
-        * sw->gp_score.target_scale;
-    float latent_score_sd = sw->h_pred[2 * n_cands + best]
-        * sw->gp_score.target_scale;
-    float rate_norm = sw->h_pred[n_cands + best] * sw->gp_cost.target_scale
-        + sw->gp_cost.target_mean;
-    float log_steps = 0.0f;
-    if (cost_dim >= 0) {
-        float steps = space_unnormalize(&sw->space->spaces[cost_dim],
-            sw->h_cands[best * dim + cost_dim]);
-        log_steps = logf(steps);
+    // select_k > 1: uniform pick among the top select_k rated candidates;
+    // select_k == 1 reduces to plain argmax (best).
+    int chosen = best;
+    if (sw->select_k > 1 && n_cands > 1) {
+        int k = sw->select_k < n_cands ? sw->select_k : n_cands;
+        int topn = 0;
+        for (int i = 0; i < n_cands; i++) {
+            float s = sw->h_ratings[i];
+            int pos = topn;
+            while (pos > 0 && sw->h_ratings[sw->h_topk[pos - 1]] < s) {
+                if (pos < k) {
+                    sw->h_topk[pos] = sw->h_topk[pos - 1];
+                }
+                pos--;
+            }
+            if (pos < k) {
+                sw->h_topk[pos] = i;
+                if (topn < k) {
+                    topn++;
+                }
+            }
+        }
+        chosen = sw->h_topk[rand() % topn];
+        best_s = sw->h_ratings[chosen];
     }
-    float log_cost = rate_norm * rate_range + log_rate_min + log_steps;
-    float log_cost_sd = sqrtf(sw->h_pred[3 * n_cands + best]
-            * sw->h_pred[3 * n_cands + best]
-            + PROTEIN_NOISE_FLOOR + softplus(sw->gp_cost.raw_noise))
-        * sw->gp_cost.target_scale * rate_range;
+    for (int d = 0; d < dim; d++) {
+        out[d] = space_canonicalize(&sw->space->spaces[d], sw->h_cands[chosen * dim + d]);
+    }
+    float y_norm = sw->h_pred[chosen], c_norm = sw->h_pred[n_cands + chosen];
 
     info.score_loss = score_loss;
     info.cost_loss = cost_loss;
-    if (sw->use_quantile) {
-        float predicted = quantile_to_score(sw->succ_n, sw->score_sort_buf, y_norm);
-        float hi = quantile_to_score(sw->succ_n, sw->score_sort_buf,
-            fminf(y_norm + score_pred_sd, 1.0f));
-        float lo = quantile_to_score(sw->succ_n, sw->score_sort_buf,
-            fmaxf(y_norm - score_pred_sd, 0.0f));
-        info.predicted_score = restore_score(sw, predicted);
-        info.predicted_std = 0.5f
-            * fabsf(restore_score(sw, hi) - restore_score(sw, lo));
-        hi = quantile_to_score(sw->succ_n, sw->score_sort_buf,
-            fminf(y_norm + latent_score_sd, 1.0f));
-        lo = quantile_to_score(sw->succ_n, sw->score_sort_buf,
-            fmaxf(y_norm - latent_score_sd, 0.0f));
-        info.latent_std = 0.5f
-            * fabsf(restore_score(sw, hi) - restore_score(sw, lo));
-        info.best_score = restore_score(sw,
-            quantile_to_score(sw->succ_n, sw->score_sort_buf, best_norm));
-    } else {
-        float predicted = y_norm * score_range + min_score;
-        float transformed_sd = score_pred_sd * score_range;
-        float latent_transformed_sd = latent_score_sd * score_range;
-        info.predicted_score = restore_score(sw, predicted);
-        if (sw->use_logit) {
-            info.predicted_std = 0.5f * fabsf(
-                restore_score(sw, predicted + transformed_sd)
-                - restore_score(sw, predicted - transformed_sd));
-            info.latent_std = 0.5f * fabsf(
-                restore_score(sw, predicted + latent_transformed_sd)
-                - restore_score(sw, predicted - latent_transformed_sd));
-        } else {
-            info.predicted_std = transformed_sd;
-            info.latent_std = latent_transformed_sd;
-        }
-        info.best_score = restore_score(sw, best_norm * score_range + min_score);
-    }
-    float log_variance = log_cost_sd * log_cost_sd;
-    info.predicted_cost = expf(log_cost + 0.5f * log_variance);
-    info.predicted_cost_std = sqrtf((expf(log_variance) - 1.0f)
-        * expf(2.0f * log_cost + log_variance));
-    info.predicted_cost_upper = expf(log_cost + PROTEIN_COST_LIMIT_Z * log_cost_sd);
-    info.expected_improvement = best_ei;
-    info.target_cost = expf(log_c_min + target_cost * cost_range);
-    info.cost_weight = best_cost_weight;
-    info.limit_probability = best_limit_probability;
-    info.valid_probability = best_valid_probability;
+    info.predicted_score = y_norm * (max_score - min_score) + min_score;
+    info.predicted_cost = expf(c_norm * (log_c_max - log_c_min) + log_c_min);
     info.rating = best_s;
-    float nearest_distance = FLT_MAX;
-    for (int i = 0; i < n_gp; i++) {
-        float distance = 0.0f;
-        for (int d = 0; d < dim; d++) {
-            float delta = sw->h_cands[best * dim + d] - sw->gp_train_params[i * dim + d];
-            distance += delta * delta;
-        }
-        nearest_distance = fminf(nearest_distance, distance);
-    }
-    info.nearest_distance = sqrtf(nearest_distance / dim);
-    for (int d = 0; d < dim; d++) {
-        float value = space_unnormalize(
-            &sw->space->spaces[d], sw->h_cands[best * dim + d]);
-        if (value == sw->space->spaces[d].min || value == sw->space->spaces[d].max) {
-            info.boundary_count++;
-        }
-    }
     info.n_pareto = n_use;
     info.n_gp_obs = n_gp;
     info.n_candidates = n_cands;

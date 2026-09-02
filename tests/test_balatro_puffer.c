@@ -48,6 +48,46 @@ static Action first_action(const LegalMasks *masks) {
     return (Action){0};
 }
 
+static float completion_reward(uint8_t blind_on_deck, uint8_t skipped) {
+    Config config;
+    default_config(&config);
+    config.shaped_reward = 1;
+    config.progress_reward = 0.0f;
+    config.blind_bonus = 0.2f;
+    config.ante_bonus = 1.0f;
+    config.win_bonus = 0.0f;
+    config.loss_penalty = 0.0f;
+    config.money_reward = 0.0f;
+    State state;
+    assert(init(&state, &config, 3 + blind_on_deck + skipped) == OK);
+    state.phase = PHASE_SELECTING_HAND;
+    state.blind_on_deck = blind_on_deck;
+    state.blind_id = blind_on_deck == 0 ? BLIND_BL_SMALL
+        : blind_on_deck == 1 ? BLIND_BL_BIG : BLIND_BL_CLUB;
+    state.blind_skipped_mask = skipped;
+    state.blind_disabled = 0;
+    state.hands_left = 1;
+    state.blind_chips = 1;
+    state.deck_count = 0;
+    state.discard_count = 0;
+    state.hand_count = 1;
+    state.hand[0] = (Card){
+        .center_id = CENTER_C_BASE,
+        .rank = 14,
+        .suit = HEARTS,
+        .sort_id = 1,
+    };
+    Action play = {
+        .type = ACTION_PLAY_HAND,
+        .selection_count = 1,
+        .selection = {0},
+    };
+    StepResult result;
+    assert(apply_step(&state, &play, NULL, &result) == OK);
+    assert(state.phase == PHASE_ROUND_EVAL);
+    return result.reward;
+}
+
 int main(void) {
     State credit_state = {0};
     credit_state.jokers[0] = (Card){.center_id = CENTER_J_CREDIT_CARD};
@@ -56,6 +96,109 @@ int main(void) {
     assert(!can_afford(&credit_state, 21));
     credit_state.jokers[0].flags = CARD_DEBUFFED;
     assert(!can_afford(&credit_state, 1));
+
+    float small_reward = completion_reward(0, 0);
+    float big_reward = completion_reward(1, 0);
+    assert(fabsf(small_reward - 0.2f) < 1e-6f);
+    assert(fabsf(big_reward - 0.2f) < 1e-6f);
+    assert(fabsf(completion_reward(2, 0) - 0.6f) < 1e-6f);
+    assert(fabsf(completion_reward(2, 1) - 0.8f) < 1e-6f);
+    assert(fabsf(completion_reward(2, 3) - 1.0f) < 1e-6f);
+    assert(fabsf(small_reward + big_reward + completion_reward(2, 0) - 1.0f) < 1e-6f);
+    assert(fabsf(big_reward + completion_reward(2, 1) - 1.0f) < 1e-6f);
+    Config skip_config;
+    default_config(&skip_config);
+    skip_config.shaped_reward = 1;
+    State skip_state;
+    assert(init(&skip_state, &skip_config, 9) == OK);
+    Action skip = {.type = ACTION_SKIP_BLIND};
+    StepResult skip_result;
+    assert(apply_step(&skip_state, &skip, NULL, &skip_result) == OK);
+    assert(skip_result.reward == 0.0f);
+    assert(skip_state.blind_on_deck == 1);
+    assert(skip_state.blind_skipped_mask == 1);
+
+    Config chaos_config;
+    default_config(&chaos_config);
+    State chaos_state;
+    assert(init(&chaos_state, &chaos_config, 1) == OK);
+    chaos_state.phase = PHASE_SHOP;
+    chaos_state.dollars = 20;
+    chaos_state.shop_main[0] = (Card){
+        .center_id = CENTER_J_CHAOS,
+        .cost = 4,
+        .sell_cost = 2,
+    };
+    chaos_state.shop_main_count = 1;
+    Observation chaos_observation;
+    LegalMasks chaos_masks;
+    assert(observe(&chaos_state, &chaos_observation, &chaos_masks) == OK);
+    StepResult chaos_result;
+    Action buy_chaos = {.type = ACTION_BUY_CARD};
+    assert(apply_step(&chaos_state, &buy_chaos, &chaos_masks, &chaos_result) == OK);
+    assert(chaos_state.joker_count == 1);
+    assert(chaos_state.jokers[0].center_id == CENTER_J_CHAOS);
+    assert(chaos_state.free_rerolls == 1);
+    assert(chaos_state.reroll_cost == 0);
+    int32_t dollars_after_chaos = chaos_state.dollars;
+    assert(observe(&chaos_state, &chaos_observation, &chaos_masks) == OK);
+    assert(chaos_observation.globals.free_rerolls == 1);
+    assert(chaos_observation.globals.reroll_cost == 0);
+    assert(chaos_masks.primary[ACTION_REROLL] == 1);
+    Action reroll = {.type = ACTION_REROLL};
+    assert(apply_step(&chaos_state, &reroll, &chaos_masks, &chaos_result) == OK);
+    assert(chaos_state.dollars == dollars_after_chaos);
+    assert(chaos_state.free_rerolls == 0);
+    assert(chaos_state.reroll_cost == chaos_state.reroll_base);
+    assert(observe(&chaos_state, &chaos_observation, &chaos_masks) == OK);
+    assert(apply_step(&chaos_state, &reroll, &chaos_masks, &chaos_result) == OK);
+    assert(chaos_state.dollars == dollars_after_chaos - chaos_state.reroll_base);
+    assert(chaos_state.reroll_cost == chaos_state.reroll_base + 1);
+
+    State mouth_state;
+    assert(init(&mouth_state, &chaos_config, 2) == OK);
+    mouth_state.phase = PHASE_SELECTING_HAND;
+    mouth_state.blind_id = BLIND_BL_MOUTH;
+    mouth_state.blind_disabled = 0;
+    mouth_state.blind_only_hand = UINT8_MAX;
+    mouth_state.hands_left = 2;
+    mouth_state.hand_size = 3;
+    mouth_state.blind_chips = 1000000;
+    mouth_state.deck_count = 0;
+    mouth_state.discard_count = 0;
+    mouth_state.hand_count = 3;
+    mouth_state.hand[0] = (Card){.center_id = CENTER_C_BASE, .rank = 2, .suit = HEARTS, .sort_id = 1};
+    mouth_state.hand[1] = (Card){.center_id = CENTER_C_BASE, .rank = 2, .suit = SPADES, .sort_id = 2};
+    mouth_state.hand[2] = (Card){.center_id = CENTER_C_BASE, .rank = 13, .suit = CLUBS, .sort_id = 3};
+    Observation mouth_observation;
+    LegalMasks mouth_masks;
+    assert(observe(&mouth_state, &mouth_observation, &mouth_masks) == OK);
+    Action play_pair = {
+        .type = ACTION_PLAY_HAND,
+        .selection_count = 2,
+        .selection = {0, 1},
+    };
+    StepResult mouth_result;
+    assert(apply_step(&mouth_state, &play_pair, &mouth_masks, &mouth_result) == OK);
+    assert(mouth_state.blind_only_hand == PAIR);
+    assert(mouth_state.last_hand_type == PAIR);
+    assert(mouth_state.last_hand_score > 0);
+    double pair_chips = mouth_state.chips;
+    mouth_state.jokers[0] = (Card){.center_id = CENTER_J_MIDAS_MASK};
+    mouth_state.jokers[1] = (Card){.center_id = CENTER_J_VAGABOND};
+    mouth_state.joker_count = 2;
+    assert(observe(&mouth_state, &mouth_observation, &mouth_masks) == OK);
+    Action play_high_card = {
+        .type = ACTION_PLAY_HAND,
+        .selection_count = 1,
+        .selection = {0},
+    };
+    assert(apply_step(&mouth_state, &play_high_card, &mouth_masks, &mouth_result) == OK);
+    assert(mouth_state.last_hand_type == HIGH_CARD);
+    assert(mouth_state.last_hand_score == 0);
+    assert(mouth_state.chips == pair_chips);
+    assert(mouth_state.discard[2].enhancement == ENHANCEMENT_NONE);
+    assert(mouth_state.consumable_count == 0);
 
     Env env = {0};
     Dict kwargs = {0};
@@ -71,15 +214,32 @@ int main(void) {
     potential->value = 255.0;
     DictItem *reorder = dict_item(&kwargs, "reorder_actions");
     reorder->value = 1.0;
+    DictItem *money = dict_item(&kwargs, "money_reward");
+    money->value = 0.1;
+    DictItem *seed = dict_item(&kwargs, "seed");
+    seed->value = 1234.0;
     env.agents[0].observations = observation;
     env.agents[0].actions = actions;
     env.agents[0].rewards = &reward;
     env.agents[0].terminals = &terminal;
     env.agents[0].action_mask = action_mask;
     puf_init(&env, &kwargs);
+    assert(env.rng == 1234);
+    Env adjacent = {.rng = 1};
+    puf_init(&adjacent, &kwargs);
+    assert(adjacent.rng == 1235);
     assert(env.config.potential_scale == 255);
     assert(env.reorder_actions == 1);
+    assert(env.config.money_reward == 0.1f);
+    unsigned int expected_rng = 1234;
+    uint64_t expected_seed = ((uint64_t)rand_r(&expected_rng) << 32) |
+        rand_r(&expected_rng);
     puf_reset(&env);
+    assert(env.state.numeric_seed == expected_seed);
+    assert(env.rng == expected_rng);
+    uint64_t first_seed = env.state.numeric_seed;
+    puf_reset(&env);
+    assert(env.state.numeric_seed != first_seed);
     assert(action_mask[ACTION_SELECT_BLIND] == 1);
     assert(mask_u64(action_mask, POLICY_PRIMARY_OFFSET +
         ACTION_SELECT_BLIND * POLICY_PRIMARY_BYTES) == 1);
@@ -88,18 +248,117 @@ int main(void) {
     StepResult select_result = {0};
     assert(apply_step(&env.state, &select_action, &env.legal_masks, &select_result) == OK);
     assert(puffer_observe(&env) == OK);
+    assert(action_mask[POLICY_ORDER_HAND_COUNT_OFFSET] == env.state.hand_count);
+    assert(action_mask[POLICY_ORDER_JOKER_COUNT_OFFSET] == env.state.joker_count);
+    assert(action_mask[POLICY_ORDER_ENABLED_OFFSET] == 1);
     assert(env.legal_masks.primary[ACTION_SWAP_HAND_LEFT]);
     assert(env.legal_masks.primary[ACTION_SWAP_HAND_RIGHT]);
     assert(env.legal_masks.primary[ACTION_SORT_HAND_RANK] == 1);
     assert(env.legal_masks.primary[ACTION_SORT_HAND_SUIT] == 1);
-    assert(action_mask[ACTION_SWAP_HAND_LEFT] == 1);
-    assert(action_mask[ACTION_SORT_HAND_RANK] == 1);
+    /* Reordering is a policy suffix, so primitive ordering transitions are
+       retained in the core mask but never exposed to the learned policy. */
+    assert(action_mask[ACTION_SWAP_HAND_LEFT] == 0);
+    assert(action_mask[ACTION_SWAP_HAND_RIGHT] == 0);
+    assert(action_mask[ACTION_SORT_HAND_RANK] == 0);
+    assert(action_mask[ACTION_SORT_HAND_SUIT] == 0);
+    /* Force one inversion: the core still reports the primitive action. */
+    Card swap_tmp = env.state.hand[0];
+    env.state.hand[0] = env.state.hand[1];
+    env.state.hand[1] = swap_tmp;
+    assert(puffer_observe(&env) == OK);
+    uint64_t swap_bits = mask_u64(action_mask, POLICY_PRIMARY_OFFSET +
+        ACTION_SWAP_HAND_LEFT * POLICY_PRIMARY_BYTES);
+    assert(swap_bits == 0);
+    assert(action_mask[ACTION_SORT_HAND_RANK] == 0);
+    /* Sorting clears the swap and sort options in the learned mask again. */
+    Action sort_rank = {.type = ACTION_SORT_HAND_RANK};
+    assert(apply_step(&env.state, &sort_rank, &env.legal_masks, &select_result) == OK);
+    assert(puffer_observe(&env) == OK);
+    assert(mask_u64(action_mask, POLICY_PRIMARY_OFFSET +
+        ACTION_SWAP_HAND_LEFT * POLICY_PRIMARY_BYTES) == 0);
+    assert(action_mask[ACTION_SORT_HAND_RANK] == 0);
+    /* A joker permutation is applied before the consequential action, and
+       the sell target follows its stable pre-permutation identity. */
+    env.max_episode_steps = 0;
+    env.state.jokers[0] = (Card){
+        .center_id = CENTER_J_BANNER, .cost = 5, .sell_cost = 4};
+    env.state.jokers[1] = (Card){
+        .center_id = CENTER_J_MIDAS_MASK, .cost = 5, .sell_cost = 2};
+    env.state.joker_count = 2;
+    assert(puffer_observe(&env) == OK);
+    reward = 0.0f;
+    actions[0] = (float)ACTION_SELL_JOKER;
+    actions[1] = 0.0f;
+    actions[2] = 0.0f;
+    for (int i = 0; i < MAX_SELECTION; ++i) actions[3 + i] = 0.0f;
+    for (int i = 0; i < env.state.hand_count; ++i)
+        actions[BALATRO_ORDER_HAND_OFFSET + i] = (float)i;
+    for (int i = 0; i < env.state.joker_count; ++i)
+        actions[BALATRO_ORDER_JOKER_OFFSET + i] = (float)(1 - i);
+    Client render_client = {0};
+    env.client = &render_client;
+    puf_step(&env);
+    env.client = NULL;
+    assert(fabsf(reward - 0.1f * 4.0f) < 1e-6f);
+
+    /* Death uses the final hand order directionally: after reversing the
+       hand, the stable old slot 1 becomes the left target and old slot 0 the
+       right source. */
+    env.state.phase = PHASE_SELECTING_HAND;
+    env.state.hands_left = 1;
+    env.state.discards_left = 0;
+    env.state.hand_count = 2;
+    env.state.hand[0] = (Card){
+        .center_id = CENTER_C_BASE, .rank = 2, .suit = HEARTS, .sort_id = 10};
+    env.state.hand[1] = (Card){
+        .center_id = CENTER_C_BASE, .rank = 14, .suit = SPADES, .sort_id = 11};
+    env.state.consumables[0] = (Card){.center_id = CENTER_C_DEATH};
+    env.state.consumable_count = 1;
+    assert(puffer_observe(&env) == OK);
+    reward = 0.0f;
+    actions[0] = (float)ACTION_USE_CONSUMABLE;
+    actions[1] = 0.0f;
+    actions[2] = 2.0f;
+    actions[3] = 0.0f;
+    actions[4] = 1.0f;
+    for (int i = 0; i < MAX_SELECTION - 2; ++i) actions[5 + i] = 0.0f;
+    for (int i = 0; i < env.state.hand_count; ++i)
+        actions[BALATRO_ORDER_HAND_OFFSET + i] = (float)(1 - i);
+    for (int i = 0; i < env.state.joker_count; ++i)
+        actions[BALATRO_ORDER_JOKER_OFFSET + i] = (float)i;
+    puf_step(&env);
+    assert(env.state.hand[0].rank == 2);
+    assert(env.state.hand[1].rank == 2);
+    assert(env.state.hand[0].suit == HEARTS);
+    assert(env.state.hand[1].suit == HEARTS);
+    assert(env.state.consumable_count == 0);
+
+    assert(env.state.joker_count == 1);
+    assert(env.state.jokers[0].center_id == CENTER_J_MIDAS_MASK);
+    /* Money shaping: a sell yields money_reward x sell_cost (dollars 4 -> 8). */
+    env.max_episode_steps = 0;
+    env.state.jokers[0] = (Card){.center_id = CENTER_J_BANNER, .cost = 5, .sell_cost = 4};
+    env.state.joker_count = 1;
+    assert(puffer_observe(&env) == OK);
+    reward = 0.0f;
+    actions[0] = (float)ACTION_SELL_JOKER;
+    actions[1] = 0.0f;
+    actions[2] = 0.0f;
+    for (int i = 0; i < MAX_SELECTION; ++i) actions[3 + i] = 0.0f;
+    for (int i = 0; i < env.state.hand_count; ++i)
+        actions[BALATRO_ORDER_HAND_OFFSET + i] = (float)i;
+    for (int i = 0; i < env.state.joker_count; ++i)
+        actions[BALATRO_ORDER_JOKER_OFFSET + i] = (float)i;
+    puf_step(&env);
+    assert(fabsf(reward - 0.1f * 4.0f) < 1e-6f);
+    env.max_episode_steps = 1;
     env.reorder_actions = 0;
     assert(puffer_observe(&env) == OK);
     assert(env.legal_masks.primary[ACTION_SWAP_HAND_LEFT]);
     assert(env.legal_masks.primary[ACTION_SORT_HAND_RANK] == 1);
     assert(action_mask[ACTION_SWAP_HAND_LEFT] == 0);
     assert(action_mask[ACTION_SORT_HAND_RANK] == 0);
+    assert(action_mask[POLICY_ORDER_ENABLED_OFFSET] == 0);
     env.reorder_actions = 1;
     puf_reset(&env);
 
@@ -185,6 +444,10 @@ int main(void) {
         actions[2] = (float)action.selection_count;
         for (int i = 0; i < MAX_SELECTION; ++i)
             actions[3 + i] = (float)action.selection[i];
+        for (int i = 0; i < env.state.hand_count; ++i)
+            actions[BALATRO_ORDER_HAND_OFFSET + i] = (float)i;
+        for (int i = 0; i < env.state.joker_count; ++i)
+            actions[BALATRO_ORDER_JOKER_OFFSET + i] = (float)i;
         puf_step(&env);
         assert(isfinite(reward));
         assert(isfinite(terminal));
@@ -200,5 +463,27 @@ int main(void) {
     assert(dict_find(&log, "wins"));
     printf("simulatro Puffer adapter: %d transitions, %d terminals, invalid=%.0f\n",
            transitions, terminals, env.log.invalid_actions);
+
+    /* The Serpent: initial draw is the normal hand size; every draw after a
+       play or discard is exactly 3 cards and the hand grows past its size.
+       (Mirrors the real game's draw_from_deck_to_hand serpent branch.) */
+    puf_reset(&env);
+    env.state.blind_on_deck = 2;
+    env.state.next_boss_id = BLIND_BL_SERPENT;
+    Action serpent_select = {.type = ACTION_SELECT_BLIND};
+    assert(apply_step(&env.state, &serpent_select, &env.legal_masks, &select_result) == OK);
+    assert(env.state.blind_id == BLIND_BL_SERPENT);
+    assert(env.state.hand_count == 8);
+    assert(env.state.deck_count == 44);
+    Action serpent_play = {.type = ACTION_PLAY_HAND, .selection_count = 2, .selection = {0, 1}};
+    assert(apply_step(&env.state, &serpent_play, &env.legal_masks, &select_result) == OK);
+    assert(env.state.hand_count == 9);  /* 8 - 2 played + 3 drawn */
+    assert(env.state.deck_count == 41);
+    Action serpent_discard = {.type = ACTION_DISCARD, .selection_count = 1, .selection = {0}};
+    assert(apply_step(&env.state, &serpent_discard, &env.legal_masks, &select_result) == OK);
+    assert(env.state.hand_count == 11); /* 9 - 1 + 3, exceeds hand size 8 */
+    assert(env.state.deck_count == 38);
+    printf("serpent: initial 8, +3 after play, +3 after discard, hand grows to %d\n",
+           env.state.hand_count);
     return 0;
 }

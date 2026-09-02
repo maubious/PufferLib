@@ -16,9 +16,74 @@ static constexpr int BA_RAW_DIM = 28;
 static constexpr int BA_KEY_DIM = 32;
 static constexpr int BA_ZONES = 7;
 
+// Discrete embedding dimensions
+static constexpr int BA_BLIND_EMBED_ROWS = BLIND_COUNT; // 31
+static constexpr int BA_BLIND_EMBED_DIM = 8;
+static constexpr int BA_DECK_EMBED_ROWS = 16;
+static constexpr int BA_DECK_EMBED_DIM = 8;
+static constexpr int BA_LOCK_EMBED_ROWS = HAND_COUNT + 1; // 13 (0..11 hand types, 12 = unlocked)
+static constexpr int BA_LOCK_EMBED_DIM = 8;
+static constexpr int BA_PLAYED_HAND_EMBED_ROWS = HAND_COUNT; // 12
+static constexpr int BA_PLAYED_HAND_EMBED_DIM = 8;
+static constexpr int BA_PLANET_HAND_EMBED_ROWS = HAND_COUNT; // 12
+static constexpr int BA_PLANET_HAND_EMBED_DIM = 8;
+static constexpr int BA_SKIP_EMBED_ROWS = 3; // Small, Big, Boss
+static constexpr int BA_SKIP_EMBED_DIM = 4;
+static constexpr int BA_TAG_EMBED_ROWS = TAG_COUNT; // 25
+static constexpr int BA_TAG_EMBED_DIM = 4;
+static constexpr int BA_VOUCHER_ID_EMBED_ROWS = 34;
+static constexpr int BA_VOUCHER_ID_EMBED_DIM = 8;
+static constexpr int BA_TAROT_EMBED_ROWS = CENTER_COUNT; // 300
+static constexpr int BA_TAROT_EMBED_DIM = 8;
+
+static constexpr int BA_CARD_FLAG_ROWS = 6;
+static constexpr int BA_ENH_EMBED_ROWS = 9;
+static constexpr int BA_ED_EMBED_ROWS = 5;
+static constexpr int BA_SEAL_EMBED_ROWS = 5;
+
+// Pack categorical parameters by embedding width. NorMuon operates once per
+// registered matrix, so registering every logical table separately turns a
+// handful of lookups into dozens of optimizer kernels per minibatch.
+static constexpr int BA_TOKEN_CENTER_ROW = 0;
+static constexpr int BA_TOKEN_RANK_ROW = BA_TOKEN_CENTER_ROW + CENTER_COUNT;
+static constexpr int BA_TOKEN_SUIT_ROW = BA_TOKEN_RANK_ROW + 15;
+static constexpr int BA_TOKEN_ZONE_ROW = BA_TOKEN_SUIT_ROW + 4;
+static constexpr int BA_TOKEN_FLAG_ROW = BA_TOKEN_ZONE_ROW + BA_ZONES;
+static constexpr int BA_TOKEN_ENH_ROW = BA_TOKEN_FLAG_ROW + BA_CARD_FLAG_ROWS;
+static constexpr int BA_TOKEN_ED_ROW = BA_TOKEN_ENH_ROW + BA_ENH_EMBED_ROWS;
+static constexpr int BA_TOKEN_SEAL_ROW = BA_TOKEN_ED_ROW + BA_ED_EMBED_ROWS;
+static constexpr int BA_TOKEN_EMBED_ROWS = BA_TOKEN_SEAL_ROW + BA_SEAL_EMBED_ROWS;
+
+static constexpr int BA_STATE_BLIND_ROW = 0;
+static constexpr int BA_STATE_DECK_ROW = BA_STATE_BLIND_ROW + BA_BLIND_EMBED_ROWS;
+static constexpr int BA_STATE_LOCK_ROW = BA_STATE_DECK_ROW + BA_DECK_EMBED_ROWS;
+static constexpr int BA_STATE_PLAYED_HAND_ROW = BA_STATE_LOCK_ROW + BA_LOCK_EMBED_ROWS;
+static constexpr int BA_STATE_PLANET_HAND_ROW = BA_STATE_PLAYED_HAND_ROW + BA_PLAYED_HAND_EMBED_ROWS;
+static constexpr int BA_STATE_SKIP_ROW = BA_STATE_PLANET_HAND_ROW + BA_PLANET_HAND_EMBED_ROWS;
+static constexpr int BA_STATE_TAG_ROW = BA_STATE_SKIP_ROW + BA_SKIP_EMBED_ROWS;
+static constexpr int BA_STATE_VOUCHER_ROW = BA_STATE_TAG_ROW + BA_TAG_EMBED_ROWS;
+static constexpr int BA_STATE_TAROT_ROW = BA_STATE_VOUCHER_ROW + BA_VOUCHER_ID_EMBED_ROWS;
+static constexpr int BA_STATE_EMBED_ROWS = BA_STATE_TAROT_ROW + BA_TAROT_EMBED_ROWS;
+static constexpr int BA_STATE_EMBED_DIM = 8;
+
 // Fixed sections layout
 static constexpr int BA_OFF_GLOBALS = 0;
-static constexpr int BA_GLOBALS_FEATURES = 117;           // 32 ids + 6 phase + 24 hand one-hots + 30 u8 + 2 u32 + 7 u16 stats + 3 i32 + 13 q8_8
+static constexpr int BA_OFF_DECK_EMBED = 0;
+static constexpr int BA_OFF_BLIND_EMBED = 8;
+static constexpr int BA_OFF_BOSS_EMBED = 16;
+static constexpr int BA_OFF_VOUCHER_EMBED = 24;
+static constexpr int BA_OFF_TAROT_EMBED = 32;
+static constexpr int BA_OFF_PHASE = 40;
+static constexpr int BA_OFF_MOST_PLAYED = 46;
+static constexpr int BA_OFF_LAST_HAND = 58;
+static constexpr int BA_OFF_LOCK_EMBED = 70;
+static constexpr int BA_OFF_PLAYED_HANDS = 78;
+static constexpr int BA_OFF_PLANET_USAGE = 86;
+static constexpr int BA_OFF_SKIP_EMBED = 94;
+static constexpr int BA_OFF_TAG_EMBED = 98;
+static constexpr int BA_OFF_SCALARS = 102;
+static constexpr int BA_SCALAR_FEATURES = 27;
+static constexpr int BA_GLOBALS_FEATURES = 152;
 static constexpr int BA_DECK_FEATURES = 279;              // 52 slots x 5 + 9 + 9 + 1
 static constexpr int BA_OFF_DECK = BA_OFF_GLOBALS + BA_GLOBALS_FEATURES;
 static constexpr int BA_OFF_VOUCHER = BA_OFF_DECK + BA_DECK_FEATURES;
@@ -28,28 +93,34 @@ static constexpr int BA_COUNT_FEATURES = 7;               // 7 zone counts
 static constexpr int BA_OFF_POKER = BA_OFF_COUNTS + BA_COUNT_FEATURES;
 static constexpr int BA_POKER_FEATURES = HAND_COUNT * 6;  // 12 * 6 = 72
 static constexpr int BA_OFF_TAGS = BA_OFF_POKER + BA_POKER_FEATURES;
-static constexpr int BA_TAG_FEATURES = 13;                // 1 double tag + 2 * 6 tag features
+static constexpr int BA_TAG_FEATURES = 13;                // 1 double tag + 2 * (4 tag embed + 1 orb + 1 valid)
 static constexpr int BA_OFF_BLIND_SIG = BA_OFF_TAGS + BA_TAG_FEATURES;
-static constexpr int BA_BLIND_SIG_FEATURES = 32;          // 16 for current blind + 16 for upcoming boss
-static constexpr int BA_FIXED = BA_OFF_BLIND_SIG + BA_BLIND_SIG_FEATURES; // 552
+static constexpr int BA_BLIND_SIG_FEATURES = 48;          // 24 for current blind + 24 for upcoming boss
+static constexpr int BA_FIXED = BA_OFF_BLIND_SIG + BA_BLIND_SIG_FEATURES; // 603
 
 // Permutation-invariant set pooling (Mean + Max across 7 zones)
 static constexpr int BA_POOL_SECTIONS = 7;                // hand, jokers, consumables, shop, vouchers, boosters, pack
 static constexpr int BA_POOLED_FEATURES = BA_POOL_SECTIONS * BA_KEY_DIM * 2;
-static constexpr int BA_OFF_POOLED = BA_FIXED;            // 552
-static constexpr int BA_TOTAL = BA_OFF_POOLED + BA_POOLED_FEATURES; // 1000
+static constexpr int BA_OFF_POOLED = BA_FIXED;            // 603
+static constexpr int BA_TOTAL = BA_OFF_POOLED + BA_POOLED_FEATURES; // 1051
 static constexpr int BA_RANK_EMBED_ROWS = 15;
 static constexpr int BA_SUIT_EMBED_ROWS = 4;
 static constexpr int BA_ZONE_EMBED_ROWS = BA_ZONES;
 static constexpr int BA_PRIMARY_QUERY_COUNT = POLICY_PRIMARY_HEADS;
 static constexpr int BA_CARD_QUERY_COUNT = 5;
-static constexpr int BA_QUERY_COUNT = BA_PRIMARY_QUERY_COUNT + BA_CARD_QUERY_COUNT;
+static constexpr int BA_ORDER_QUERY_HAND = BA_PRIMARY_QUERY_COUNT + BA_CARD_QUERY_COUNT;
+static constexpr int BA_ORDER_QUERY_JOKER = BA_ORDER_QUERY_HAND + 1;
+static constexpr int BA_ORDER_QUERY_COUNT = 2;
+static constexpr int BA_QUERY_COUNT = BA_PRIMARY_QUERY_COUNT + BA_CARD_QUERY_COUNT
+    + BA_ORDER_QUERY_COUNT;
 static constexpr int BA_QUERY_DIM = BA_QUERY_COUNT * BA_KEY_DIM;
-static constexpr int BA_DEC_ROWS = 23 + POLICY_PRIMARY_HEAD_SIZE + 6 + 5 * 64 + 1;
+static constexpr int BA_ORDER_HAND_OFFSET = 23 + POLICY_PRIMARY_HEAD_SIZE + 6 + 5 * 64;
+static constexpr int BA_ORDER_JOKER_OFFSET = BA_ORDER_HAND_OFFSET + 64;
+static constexpr int BA_VALUE_OFFSET = BA_ORDER_JOKER_OFFSET + 32;
+static constexpr int BA_DEC_ROWS = BA_VALUE_OFFSET + 1;
 static constexpr int BA_PRIMARY_OFFSET = 23;
 static constexpr int BA_COUNT_OFFSET = BA_PRIMARY_OFFSET + POLICY_PRIMARY_HEAD_SIZE;
 static constexpr int BA_CARD_OFFSET = BA_COUNT_OFFSET + 6;
-static constexpr int BA_VALUE_OFFSET = BA_CARD_OFFSET + 5 * 64;
 static constexpr int BA_LINEAR_ROWS = 30;
 static constexpr int BA_LINEAR_PAD = 32;
 static constexpr int BA_FUSED_ROWS = BA_LINEAR_PAD + BA_QUERY_DIM;
@@ -58,14 +129,36 @@ static_assert(BA_LINEAR_ROWS <= BA_LINEAR_PAD, "linear decoder rows exceed paddi
 
 static_assert(sizeof(Observation) == 3055,
     "Balatro encoder must be updated for the Observation layout");
-static_assert(BA_FIXED == 552 && BA_TOTAL == 1000,
+static_assert(BA_FIXED == 603 && BA_TOTAL == 1051,
     "Balatro encoder feature layout mismatch");
+
+static constexpr int BA_PRIMARY_TYPES[POLICY_PRIMARY_HEADS] = {
+    ACTION_BUY_CARD, ACTION_SELL_JOKER, ACTION_SELL_CONSUMABLE,
+    ACTION_USE_CONSUMABLE, ACTION_REDEEM_VOUCHER, ACTION_OPEN_BOOSTER,
+    ACTION_PICK_PACK_CARD, ACTION_SWAP_JOKERS_LEFT, ACTION_SWAP_JOKERS_RIGHT,
+    ACTION_SWAP_HAND_LEFT, ACTION_SWAP_HAND_RIGHT, ACTION_BUY_AND_USE};
+
+enum BlindSpecialRule : uint8_t {
+    BLIND_SPECIAL_ARM = 1u << 0,
+    BLIND_SPECIAL_ACORN = 1u << 1,
+    BLIND_SPECIAL_BELL = 1u << 2,
+    BLIND_SPECIAL_HEART = 1u << 3,
+    BLIND_SPECIAL_LEAF = 1u << 4,
+    BLIND_SPECIAL_SERPENT = 1u << 5,
+};
+
+enum BlindFacedownRule : uint8_t {
+    BLIND_FACEDOWN_HOUSE = 1u << 0,
+    BLIND_FACEDOWN_WHEEL = 1u << 1,
+    BLIND_FACEDOWN_FISH = 1u << 2,
+    BLIND_FACEDOWN_MARK = 1u << 3,
+};
 
 struct BlindSignature {
     uint8_t debuff_suit;            // 0=Spades, 1=Hearts, 2=Clubs, 3=Diamonds, 255=None
     uint8_t debuff_face;            // The Plant (1)
     uint8_t debuff_played;          // The Pillar (1)
-    uint8_t debuff_all_jokers;      // Final Leaf / Amber Acorn (1)
+    uint8_t special_mask;
     uint8_t min_play_size;          // The Psychic (5), 1 otherwise
     uint8_t max_hands;              // The Needle (1), 0=unlimited
     uint8_t max_discards;           // The Water (0), 255=unlimited
@@ -76,41 +169,41 @@ struct BlindSignature {
     uint8_t discard_random_on_play; // The Hook (1)
     uint8_t money_lost_on_play;     // The Tooth ($1/card)
     uint8_t set_money_zero_on_most; // The Ox (1)
-    uint8_t cards_drawn_facedown;   // The Mark, The Wheel, The House (1)
+    uint8_t facedown_mask;
     uint8_t hand_size_reduced;      // The Manacle (1)
 };
 
 static __device__ __constant__ BlindSignature BLIND_SIGNATURES[31] = {
     /* 0 */                         {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
-    /* 1: BLIND_BL_ARM */           {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 1: BLIND_BL_ARM */           {255, 0, 0, BLIND_SPECIAL_ARM, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
     /* 2: BLIND_BL_BIG */           {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
     /* 3: BLIND_BL_CLUB */          {2,   0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
     /* 4: BLIND_BL_EYE */           {255, 0, 0, 0, 1, 0, 255, 0, 1, 0, 1, 0, 0, 0, 0, 0},
-    /* 5: BLIND_BL_FINAL_ACORN */   {255, 0, 0, 1, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 1, 0},
-    /* 6: BLIND_BL_FINAL_BELL */    {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 1, 0, 0, 0, 0},
-    /* 7: BLIND_BL_FINAL_HEART */   {255, 0, 0, 1, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
-    /* 8: BLIND_BL_FINAL_LEAF */    {255, 0, 0, 1, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 5: BLIND_BL_FINAL_ACORN */   {255, 0, 0, BLIND_SPECIAL_ACORN, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 6: BLIND_BL_FINAL_BELL */    {255, 0, 0, BLIND_SPECIAL_BELL, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 7: BLIND_BL_FINAL_HEART */   {255, 0, 0, BLIND_SPECIAL_HEART, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 8: BLIND_BL_FINAL_LEAF */    {255, 0, 0, BLIND_SPECIAL_LEAF, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
     /* 9: BLIND_BL_FINAL_VESSEL */  {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 3, 0, 0, 0, 0, 0},
-    /* 10: BLIND_BL_FISH */         {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 1, 0},
+    /* 10: BLIND_BL_FISH */         {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, BLIND_FACEDOWN_FISH, 0},
     /* 11: BLIND_BL_FLINT */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 1, 1, 0, 0, 0, 0, 0},
     /* 12: BLIND_BL_GOAD */         {0,   0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
     /* 13: BLIND_BL_HEAD */         {1,   0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
     /* 14: BLIND_BL_HOOK */         {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 1, 0, 0, 0, 0},
-    /* 15: BLIND_BL_HOUSE */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 1, 0},
+    /* 15: BLIND_BL_HOUSE */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, BLIND_FACEDOWN_HOUSE, 0},
     /* 16: BLIND_BL_MANACLE */      {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 1},
-    /* 17: BLIND_BL_MARK */         {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 1, 0},
-    /* 18: BLIND_BL_MOUTH */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 17: BLIND_BL_MARK */         {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, BLIND_FACEDOWN_MARK, 0},
+    /* 18: BLIND_BL_MOUTH */        {255, 0, 0, 0, 1, 0, 255, 1, 0, 0, 1, 0, 0, 0, 0, 0},
     /* 19: BLIND_BL_NEEDLE */       {255, 0, 0, 0, 1, 1, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
     /* 20: BLIND_BL_OX */           {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 1, 0, 0},
     /* 21: BLIND_BL_PILLAR */       {255, 0, 1, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
     /* 22: BLIND_BL_PLANT */        {255, 1, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
     /* 23: BLIND_BL_PSYCHIC */      {255, 0, 0, 0, 5, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
-    /* 24: BLIND_BL_SERPENT */      {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+    /* 24: BLIND_BL_SERPENT */      {255, 0, 0, BLIND_SPECIAL_SERPENT, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
     /* 25: BLIND_BL_SMALL */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
     /* 26: BLIND_BL_TOOTH */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 1, 0, 0, 0},
     /* 27: BLIND_BL_WALL */         {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 2, 0, 0, 0, 0, 0},
     /* 28: BLIND_BL_WATER */        {255, 0, 0, 0, 1, 0, 0,   0, 0, 0, 1, 0, 0, 0, 0, 0},
-    /* 29: BLIND_BL_WHEEL */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 1, 0},
+    /* 29: BLIND_BL_WHEEL */        {255, 0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, BLIND_FACEDOWN_WHEEL, 0},
     /* 30: BLIND_BL_WINDOW */       {3,   0, 0, 0, 1, 0, 255, 0, 0, 0, 1, 0, 0, 0, 0, 0},
 };
 
@@ -119,18 +212,20 @@ __device__ __forceinline__ float blind_sig_value(const BlindSignature* sig, int 
     case 0: return sig->debuff_suit < 4 ? ((float)sig->debuff_suit + 1.0f) / 4.0f : 0.0f;
     case 1: return (float)sig->debuff_face;
     case 2: return (float)sig->debuff_played;
-    case 3: return (float)sig->debuff_all_jokers;
-    case 4: return sig->min_play_size > 1 ? (float)sig->min_play_size / 5.0f : 0.0f;
-    case 5: return sig->max_hands > 0 ? (float)sig->max_hands / 4.0f : 0.0f;
-    case 6: return sig->max_discards == 0 ? 1.0f : 0.0f;
-    case 7: return (float)sig->single_hand_type;
-    case 8: return (float)sig->no_repeat_hands;
-    case 9: return (float)sig->base_score_halved;
-    case 10: return (float)sig->chips_mult / 3.0f;
-    case 11: return (float)sig->discard_random_on_play;
-    case 12: return (float)sig->money_lost_on_play;
-    case 13: return (float)sig->set_money_zero_on_most;
-    case 14: return (float)sig->cards_drawn_facedown;
+    case 3: case 4: case 5: case 6: case 7: case 8:
+        return (float)((sig->special_mask >> (d - 3)) & 1u);
+    case 9: return sig->min_play_size > 1 ? (float)sig->min_play_size / 5.0f : 0.0f;
+    case 10: return sig->max_hands > 0 ? (float)sig->max_hands / 4.0f : 0.0f;
+    case 11: return sig->max_discards == 0 ? 1.0f : 0.0f;
+    case 12: return (float)sig->single_hand_type;
+    case 13: return (float)sig->no_repeat_hands;
+    case 14: return (float)sig->base_score_halved;
+    case 15: return (float)sig->chips_mult / 3.0f;
+    case 16: return (float)sig->discard_random_on_play;
+    case 17: return (float)sig->money_lost_on_play;
+    case 18: return (float)sig->set_money_zero_on_most;
+    case 19: case 20: case 21: case 22:
+        return (float)((sig->facedown_mask >> (d - 19)) & 1u);
     default: return (float)sig->hand_size_reduced;
     }
 }
@@ -240,10 +335,8 @@ __device__ __forceinline__ float booster_sig_value(int center, int d) {
 struct BalatroEncoderWeights {
     Prec token_w;       // (BA_KEY_DIM, BA_RAW_DIM)
     Prec token_b;       // (BA_KEY_DIM)
-    Prec center_embed;  // (CENTER_COUNT, BA_KEY_DIM)
-    Prec rank_embed;    // (15, BA_KEY_DIM)
-    Prec suit_embed;    // (4, BA_KEY_DIM)
-    Prec zone_embed;    // (7, BA_KEY_DIM)
+    Prec token_embed;   // (BA_TOKEN_EMBED_ROWS, BA_KEY_DIM)
+    Prec state_embed;   // (BA_STATE_EMBED_ROWS, BA_STATE_EMBED_DIM)
     Prec proj_w;        // (hidden, BA_TOTAL)
     int obs_size, hidden;
 };
@@ -252,16 +345,17 @@ struct BalatroEncoderActivations {
     Prec pooled, out, d_pooled;
     Prec keys;
     Int counts, pool_argmax;
-    Long center_acc, rank_acc, suit_acc, zone_acc;
-    Long token_w_acc, token_b_acc;
-    Prec token_wgrad, token_bgrad, center_grad, rank_grad, suit_grad, zone_grad;
+    Long token_embed_acc, state_embed_acc, token_w_acc, token_b_acc;
+    Prec token_wgrad, token_bgrad, token_embed_grad, state_embed_grad;
     Prec proj_wgrad;
     const unsigned char* obs_data;
+    const float* decoder_grad_logits;
+    const precision_t* decoder_fused;
+    const precision_t* decoder_probability;
     int obs_batch;
 };
 
 static BalatroEncoderActivations* ba_enc_last = NULL;
-static Prec* ba_ptr_keygrad = NULL;
 
 __device__ __forceinline__ int ba_byte(
         const unsigned char* obs, int64_t base, int offset) {
@@ -397,19 +491,15 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
         int* __restrict__ pool_argmax,
         const precision_t* __restrict__ token_w,
         const precision_t* __restrict__ token_b,
-        const precision_t* __restrict__ center_embed,
-        const precision_t* __restrict__ rank_embed,
-        const precision_t* __restrict__ suit_embed,
-        const precision_t* __restrict__ zone_embed,
+        const precision_t* __restrict__ token_embed,
+        const precision_t* __restrict__ state_embed,
         const unsigned char* __restrict__ obs,
         int B, int obs_size) {
-    __shared__ float s_tokens[MAX_OBS_TOKENS][BA_KEY_DIM];
+    __shared__ float s_pool_sum[BA_POOL_SECTIONS][BA_KEY_DIM];
+    __shared__ unsigned long long s_pool_max_pair[BA_POOL_SECTIONS][BA_KEY_DIM];
     __shared__ float s_raw[BLOCK_SIZE / 32][BA_RAW_DIM];
     __shared__ int s_counts[BA_POOL_SECTIONS];
     __shared__ int s_total;
-    __shared__ int s_section[BLOCK_SIZE / 32];
-    __shared__ int s_id[BLOCK_SIZE / 32];
-    __shared__ int s_playing[BLOCK_SIZE / 32];
 
     int b = blockIdx.x;
     if (b >= B) return;
@@ -421,188 +511,222 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
     int voucher = ba_u16(obs, in, base + offsetof(ObservationGlobals, next_voucher_id));
     int tarot = ba_u16(obs, in, base + offsetof(ObservationGlobals, last_tarot_planet));
 
-    static constexpr int scalar_offset[30] = {
+    static constexpr int scalar_offset[27] = {
         offsetof(ObservationGlobals, stake), offsetof(ObservationGlobals, blind_on_deck),
         offsetof(ObservationGlobals, blind_disabled), offsetof(ObservationGlobals, hand_sort_suit),
-        offsetof(ObservationGlobals, blind_skipped_mask), offsetof(ObservationGlobals, blind_only_hand),
         offsetof(ObservationGlobals, boss_rerolled), offsetof(ObservationGlobals, free_rerolls),
         offsetof(ObservationGlobals, reroll_base), offsetof(ObservationGlobals, reroll_increase),
         offsetof(ObservationGlobals, discount_percent), offsetof(ObservationGlobals, hands_per_round),
         offsetof(ObservationGlobals, discards_per_round), offsetof(ObservationGlobals, base_hand_size),
         offsetof(ObservationGlobals, pack_kind), offsetof(ObservationGlobals, double_tag),
-        offsetof(ObservationGlobals, active_tag), offsetof(ObservationGlobals, tag_hand_bonus),
-        offsetof(ObservationGlobals, tag_force_rarity), offsetof(ObservationGlobals, tag_force_rarity_count),
-        offsetof(ObservationGlobals, tag_force_edition), offsetof(ObservationGlobals, tag_force_edition_count),
-        offsetof(ObservationGlobals, tag_voucher_pending), offsetof(ObservationGlobals, tag_coupon_pending),
-        offsetof(ObservationGlobals, tag_coupon_active), offsetof(ObservationGlobals, tag_investment_pending),
-        offsetof(ObservationGlobals, tag_d_six_pending), offsetof(ObservationGlobals, tag_d_six_active),
-        offsetof(ObservationGlobals, ecto_penalty), offsetof(ObservationGlobals, gros_michel_extinct),
+        offsetof(ObservationGlobals, tag_hand_bonus), offsetof(ObservationGlobals, tag_force_rarity),
+        offsetof(ObservationGlobals, tag_force_rarity_count), offsetof(ObservationGlobals, tag_force_edition),
+        offsetof(ObservationGlobals, tag_force_edition_count), offsetof(ObservationGlobals, tag_voucher_pending),
+        offsetof(ObservationGlobals, tag_coupon_pending), offsetof(ObservationGlobals, tag_coupon_active),
+        offsetof(ObservationGlobals, tag_investment_pending), offsetof(ObservationGlobals, tag_d_six_pending),
+        offsetof(ObservationGlobals, tag_d_six_active), offsetof(ObservationGlobals, ecto_penalty),
+        offsetof(ObservationGlobals, gros_michel_extinct),
     };
-    static constexpr float scalar_scale[30] = {
-        1.0f / 8.0f,   1.0f / 2.0f,  -1.0f,         -1.0f,         1.0f / 7.0f,
-        1.0f / 16.0f,  -1.0f,        1.0f / 16.0f,  1.0f / 16.0f,  1.0f / 16.0f,
-        1.0f / 100.0f, 1.0f / 16.0f, 1.0f / 16.0f,  1.0f / 16.0f,  1.0f / 16.0f,
-        -1.0f,        1.0f / TAG_COUNT, 1.0f / 16.0f, 1.0f / 4.0f, 1.0f / 16.0f,
-        1.0f / 4.0f,   1.0f / 16.0f, -1.0f,         -1.0f,         -1.0f,
-        -1.0f,        -1.0f,        -1.0f,          1.0f / 16.0f, -1.0f,
+    static constexpr float scalar_scale[27] = {
+        1.0f / 8.0f,   1.0f / 2.0f,  -1.0f,         -1.0f,
+        -1.0f,        1.0f / 16.0f,  1.0f / 16.0f,  1.0f / 16.0f,
+        1.0f / 100.0f, 1.0f / 16.0f, 1.0f / 16.0f,  1.0f / 16.0f,
+        1.0f / 16.0f,  -1.0f,        1.0f / 16.0f,  1.0f / 4.0f,
+        1.0f / 16.0f,  1.0f / 4.0f,   1.0f / 16.0f,  -1.0f,
+        -1.0f,        -1.0f,         -1.0f,         -1.0f,
+        -1.0f,        1.0f / 16.0f,  -1.0f,
     };
 
-    // 1. Unpack Fixed Globals & Counters (520 dims)
-    for (int feature = threadIdx.x; feature < BA_FIXED; feature += blockDim.x) {
-        float value = 0.0f;
-        if (feature < BA_OFF_DECK) {
-            int local = feature - BA_OFF_GLOBALS;
-            if (local < 32) {
-                // Fixed orthogonal multi-frequency sinusoidal identity codes:
-                if (local < 8) {
-                    int d = local;
-                    float freq = (float)(d / 2 + 1);
-                    float theta = (deck > 0 && deck < CENTER_COUNT)
-                        ? (2.0f * 3.14159265f * (float)deck * freq / (float)CENTER_COUNT) : 0.0f;
-                    value = (deck > 0 && deck < CENTER_COUNT) ? ((d % 2 == 0) ? __sinf(theta) : __cosf(theta)) : 0.0f;
-                } else if (local < 12) {
-                    int d = local - 8;
-                    float freq = (float)(d / 2 + 1);
-                    float theta = (blind > 0 && blind < BLIND_COUNT)
-                        ? (2.0f * 3.14159265f * (float)blind * freq / (float)BLIND_COUNT) : 0.0f;
-                    value = (blind > 0 && blind < BLIND_COUNT) ? ((d % 2 == 0) ? __sinf(theta) : __cosf(theta)) : 0.0f;
-                } else if (local < 16) {
-                    int d = local - 12;
-                    float freq = (float)(d / 2 + 1);
-                    float theta = (boss > 0 && boss < BLIND_COUNT)
-                        ? (2.0f * 3.14159265f * (float)boss * freq / (float)BLIND_COUNT) : 0.0f;
-                    value = (boss > 0 && boss < BLIND_COUNT) ? ((d % 2 == 0) ? __sinf(theta) : __cosf(theta)) : 0.0f;
-                } else if (local < 24) {
-                    int d = local - 16;
-                    float freq = (float)(d / 2 + 1);
-                    float theta = (voucher > 0 && voucher < CENTER_COUNT)
-                        ? (2.0f * 3.14159265f * (float)voucher * freq / (float)CENTER_COUNT) : 0.0f;
-                    value = (voucher > 0 && voucher < CENTER_COUNT) ? ((d % 2 == 0) ? __sinf(theta) : __cosf(theta)) : 0.0f;
-                } else {
-                    int d = local - 24;
-                    float freq = (float)(d / 2 + 1);
-                    float theta = (tarot > 0 && tarot < CENTER_COUNT)
-                        ? (2.0f * 3.14159265f * (float)tarot * freq / (float)CENTER_COUNT) : 0.0f;
-                    value = (tarot > 0 && tarot < CENTER_COUNT) ? ((d % 2 == 0) ? __sinf(theta) : __cosf(theta)) : 0.0f;
-                }
-            } else {
-                local -= 32;
-                int phase = ba_byte(obs, in, base + offsetof(ObservationGlobals, phase));
-                int most = ba_byte(obs, in, base + offsetof(ObservationGlobals, most_played_hand));
-                int last = ba_byte(obs, in, base + offsetof(ObservationGlobals, last_hand_type));
-                if (local < 6) value = local == phase;
-                else if ((local -= 6) < HAND_COUNT) value = local == most;
-                else if ((local -= HAND_COUNT) < HAND_COUNT) value = local == last;
-                else if ((local -= HAND_COUNT) < 30) {
-                    int raw = ba_byte(obs, in, base + scalar_offset[local]);
-                    value = scalar_scale[local] < 0.0f ? (float)(raw != 0) : (float)raw * scalar_scale[local];
-                } else if ((local -= 30) < 2) {
-                    int off = local == 0 ? offsetof(ObservationGlobals, ante)
-                        : offsetof(ObservationGlobals, run_hands_played);
-                    value = (float)ba_byte(obs, in, base + off) / (local == 0 ? 16.0f : 256.0f);
-                } else if ((local -= 2) < 7) {
-                    static constexpr int u16_stat_offsets[7] = {
-                        offsetof(ObservationGlobals, hands_left), offsetof(ObservationGlobals, discards_left),
-                        offsetof(ObservationGlobals, hands_played), offsetof(ObservationGlobals, discards_used),
-                        offsetof(ObservationGlobals, blind_hands_mask), offsetof(ObservationGlobals, tarots_used),
-                        offsetof(ObservationGlobals, planet_usage_mask),
-                    };
-                    value = (float)ba_u16(obs, in, base + u16_stat_offsets[local]) / 64.0f;
-                } else if ((local -= 7) < 3) {
-                    static constexpr int i32_stat_offsets[3] = {
-                        offsetof(ObservationGlobals, dollars), offsetof(ObservationGlobals, reroll_cost),
-                        offsetof(ObservationGlobals, round_earnings),
-                    };
-                    value = (float)(int32_t)ba_u32(obs, in, base + i32_stat_offsets[local]) / 64.0f;
-                } else if ((local -= 3) < 4) {
-                    value = ba_float(obs, in, base + offsetof(ObservationGlobals, chips_log2) + 4 * local) / 16.0f;
-                } else if ((local -= 4) < 3) {
-                    value = (float)ba_u16(obs, in, base + offsetof(ObservationGlobals, interest_cap) + 2 * local) / 64.0f;
-                } else {
-                    local -= 3;
-                    value = (float)ba_byte(obs, in, base + offsetof(ObservationGlobals, joker_rate) + local) / 100.0f;
-                }
-            }
-        } else if (feature < BA_OFF_VOUCHER) {
-            int local = feature - BA_OFF_DECK;
-            int deck_base = offsetof(Observation, deck_matrix);
-            if (local < 260) {
-                int slot = local / 5;
-                int f = local % 5;
-                int slot_off = deck_base + slot * sizeof(DeckSlot);
-                if (f == 0) value = (float)ba_byte(obs, in, slot_off + 0) / 52.0f;
-                else if (f == 1) value = (float)ba_byte(obs, in, slot_off + 1) / 16.0f;
-                else if (f == 2) value = (float)ba_byte(obs, in, slot_off + 2) / 52.0f;
-                else if (f == 3) value = (float)ba_u16(obs, in, slot_off + 4) / 512.0f;
-                else value = (float)ba_u16(obs, in, slot_off + 6) / 2048.0f;
-            } else if ((local -= 260) < 9) {
-                value = (float)ba_u16(obs, in, deck_base + offsetof(DeckMatrix, draw_enhancements) + 2 * local) / 52.0f;
-            } else if ((local -= 9) < 9) {
-                value = (float)ba_u16(obs, in, deck_base + offsetof(DeckMatrix, discard_enhancements) + 2 * local) / 52.0f;
-            } else {
-                value = (float)ba_u16(obs, in, deck_base + offsetof(DeckMatrix, total_deck_size)) / 256.0f;
-            }
-        } else if (feature < BA_OFF_COUNTS) {
-            int bit = feature - BA_OFF_VOUCHER;
-            uint32_t mask_lo = ba_u32(obs, in, base + offsetof(ObservationGlobals, redeemed_vouchers_mask));
-            uint32_t mask_hi = ba_u32(obs, in, base + offsetof(ObservationGlobals, redeemed_vouchers_mask) + 4);
-            uint32_t mask = bit < 32 ? mask_lo : mask_hi;
-            value = (float)((mask >> (bit & 31)) & 1u);
-        } else if (feature < BA_OFF_POKER) {
-            int i = feature - BA_OFF_COUNTS;
-            static constexpr int zone_offsets[7] = {
-                offsetof(Observation, hand_count), offsetof(Observation, joker_count),
-                offsetof(Observation, consumable_count), offsetof(Observation, shop_count),
-                offsetof(Observation, voucher_count), offsetof(Observation, booster_count),
-                offsetof(Observation, pack_count),
-            };
-            static constexpr float zone_scales[7] = {
-                1.0f / 16.0f, 1.0f / 8.0f, 1.0f / 4.0f, 1.0f / 4.0f,
-                1.0f / 2.0f,  1.0f / 2.0f, 1.0f / 5.0f,
-            };
-            value = (float)ba_byte(obs, in, zone_offsets[i]) * zone_scales[i];
-        } else if (feature < BA_OFF_TAGS) {
-            int local = feature - BA_OFF_POKER;
-            int rec = local / 6;
-            int f = local % 6;
-            int record = offsetof(Observation, poker_hands) + rec * sizeof(PokerHandStat);
-            if (f == 0) value = (float)ba_byte(obs, in, record + offsetof(PokerHandStat, visible));
-            else if (f == 1) value = (float)ba_byte(obs, in, record + offsetof(PokerHandStat, level)) / 16.0f;
-            else if (f == 2) value = ba_float(obs, in, record + offsetof(PokerHandStat, chips_log2)) / 16.0f;
-            else if (f == 3) value = ba_float(obs, in, record + offsetof(PokerHandStat, mult_log2)) / 16.0f;
-            else if (f == 4) value = (float)ba_u16(obs, in, record + offsetof(PokerHandStat, total_plays)) / 256.0f;
-            else value = (float)ba_u16(obs, in, record + offsetof(PokerHandStat, round_plays)) / 64.0f;
-        } else if (feature < BA_OFF_BLIND_SIG) {
-            int local = feature - BA_OFF_TAGS;
-            if (local == 0) {
-                value = (float)ba_byte(obs, in, base + offsetof(ObservationGlobals, double_tag));
-            } else {
-                int blind_idx = (local - 1) / 6;
-                int f = (local - 1) % 6;
-                int tag_id = ba_byte(obs, in, base + offsetof(ObservationGlobals, blind_tags) + blind_idx);
-                if (tag_id == 0 || tag_id >= TAG_COUNT) {
-                    value = 0.0f;
-                } else if (f < 4) {
-                    float freq = (float)(f / 2 + 1);
-                    float theta = 2.0f * 3.14159265f * (float)tag_id * freq / (float)TAG_COUNT;
-                    value = (f % 2 == 0) ? __sinf(theta) : __cosf(theta);
-                } else if (f == 4) {
-                    int orb = ba_byte(obs, in, base + offsetof(ObservationGlobals, orbital_hands) + blind_idx);
-                    value = (float)orb / (float)HAND_COUNT;
-                } else {
-                    value = 1.0f;
-                }
-            }
+    // 1. Unpack Fixed Globals & Counters
+    // 1. Unpack Fixed Globals & Counters (603 features in parallel)
+    // 1A. Deck matrix (279 features: 152..430)
+    int deck_base = offsetof(Observation, deck_matrix);
+    for (int i = threadIdx.x; i < 52; i += blockDim.x) {
+        int slot_off = deck_base + i * sizeof(DeckSlot);
+        pooled[b * BA_TOTAL + BA_OFF_DECK + i * 5 + 0] = from_float((float)ba_byte(obs, in, slot_off + 0) / 52.0f);
+        pooled[b * BA_TOTAL + BA_OFF_DECK + i * 5 + 1] = from_float((float)ba_byte(obs, in, slot_off + 1) / 16.0f);
+        pooled[b * BA_TOTAL + BA_OFF_DECK + i * 5 + 2] = from_float((float)ba_byte(obs, in, slot_off + 2) / 52.0f);
+        pooled[b * BA_TOTAL + BA_OFF_DECK + i * 5 + 3] = from_float((float)ba_u16(obs, in, slot_off + 4) / 512.0f);
+        pooled[b * BA_TOTAL + BA_OFF_DECK + i * 5 + 4] = from_float((float)ba_u16(obs, in, slot_off + 6) / 2048.0f);
+    }
+    for (int i = threadIdx.x; i < 19; i += blockDim.x) {
+        float val = 0.0f;
+        if (i < 9) val = (float)ba_u16(obs, in, deck_base + offsetof(DeckMatrix, draw_enhancements) + 2 * i) / 52.0f;
+        else if (i < 18) val = (float)ba_u16(obs, in, deck_base + offsetof(DeckMatrix, discard_enhancements) + 2 * (i - 9)) / 52.0f;
+        else val = (float)ba_u16(obs, in, deck_base + offsetof(DeckMatrix, total_deck_size)) / 256.0f;
+        pooled[b * BA_TOTAL + BA_OFF_DECK + 260 + i] = from_float(val);
+    }
+
+    // 1B. Poker hands (72 features: 470..541)
+    for (int rec = threadIdx.x; rec < HAND_COUNT; rec += blockDim.x) {
+        int record = offsetof(Observation, poker_hands) + rec * sizeof(PokerHandStat);
+        pooled[b * BA_TOTAL + BA_OFF_POKER + rec * 6 + 0] = from_float((float)ba_byte(obs, in, record + offsetof(PokerHandStat, visible)));
+        pooled[b * BA_TOTAL + BA_OFF_POKER + rec * 6 + 1] = from_float((float)ba_byte(obs, in, record + offsetof(PokerHandStat, level)) / 16.0f);
+        pooled[b * BA_TOTAL + BA_OFF_POKER + rec * 6 + 2] = from_float(ba_float(obs, in, record + offsetof(PokerHandStat, chips_log2)) / 16.0f);
+        pooled[b * BA_TOTAL + BA_OFF_POKER + rec * 6 + 3] = from_float(ba_float(obs, in, record + offsetof(PokerHandStat, mult_log2)) / 16.0f);
+        pooled[b * BA_TOTAL + BA_OFF_POKER + rec * 6 + 4] = from_float((float)ba_u16(obs, in, record + offsetof(PokerHandStat, total_plays)) / 256.0f);
+        pooled[b * BA_TOTAL + BA_OFF_POKER + rec * 6 + 5] = from_float((float)ba_u16(obs, in, record + offsetof(PokerHandStat, round_plays)) / 64.0f);
+    }
+
+    // 1C. Vouchers (32 features: 431..462)
+    for (int bit = threadIdx.x; bit < 32; bit += blockDim.x) {
+        uint32_t mask_lo = ba_u32(obs, in, base + offsetof(ObservationGlobals, redeemed_vouchers_mask));
+        pooled[b * BA_TOTAL + BA_OFF_VOUCHER + bit] = from_float((float)((mask_lo >> bit) & 1u));
+    }
+
+    // 1D. Zone Counts (7 features: 463..469)
+    for (int i = threadIdx.x; i < 7; i += blockDim.x) {
+        static constexpr int zone_offsets[7] = {
+            offsetof(Observation, hand_count), offsetof(Observation, joker_count),
+            offsetof(Observation, consumable_count), offsetof(Observation, shop_count),
+            offsetof(Observation, voucher_count), offsetof(Observation, booster_count),
+            offsetof(Observation, pack_count),
+        };
+        static constexpr float zone_scales[7] = {
+            1.0f / 16.0f, 1.0f / 8.0f, 1.0f / 4.0f, 1.0f / 4.0f,
+            1.0f / 2.0f,  1.0f / 2.0f, 1.0f / 5.0f,
+        };
+        pooled[b * BA_TOTAL + BA_OFF_COUNTS + i] = from_float((float)ba_byte(obs, in, zone_offsets[i]) * zone_scales[i]);
+    }
+
+    // 1E. Blind Signatures (48 features: 555..602)
+    for (int local = threadIdx.x; local < 48; local += blockDim.x) {
+        float val = (local < 24)
+            ? ((blind >= 0 && blind < 31) ? blind_sig_value(&BLIND_SIGNATURES[blind], local) : 0.0f)
+            : ((boss >= 0 && boss < 31) ? blind_sig_value(&BLIND_SIGNATURES[boss], local - 24) : 0.0f);
+        pooled[b * BA_TOTAL + BA_OFF_BLIND_SIG + local] = from_float(val);
+    }
+
+    // 1F. Tags (13 features: 542..554)
+    for (int local = threadIdx.x; local < 13; local += blockDim.x) {
+        float val;
+        if (local == 0) {
+            val = (float)ba_byte(obs, in, base + offsetof(ObservationGlobals, double_tag));
         } else {
-            int local = feature - BA_OFF_BLIND_SIG;
-            if (local < 16) {
-                value = (blind >= 0 && blind < 31) ? blind_sig_value(&BLIND_SIGNATURES[blind], local) : 0.0f;
+            int blind_idx = (local - 1) / 6;
+            int f = (local - 1) % 6;
+            int tag_id = ba_byte(obs, in, base + offsetof(ObservationGlobals, blind_tags) + blind_idx);
+            if (tag_id >= TAG_COUNT) tag_id = 0;
+            if (f < 4) {
+                val = to_float(state_embed[(BA_STATE_TAG_ROW + tag_id) * 8 + f]);
+            } else if (f == 4) {
+                int orb = ba_byte(obs, in, base + offsetof(ObservationGlobals, orbital_hands) + blind_idx);
+                val = (float)orb / (float)HAND_COUNT;
             } else {
-                int d = local - 16;
-                value = (boss >= 0 && boss < 31) ? blind_sig_value(&BLIND_SIGNATURES[boss], d) : 0.0f;
+                val = tag_id > 0 ? 1.0f : 0.0f;
             }
         }
-        pooled[b * BA_TOTAL + feature] = from_float(value);
+        pooled[b * BA_TOTAL + BA_OFF_TAGS + local] = from_float(val);
+    }
+
+    // 1G. Globals, Scalars & Stats (152 features: 0..151)
+    for (int local = threadIdx.x; local < BA_GLOBALS_FEATURES; local += blockDim.x) {
+        float value = 0.0f;
+        if (local < 40) {
+            int d = local & 7;
+            int row = local >> 3;
+            if (row == 0) {
+                int d_id = (deck >= 0 && deck < 16) ? deck : 0;
+                value = to_float(state_embed[(BA_STATE_DECK_ROW + d_id) * 8 + d]);
+            } else if (row == 1) {
+                int b_id = (blind >= 0 && blind < BLIND_COUNT) ? blind : 0;
+                value = to_float(state_embed[(BA_STATE_BLIND_ROW + b_id) * 8 + d]);
+            } else if (row == 2) {
+                int b_id = (boss >= 0 && boss < BLIND_COUNT) ? boss : 0;
+                value = to_float(state_embed[(BA_STATE_BLIND_ROW + b_id) * 8 + d]);
+            } else if (row == 3) {
+                int v_idx = (voucher >= CENTER_V_ANTIMATTER && voucher <= CENTER_V_WASTEFUL)
+                    ? (voucher - CENTER_V_ANTIMATTER + 1) : 0;
+                value = to_float(state_embed[(BA_STATE_VOUCHER_ROW + v_idx) * 8 + d]);
+            } else {
+                int t_id = (tarot >= 0 && tarot < CENTER_COUNT) ? tarot : 0;
+                value = to_float(state_embed[(BA_STATE_TAROT_ROW + t_id) * 8 + d]);
+            }
+        } else if (local < 46) {
+            int phase = ba_byte(obs, in, base + offsetof(ObservationGlobals, phase));
+            value = (local - 40) == phase ? 1.0f : 0.0f;
+        } else if (local < 58) {
+            int most = ba_byte(obs, in, base + offsetof(ObservationGlobals, most_played_hand));
+            value = (local - 46) == most ? 1.0f : 0.0f;
+        } else if (local < 70) {
+            int last = ba_byte(obs, in, base + offsetof(ObservationGlobals, last_hand_type));
+            value = (local - 58) == last ? 1.0f : 0.0f;
+        } else if (local < 78) {
+            int d = local - 70;
+            int lock_raw = ba_byte(obs, in, base + offsetof(ObservationGlobals, blind_only_hand));
+            int lock_idx = (lock_raw < HAND_COUNT) ? lock_raw : HAND_COUNT;
+            value = to_float(state_embed[(BA_STATE_LOCK_ROW + lock_idx) * 8 + d]);
+        } else if (local < 86) {
+            int d = local - 78;
+            uint16_t hands_mask = ba_u16(obs, in, base + offsetof(ObservationGlobals, blind_hands_mask));
+            float sum = 0.0f;
+            uint32_t m = hands_mask & 0x0FFF;
+            while (m) {
+                int h = __ffs(m) - 1;
+                m &= m - 1;
+                sum += to_float(state_embed[(BA_STATE_PLAYED_HAND_ROW + h) * 8 + d]);
+            }
+            value = sum;
+        } else if (local < 94) {
+            int d = local - 86;
+            uint16_t planet_mask = ba_u16(obs, in, base + offsetof(ObservationGlobals, planet_usage_mask));
+            float sum = 0.0f;
+            uint32_t m = planet_mask & 0x0FFF;
+            while (m) {
+                int h = __ffs(m) - 1;
+                m &= m - 1;
+                sum += to_float(state_embed[(BA_STATE_PLANET_HAND_ROW + h) * 8 + d]);
+            }
+            value = sum;
+        } else if (local < 98) {
+            int d = local - 94;
+            uint8_t skip_mask = ba_byte(obs, in, base + offsetof(ObservationGlobals, blind_skipped_mask));
+            float sum = 0.0f;
+            for (int s = 0; s < 3; ++s) {
+                if ((skip_mask >> s) & 1)
+                    sum += to_float(state_embed[(BA_STATE_SKIP_ROW + s) * 8 + d]);
+            }
+            value = sum;
+        } else if (local < 102) {
+            int d = local - 98;
+            int atag = ba_byte(obs, in, base + offsetof(ObservationGlobals, active_tag));
+            if (atag >= TAG_COUNT) atag = 0;
+            value = to_float(state_embed[(BA_STATE_TAG_ROW + atag) * 8 + d]);
+        } else if (local < 129) {
+            int s = local - 102;
+            int raw = ba_byte(obs, in, base + scalar_offset[s]);
+            value = scalar_scale[s] < 0.0f ? (float)(raw != 0) : (float)raw * scalar_scale[s];
+        } else if (local < 131) {
+            int s = local - 129;
+            int off = s == 0 ? offsetof(ObservationGlobals, ante)
+                : offsetof(ObservationGlobals, run_hands_played);
+            value = (float)ba_byte(obs, in, base + off) / (s == 0 ? 16.0f : 256.0f);
+        } else if (local < 136) {
+            int s = local - 131;
+            static constexpr int u16_stat_offsets[5] = {
+                offsetof(ObservationGlobals, hands_left), offsetof(ObservationGlobals, discards_left),
+                offsetof(ObservationGlobals, hands_played), offsetof(ObservationGlobals, discards_used),
+                offsetof(ObservationGlobals, tarots_used),
+            };
+            value = (float)ba_u16(obs, in, base + u16_stat_offsets[s]) / 64.0f;
+        } else if (local < 139) {
+            int s = local - 136;
+            static constexpr int i32_stat_offsets[3] = {
+                offsetof(ObservationGlobals, dollars), offsetof(ObservationGlobals, reroll_cost),
+                offsetof(ObservationGlobals, round_earnings),
+            };
+            value = (float)(int32_t)ba_u32(obs, in, base + i32_stat_offsets[s]) / 64.0f;
+        } else if (local < 143) {
+            int s = local - 139;
+            value = ba_float(obs, in, base + offsetof(ObservationGlobals, chips_log2) + 4 * s) / 16.0f;
+        } else if (local < 146) {
+            int s = local - 143;
+            value = (float)ba_u16(obs, in, base + offsetof(ObservationGlobals, interest_cap) + 2 * s) / 64.0f;
+        } else {
+            int s = local - 146;
+            value = (float)ba_byte(obs, in, base + offsetof(ObservationGlobals, joker_rate) + s) / 100.0f;
+        }
+        pooled[b * BA_TOTAL + BA_OFF_GLOBALS + local] = from_float(value);
     }
 
     // 2. Decode live tokens and apply the shared typed token MLP.
@@ -615,51 +739,77 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
     int total = s_total;
     if (threadIdx.x < BA_POOL_SECTIONS)
         counts_out[b * BA_POOL_SECTIONS + threadIdx.x] = s_counts[threadIdx.x];
+    for (int i = threadIdx.x; i < BA_POOL_SECTIONS * BA_KEY_DIM; i += blockDim.x) {
+        int s = i / BA_KEY_DIM;
+        int d = i % BA_KEY_DIM;
+        s_pool_sum[s][d] = 0.0f;
+        s_pool_max_pair[s][d] = 0ULL;
+    }
+    __syncthreads();
 
     constexpr int TOKEN_WARP = 32;
     constexpr int TOKEN_WARPS = BLOCK_SIZE / TOKEN_WARP;
     int lane = threadIdx.x & (TOKEN_WARP - 1);
     int warp = threadIdx.x / TOKEN_WARP;
     for (int slot = warp; slot < total; slot += TOKEN_WARPS) {
+        int id, sec, playing, enh, ed, seal, flags;
         if (lane == 0) {
             int local;
-            s_section[warp] = ba_slot_section(s_counts, slot, &local);
+            sec = ba_slot_section(s_counts, slot, &local);
             ba_token_features(obs, in, slot, s_raw[warp]);
             int token_base = offsetof(Observation, tokens)
                 + slot * sizeof(CardToken);
-            int id = ba_u16(obs, in, token_base + offsetof(CardToken, id));
+            id = ba_u16(obs, in, token_base + offsetof(CardToken, id));
             int zone = ba_byte(obs, in, token_base + offsetof(CardToken, zone));
-            s_id[warp] = id;
-            s_playing[warp] = zone == ZONE_HAND || id > 300;
+            playing = zone == ZONE_HAND || id > 300;
+            enh = ba_byte(obs, in, token_base + offsetof(CardToken, enhancement));
+            ed = ba_byte(obs, in, token_base + offsetof(CardToken, edition));
+            seal = ba_byte(obs, in, token_base + offsetof(CardToken, seal));
+            flags = ba_byte(obs, in, token_base + offsetof(CardToken, flags));
         }
-        __syncwarp();
-        int id = s_id[warp];
-        int playing = s_playing[warp];
+        uint32_t p0 = __shfl_sync(PUF_WARP_MASK, (id & 0xFFFF) | (sec << 16) | (playing << 24), 0);
+        uint32_t p1 = __shfl_sync(PUF_WARP_MASK, enh | (ed << 8) | (seal << 16) | (flags << 24), 0);
+        id = p0 & 0xFFFF;
+        sec = (p0 >> 16) & 0xFF;
+        playing = (p0 >> 24) & 1;
+        enh = p1 & 0xFF;
+        ed = (p1 >> 8) & 0xFF;
+        seal = (p1 >> 16) & 0xFF;
+        flags = (p1 >> 24) & 0xFF;
         int rank = playing ? id >> 8 : 0;
         int suit = playing ? id & 0xFF : 0;
+
         float z = to_float(token_b[lane])
-            + to_float(zone_embed[s_section[warp] * BA_KEY_DIM + lane]);
+            + to_float(token_embed[(BA_TOKEN_ZONE_ROW + sec) * BA_KEY_DIM + lane]);
         if (playing) {
-            z += to_float(rank_embed[rank * BA_KEY_DIM + lane]);
-            z += to_float(suit_embed[suit * BA_KEY_DIM + lane]);
+            z += to_float(token_embed[(BA_TOKEN_RANK_ROW + rank) * BA_KEY_DIM + lane]);
+            z += to_float(token_embed[(BA_TOKEN_SUIT_ROW + suit) * BA_KEY_DIM + lane]);
         } else {
-            z += to_float(center_embed[id * BA_KEY_DIM + lane]);
+            z += to_float(token_embed[(BA_TOKEN_CENTER_ROW + id) * BA_KEY_DIM + lane]);
+        }
+        if (enh > 0 && enh < 9)
+            z += to_float(token_embed[(BA_TOKEN_ENH_ROW + enh) * BA_KEY_DIM + lane]);
+        if (ed > 0 && ed < 5)
+            z += to_float(token_embed[(BA_TOKEN_ED_ROW + ed) * BA_KEY_DIM + lane]);
+        if (seal > 0 && seal < 5)
+            z += to_float(token_embed[(BA_TOKEN_SEAL_ROW + seal) * BA_KEY_DIM + lane]);
+        #pragma unroll
+        for (int f = 0; f < 6; ++f) {
+            if ((flags >> f) & 1)
+                z += to_float(token_embed[(BA_TOKEN_FLAG_ROW + f) * BA_KEY_DIM + lane]);
         }
         #pragma unroll
         for (int k = 0; k < BA_RAW_DIM; ++k) {
             z += to_float(token_w[lane * BA_RAW_DIM + k]) * s_raw[warp][k];
         }
         float token_value = fmaxf(z, 0.0f);
-        s_tokens[slot][lane] = token_value;
         keys[((int64_t)b * MAX_OBS_TOKENS + slot) * BA_KEY_DIM + lane]
             = from_float(token_value);
+        atomicAdd(&s_pool_sum[sec][lane], token_value);
+        uint32_t val_u = __float_as_uint(token_value);
+        uint64_t pair = ((uint64_t)val_u << 32) | (uint64_t)(0xFFFFFFFFu - (uint32_t)slot);
+        atomicMax((unsigned long long*)&s_pool_max_pair[sec][lane], (unsigned long long)pair);
         __syncwarp();
-    }
-    for (int i = total * BA_KEY_DIM + threadIdx.x; i < MAX_OBS_TOKENS * BA_KEY_DIM; i += blockDim.x) {
-        int slot = i / BA_KEY_DIM;
-        int d = i % BA_KEY_DIM;
-        s_tokens[slot][d] = 0.0f;
-        keys[((int64_t)b * MAX_OBS_TOKENS + slot) * BA_KEY_DIM + d] = from_float(0.0f);
     }
     __syncthreads();
 
@@ -670,28 +820,18 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
         int is_max = rem / BA_KEY_DIM;
         int d = rem % BA_KEY_DIM;
 
-        int start = 0;
-        for (int s = 0; s < sec; ++s) start += s_counts[s];
-        int end = start + s_counts[sec];
-        if (end > total) end = total;
-
-        float sum = 0.0f;
-        int cnt = end - start;
-        float max_val = cnt > 0 ? s_tokens[start][d] : 0.0f;
-        int max_slot = start;
-        for (int slot = start; slot < end; ++slot) {
-            float v = s_tokens[slot][d];
-            sum += v;
-            if (v > max_val) {
-                max_val = v;
-                max_slot = slot;
-            }
+        int cnt = s_counts[sec];
+        if (is_max) {
+            unsigned long long best = s_pool_max_pair[sec][d];
+            float max_val = cnt > 0 ? __uint_as_float((uint32_t)(best >> 32)) : 0.0f;
+            int max_slot = cnt > 0 ? (int)(0xFFFFFFFFu - (uint32_t)(best & 0xFFFFFFFFu)) : -1;
+            pooled[b * BA_TOTAL + BA_OFF_POOLED + c] = from_float(max_val);
+            pool_argmax[b * BA_POOL_SECTIONS * BA_KEY_DIM + sec * BA_KEY_DIM + d] = max_slot;
+        } else {
+            float sum = s_pool_sum[sec][d];
+            float mean = cnt > 0 ? sum / (float)cnt : 0.0f;
+            pooled[b * BA_TOTAL + BA_OFF_POOLED + c] = from_float(mean);
         }
-        float out_v = cnt > 0 ? (is_max ? max_val : sum / (float)cnt) : 0.0f;
-        pooled[b * BA_TOTAL + BA_OFF_POOLED + c] = from_float(out_v);
-        if (is_max)
-            pool_argmax[b * BA_POOL_SECTIONS * BA_KEY_DIM + sec * BA_KEY_DIM + d] =
-                cnt > 0 ? max_slot : -1;
     }
 }
 
@@ -711,86 +851,303 @@ __global__ void ba_fxp_to_precision_kernel(
 
 __global__ void ba_token_backward_kernel(
         const precision_t* __restrict__ d_pooled,
-        const precision_t* __restrict__ keygrad,
+        const float* __restrict__ grad_logits,
+        const precision_t* __restrict__ fused,
+        const precision_t* __restrict__ primary_probability,
+        const precision_t* __restrict__ keys,
         const int* __restrict__ counts_data,
         const int* __restrict__ pool_argmax,
-        const precision_t* __restrict__ token_w,
-        const precision_t* __restrict__ token_b,
-        const precision_t* __restrict__ center_embed,
-        const precision_t* __restrict__ rank_embed,
-        const precision_t* __restrict__ suit_embed,
-        const precision_t* __restrict__ zone_embed,
-        long* __restrict__ center_acc,
-        long* __restrict__ rank_acc,
-        long* __restrict__ suit_acc,
-        long* __restrict__ zone_acc,
+        long* __restrict__ token_embed_acc,
+        long* __restrict__ state_embed_acc,
         long* __restrict__ token_w_acc,
         long* __restrict__ token_b_acc,
         const unsigned char* __restrict__ obs,
         int obs_size,
         int B) {
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)B * MAX_OBS_TOKENS * BA_KEY_DIM) return;
-    int d = idx % BA_KEY_DIM;
-    int slot = (idx / BA_KEY_DIM) % MAX_OBS_TOKENS;
-    int b = idx / ((int64_t)MAX_OBS_TOKENS * BA_KEY_DIM);
-    int counts[BA_POOL_SECTIONS];
-    #pragma unroll
-    for (int s = 0; s < BA_POOL_SECTIONS; ++s)
-        counts[s] = counts_data[b * BA_POOL_SECTIONS + s];
-    int total = 0;
-    #pragma unroll
-    for (int s = 0; s < BA_POOL_SECTIONS; ++s) total += counts[s];
-    if (slot >= total) return;
+    constexpr int TOKEN_WARPS = BLOCK_SIZE / 32;
+    __shared__ float raw[TOKEN_WARPS][BA_RAW_DIM];
+    __shared__ int s_counts[BA_POOL_SECTIONS];
+    __shared__ int s_total;
+    __shared__ float s_token_b[BA_KEY_DIM];
+    __shared__ float s_token_w[BA_KEY_DIM][BA_RAW_DIM];
 
-    int local;
-    int sec = ba_slot_section(counts, slot, &local);
-    float g = keygrad ? to_float(keygrad[idx]) : 0.0f;
-    int count = counts[sec];
-    g += to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_POOLED
-        + sec * BA_KEY_DIM * 2 + d]) / (float)count;
-    int max_slot = pool_argmax[(int64_t)b * BA_POOL_SECTIONS * BA_KEY_DIM
-        + sec * BA_KEY_DIM + d];
-    if (max_slot == slot)
-        g += to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_POOLED
-            + sec * BA_KEY_DIM * 2 + BA_KEY_DIM + d]);
+    int b = blockIdx.x;
+    if (b >= B) return;
 
+    if (threadIdx.x < BA_POOL_SECTIONS) {
+        s_counts[threadIdx.x] = counts_data[b * BA_POOL_SECTIONS + threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+        int tot = 0;
+        #pragma unroll
+        for (int s = 0; s < BA_POOL_SECTIONS; ++s) tot += counts_data[b * BA_POOL_SECTIONS + s];
+        s_total = tot;
+    }
+    for (int i = threadIdx.x; i < BA_KEY_DIM; i += blockDim.x) {
+        s_token_b[i] = 0.0f;
+    }
+    for (int i = threadIdx.x; i < BA_KEY_DIM * BA_RAW_DIM; i += blockDim.x) {
+        int d_idx = i / BA_RAW_DIM;
+        int k_idx = i % BA_RAW_DIM;
+        s_token_w[d_idx][k_idx] = 0.0f;
+    }
+    __syncthreads();
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x / 32;
+    int d = lane;
+    int total = s_total;
     int64_t in = (int64_t)b * obs_size;
-    float v[BA_RAW_DIM];
-    ba_token_features(obs, in, slot, v);
+    int64_t b_grad = (int64_t)b * BA_VALUE_OFFSET;
+    int64_t b_prob = (int64_t)b * BA_PRIMARY_QUERY_COUNT * POLICY_PRIMARY_COUNT;
+    const precision_t* query = fused + (int64_t)b * BA_FUSED_ROWS + BA_LINEAR_PAD;
 
-    int token_base = offsetof(Observation, tokens) + slot * sizeof(CardToken);
-    int id = ba_u16(obs, in, token_base + offsetof(CardToken, id));
-    int zone = ba_byte(obs, in, token_base + offsetof(CardToken, zone));
-    int is_playing = (zone == ZONE_HAND) || (id > 300);
-    int rank = is_playing ? id >> 8 : 0;
-    int suit = is_playing ? id & 0xFF : 0;
-    float pre = to_float(token_b[d]) + to_float(zone_embed[zone * BA_KEY_DIM + d]);
-    if (is_playing) {
-        pre += to_float(rank_embed[rank * BA_KEY_DIM + d]);
-        pre += to_float(suit_embed[suit * BA_KEY_DIM + d]);
-    } else {
-        pre += to_float(center_embed[id * BA_KEY_DIM + d]);
+    if (warp == 0) {
+        int base = offsetof(Observation, globals);
+        int octet = lane >> 3;      // 0, 1, 2, or 3
+        int sub_lane = lane & 7;    // 0 .. 7
+        if (octet == 0) {
+            int deck = ba_u16(obs, in, base + offsetof(ObservationGlobals, deck_id));
+            if (deck < 16) {
+                float g_deck = to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_DECK_EMBED + sub_lane]);
+                if (g_deck != 0.0f)
+                    ba_fxp_atomic_add(&state_embed_acc[(BA_STATE_DECK_ROW + deck) * 8 + sub_lane], g_deck);
+            }
+            int blind = ba_u16(obs, in, base + offsetof(ObservationGlobals, blind_id));
+            if (blind < BLIND_COUNT) {
+                float g_blind = to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_BLIND_EMBED + sub_lane]);
+                if (g_blind != 0.0f)
+                    ba_fxp_atomic_add(&state_embed_acc[(BA_STATE_BLIND_ROW + blind) * 8 + sub_lane], g_blind);
+            }
+        } else if (octet == 1) {
+            int boss = ba_u16(obs, in, base + offsetof(ObservationGlobals, next_boss_id));
+            if (boss < BLIND_COUNT) {
+                float g_boss = to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_BOSS_EMBED + sub_lane]);
+                if (g_boss != 0.0f)
+                    ba_fxp_atomic_add(&state_embed_acc[(BA_STATE_BLIND_ROW + boss) * 8 + sub_lane], g_boss);
+            }
+            int voucher = ba_u16(obs, in, base + offsetof(ObservationGlobals, next_voucher_id));
+            int v_idx = (voucher >= CENTER_V_ANTIMATTER && voucher <= CENTER_V_WASTEFUL)
+                ? (voucher - CENTER_V_ANTIMATTER + 1) : 0;
+            if (v_idx < 34) {
+                float g_v = to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_VOUCHER_EMBED + sub_lane]);
+                if (g_v != 0.0f)
+                    ba_fxp_atomic_add(&state_embed_acc[(BA_STATE_VOUCHER_ROW + v_idx) * 8 + sub_lane], g_v);
+            }
+        } else if (octet == 2) {
+            int tarot = ba_u16(obs, in, base + offsetof(ObservationGlobals, last_tarot_planet));
+            if (tarot < CENTER_COUNT) {
+                float g_t = to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_TAROT_EMBED + sub_lane]);
+                if (g_t != 0.0f)
+                    ba_fxp_atomic_add(&state_embed_acc[(BA_STATE_TAROT_ROW + tarot) * 8 + sub_lane], g_t);
+            }
+            int lock_raw = ba_byte(obs, in, base + offsetof(ObservationGlobals, blind_only_hand));
+            int lock_idx = (lock_raw < HAND_COUNT) ? lock_raw : HAND_COUNT;
+            float g_lock = to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_LOCK_EMBED + sub_lane]);
+            if (g_lock != 0.0f)
+                ba_fxp_atomic_add(&state_embed_acc[(BA_STATE_LOCK_ROW + lock_idx) * 8 + sub_lane], g_lock);
+        } else if (octet == 3) {
+            uint16_t hands_mask = ba_u16(obs, in, base + offsetof(ObservationGlobals, blind_hands_mask));
+            float g_hands = to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_PLAYED_HANDS + sub_lane]);
+            if (g_hands != 0.0f) {
+                uint32_t m = hands_mask & 0x0FFF;
+                while (m) {
+                    int h = __ffs(m) - 1;
+                    m &= m - 1;
+                    ba_fxp_atomic_add(&state_embed_acc[(BA_STATE_PLAYED_HAND_ROW + h) * 8 + sub_lane], g_hands);
+                }
+            }
+
+            uint16_t planet_mask = ba_u16(obs, in, base + offsetof(ObservationGlobals, planet_usage_mask));
+            float g_planet = to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_PLANET_USAGE + sub_lane]);
+            if (g_planet != 0.0f) {
+                uint32_t m = planet_mask & 0x0FFF;
+                while (m) {
+                    int h = __ffs(m) - 1;
+                    m &= m - 1;
+                    ba_fxp_atomic_add(&state_embed_acc[(BA_STATE_PLANET_HAND_ROW + h) * 8 + sub_lane], g_planet);
+                }
+            }
+            if (sub_lane < 4) {
+                uint8_t skip_mask = ba_byte(obs, in, base + offsetof(ObservationGlobals, blind_skipped_mask));
+                float g_skip = to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_SKIP_EMBED + sub_lane]);
+                if (g_skip != 0.0f) {
+                    for (int s = 0; s < 3; ++s) {
+                        if ((skip_mask >> s) & 1)
+                            ba_fxp_atomic_add(&state_embed_acc[(BA_STATE_SKIP_ROW + s) * 8 + sub_lane], g_skip);
+                    }
+                }
+                int atag = ba_byte(obs, in, base + offsetof(ObservationGlobals, active_tag));
+                if (atag < TAG_COUNT) {
+                    float g_tag = to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_TAG_EMBED + sub_lane]);
+                    if (g_tag != 0.0f)
+                        ba_fxp_atomic_add(&state_embed_acc[(BA_STATE_TAG_ROW + atag) * 8 + sub_lane], g_tag);
+                }
+                for (int bi = 0; bi < 2; ++bi) {
+                    int btag = ba_byte(obs, in, base + offsetof(ObservationGlobals, blind_tags) + bi);
+                    if (btag < TAG_COUNT) {
+                        float g_btag = to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_TAGS + 1 + bi * 6 + sub_lane]);
+                        if (g_btag != 0.0f)
+                            ba_fxp_atomic_add(&state_embed_acc[(BA_STATE_TAG_ROW + btag) * 8 + sub_lane], g_btag);
+                    }
+                }
+            }
+        }
     }
-    #pragma unroll
-    for (int k = 0; k < BA_RAW_DIM; ++k)
-        pre += to_float(token_w[d * BA_RAW_DIM + k]) * v[k];
 
-    if (pre <= 0.0f || g == 0.0f) return;
+    for (int slot = warp; slot < total; slot += TOKEN_WARPS) {
+        int id, zone, is_playing, enh, ed, seal, flags;
+        if (lane == 0) {
+            ba_token_features(obs, in, slot, raw[warp]);
+            int token_base = offsetof(Observation, tokens) + slot * sizeof(CardToken);
+            id = ba_u16(obs, in, token_base + offsetof(CardToken, id));
+            zone = ba_byte(obs, in, token_base + offsetof(CardToken, zone));
+            is_playing = (zone == ZONE_HAND) || (id > 300);
+            enh = ba_byte(obs, in, token_base + offsetof(CardToken, enhancement));
+            ed = ba_byte(obs, in, token_base + offsetof(CardToken, edition));
+            seal = ba_byte(obs, in, token_base + offsetof(CardToken, seal));
+            flags = ba_byte(obs, in, token_base + offsetof(CardToken, flags));
+        }
+        uint32_t p0 = __shfl_sync(PUF_WARP_MASK, (id & 0xFFFF) | (zone << 16) | (is_playing << 24), 0);
+        uint32_t p1 = __shfl_sync(PUF_WARP_MASK, enh | (ed << 8) | (seal << 16) | (flags << 24), 0);
+        id = p0 & 0xFFFF;
+        zone = (p0 >> 16) & 0xFF;
+        is_playing = (p0 >> 24) & 1;
+        enh = p1 & 0xFF;
+        ed = (p1 >> 8) & 0xFF;
+        seal = (p1 >> 16) & 0xFF;
+        flags = (p1 >> 24) & 0xFF;
 
-    ba_fxp_atomic_add(&zone_acc[zone * BA_KEY_DIM + d], g);
-    if (is_playing) {
-        ba_fxp_atomic_add(&rank_acc[rank * BA_KEY_DIM + d], g);
-        ba_fxp_atomic_add(&suit_acc[suit * BA_KEY_DIM + d], g);
-    } else {
-        ba_fxp_atomic_add(&center_acc[id * BA_KEY_DIM + d], g);
+        int local;
+        int sec = ba_slot_section(s_counts, slot, &local);
+        float g = 0.0f;
+        if (sec == ZONE_SHOP_MAIN) {
+            static constexpr int queries[2] = {0, 11};
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                int q = queries[i];
+                float scalar = grad_logits[b_grad + BA_PRIMARY_OFFSET
+                    + q * POLICY_PRIMARY_COUNT + local];
+                scalar += grad_logits[b_grad + BA_PRIMARY_TYPES[q]]
+                    * to_float(primary_probability[b_prob
+                        + q * POLICY_PRIMARY_COUNT + local]);
+                g += scalar * to_float(query[q * BA_KEY_DIM + d]);
+            }
+        } else if (sec == ZONE_JOKER) {
+            static constexpr int queries[3] = {1, 7, 8};
+            #pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                int q = queries[i];
+                float scalar = grad_logits[b_grad + BA_PRIMARY_OFFSET
+                    + q * POLICY_PRIMARY_COUNT + local];
+                scalar += grad_logits[b_grad + BA_PRIMARY_TYPES[q]]
+                    * to_float(primary_probability[b_prob
+                        + q * POLICY_PRIMARY_COUNT + local]);
+                g += scalar * to_float(query[q * BA_KEY_DIM + d]);
+            }
+            if (local < OBS_MAX_JOKERS) {
+                g += grad_logits[b_grad + BA_ORDER_JOKER_OFFSET + local]
+                    * to_float(query[BA_ORDER_QUERY_JOKER * BA_KEY_DIM + d]);
+            }
+        } else if (sec == ZONE_CONSUMABLE) {
+            static constexpr int queries[2] = {2, 3};
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                int q = queries[i];
+                float scalar = grad_logits[b_grad + BA_PRIMARY_OFFSET
+                    + q * POLICY_PRIMARY_COUNT + local];
+                scalar += grad_logits[b_grad + BA_PRIMARY_TYPES[q]]
+                    * to_float(primary_probability[b_prob
+                        + q * POLICY_PRIMARY_COUNT + local]);
+                g += scalar * to_float(query[q * BA_KEY_DIM + d]);
+            }
+        } else if (sec == ZONE_SHOP_VOUCHER || sec == ZONE_SHOP_BOOSTER
+                || sec == ZONE_PACK_CARD) {
+            int q = sec == ZONE_SHOP_VOUCHER ? 4
+                : sec == ZONE_SHOP_BOOSTER ? 5 : 6;
+            float scalar = grad_logits[b_grad + BA_PRIMARY_OFFSET
+                + q * POLICY_PRIMARY_COUNT + local];
+            scalar += grad_logits[b_grad + BA_PRIMARY_TYPES[q]]
+                * to_float(primary_probability[b_prob
+                    + q * POLICY_PRIMARY_COUNT + local]);
+            g += scalar * to_float(query[q * BA_KEY_DIM + d]);
+        } else if (sec == ZONE_HAND && local < POLICY_PRIMARY_COUNT) {
+            static constexpr int queries[2] = {9, 10};
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                int q = queries[i];
+                float scalar = grad_logits[b_grad + BA_PRIMARY_OFFSET
+                    + q * POLICY_PRIMARY_COUNT + local];
+                scalar += grad_logits[b_grad + BA_PRIMARY_TYPES[q]]
+                    * to_float(primary_probability[b_prob
+                        + q * POLICY_PRIMARY_COUNT + local]);
+                g += scalar * to_float(query[q * BA_KEY_DIM + d]);
+            }
+            #pragma unroll
+            for (int card = 0; card < 5; ++card) {
+                int q = BA_PRIMARY_QUERY_COUNT + card;
+                g += grad_logits[b_grad + BA_CARD_OFFSET
+                    + card * POLICY_PRIMARY_COUNT + local]
+                    * to_float(query[q * BA_KEY_DIM + d]);
+            }
+            if (local < OBS_MAX_HAND) {
+                g += grad_logits[b_grad + BA_ORDER_HAND_OFFSET + local]
+                    * to_float(query[BA_ORDER_QUERY_HAND * BA_KEY_DIM + d]);
+            }
+        }
+        g *= BA_QUERY_SCALE;
+        int count = s_counts[sec];
+        g += to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_POOLED
+            + sec * BA_KEY_DIM * 2 + d]) / (float)count;
+        int max_slot = pool_argmax[(int64_t)b * BA_POOL_SECTIONS * BA_KEY_DIM
+            + sec * BA_KEY_DIM + d];
+        if (max_slot == slot)
+            g += to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_POOLED
+                + sec * BA_KEY_DIM * 2 + BA_KEY_DIM + d]);
+
+        int rank = is_playing ? id >> 8 : 0;
+        int suit = is_playing ? id & 0xFF : 0;
+        int64_t idx = ((int64_t)b * MAX_OBS_TOKENS + slot) * BA_KEY_DIM + d;
+        if (to_float(keys[idx]) <= 0.0f || g == 0.0f) continue;
+
+        ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_ZONE_ROW + zone) * BA_KEY_DIM + d], g);
+        if (is_playing) {
+            ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_RANK_ROW + rank) * BA_KEY_DIM + d], g);
+            ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_SUIT_ROW + suit) * BA_KEY_DIM + d], g);
+        } else {
+            ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_CENTER_ROW + id) * BA_KEY_DIM + d], g);
+        }
+        if (enh > 0 && enh < 9)
+            ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_ENH_ROW + enh) * BA_KEY_DIM + d], g);
+        if (ed > 0 && ed < 5)
+            ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_ED_ROW + ed) * BA_KEY_DIM + d], g);
+        if (seal > 0 && seal < 5)
+            ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_SEAL_ROW + seal) * BA_KEY_DIM + d], g);
+        #pragma unroll
+        for (int f = 0; f < 6; ++f) {
+            if ((flags >> f) & 1)
+                ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_FLAG_ROW + f) * BA_KEY_DIM + d], g);
+        }
+        atomicAdd(&s_token_b[d], g);
+        #pragma unroll
+        for (int k = 0; k < BA_RAW_DIM; ++k) {
+            float vk = raw[warp][k];
+            if (vk != 0.0f)
+                atomicAdd(&s_token_w[d][k], g * vk);
+        }
     }
-    ba_fxp_atomic_add(&token_b_acc[d], g);
-    #pragma unroll
-    for (int k = 0; k < BA_RAW_DIM; ++k) {
-        float vk = v[k];
-        if (vk != 0.0f)
-            ba_fxp_atomic_add(&token_w_acc[d * BA_RAW_DIM + k], g * vk);
+    __syncthreads();
+    if (threadIdx.x < BA_KEY_DIM) {
+        float gb = s_token_b[threadIdx.x];
+        if (gb != 0.0f)
+            ba_fxp_atomic_add(&token_b_acc[threadIdx.x], gb);
+    }
+    for (int i = threadIdx.x; i < BA_KEY_DIM * BA_RAW_DIM; i += blockDim.x) {
+        int d_idx = i / BA_RAW_DIM;
+        int k_idx = i % BA_RAW_DIM;
+        float gw = s_token_w[d_idx][k_idx];
+        if (gw != 0.0f)
+            ba_fxp_atomic_add(&token_w_acc[i], gw);
     }
 }
 
@@ -814,8 +1171,8 @@ static Prec ba_encoder_forward(
     ba_encode_kernel<<<B, BLOCK_SIZE, 0, stream>>>(
         a->pooled.data, a->keys.data, a->counts.data,
         a->pool_argmax.data, ew->token_w.data, ew->token_b.data,
-        ew->center_embed.data, ew->rank_embed.data, ew->suit_embed.data,
-        ew->zone_embed.data, input.data, B, ew->obs_size);
+        ew->token_embed.data, ew->state_embed.data,
+        input.data, B, ew->obs_size);
     puf_mm(&a->pooled, &ew->proj_w, &a->out, stream);
     return a->out;
 }
@@ -825,41 +1182,23 @@ static void ba_encoder_backward(
     BalatroEncoderWeights* ew = (BalatroEncoderWeights*)w;
     BalatroEncoderActivations* a = (BalatroEncoderActivations*)activations;
     int B = a->obs_batch;
+    assert(a->decoder_grad_logits && a->decoder_fused
+        && a->decoder_probability);
     puf_mm_tn(&grad, &a->pooled, &a->proj_wgrad, stream);
     puf_mm_nn(&grad, &ew->proj_w, &a->d_pooled, stream);
-    cudaMemsetAsync(a->center_acc.data, 0,
-        numel(a->center_acc.shape) * sizeof(long), stream);
-    cudaMemsetAsync(a->rank_acc.data, 0,
-        numel(a->rank_acc.shape) * sizeof(long), stream);
-    cudaMemsetAsync(a->suit_acc.data, 0,
-        numel(a->suit_acc.shape) * sizeof(long), stream);
-    cudaMemsetAsync(a->zone_acc.data, 0,
-        numel(a->zone_acc.shape) * sizeof(long), stream);
-    cudaMemsetAsync(a->token_w_acc.data, 0,
-        numel(a->token_w_acc.shape) * sizeof(long), stream);
-    cudaMemsetAsync(a->token_b_acc.data, 0,
-        numel(a->token_b_acc.shape) * sizeof(long), stream);
-    ba_token_backward_kernel<<<grid_size((int64_t)B * MAX_OBS_TOKENS * BA_KEY_DIM), BLOCK_SIZE, 0, stream>>>(
+    constexpr int ACC_TOTAL_ELEMS = BA_KEY_DIM * BA_RAW_DIM + BA_KEY_DIM
+        + BA_TOKEN_EMBED_ROWS * BA_KEY_DIM + BA_STATE_EMBED_ROWS * BA_STATE_EMBED_DIM;
+    cudaMemsetAsync(a->token_w_acc.data, 0, ACC_TOTAL_ELEMS * sizeof(long), stream);
+    ba_token_backward_kernel<<<B, BLOCK_SIZE, 0, stream>>>(
         a->d_pooled.data,
-        ba_ptr_keygrad ? ba_ptr_keygrad->data : NULL,
+        a->decoder_grad_logits, a->decoder_fused, a->decoder_probability,
+        a->keys.data,
         a->counts.data, a->pool_argmax.data,
-        ew->token_w.data, ew->token_b.data, ew->center_embed.data,
-        ew->rank_embed.data, ew->suit_embed.data, ew->zone_embed.data,
-        a->center_acc.data, a->rank_acc.data, a->suit_acc.data, a->zone_acc.data,
+        a->token_embed_acc.data, a->state_embed_acc.data,
         a->token_w_acc.data, a->token_b_acc.data,
         a->obs_data, ew->obs_size, B);
-    ba_fxp_to_precision_kernel<<<grid_size(BA_KEY_DIM * BA_RAW_DIM), BLOCK_SIZE, 0, stream>>>(
-        a->token_wgrad.data, a->token_w_acc.data, BA_KEY_DIM * BA_RAW_DIM);
-    ba_fxp_to_precision_kernel<<<grid_size(BA_KEY_DIM), BLOCK_SIZE, 0, stream>>>(
-        a->token_bgrad.data, a->token_b_acc.data, BA_KEY_DIM);
-    ba_fxp_to_precision_kernel<<<grid_size(CENTER_COUNT * BA_KEY_DIM), BLOCK_SIZE, 0, stream>>>(
-        a->center_grad.data, a->center_acc.data, CENTER_COUNT * BA_KEY_DIM);
-    ba_fxp_to_precision_kernel<<<grid_size(15 * BA_KEY_DIM), BLOCK_SIZE, 0, stream>>>(
-        a->rank_grad.data, a->rank_acc.data, 15 * BA_KEY_DIM);
-    ba_fxp_to_precision_kernel<<<grid_size(4 * BA_KEY_DIM), BLOCK_SIZE, 0, stream>>>(
-        a->suit_grad.data, a->suit_acc.data, 4 * BA_KEY_DIM);
-    ba_fxp_to_precision_kernel<<<grid_size(BA_ZONES * BA_KEY_DIM), BLOCK_SIZE, 0, stream>>>(
-        a->zone_grad.data, a->zone_acc.data, BA_ZONES * BA_KEY_DIM);
+    ba_fxp_to_precision_kernel<<<grid_size(ACC_TOTAL_ELEMS), BLOCK_SIZE, 0, stream>>>(
+        a->token_wgrad.data, a->token_w_acc.data, ACC_TOTAL_ELEMS);
 }
 
 static void ba_encoder_init_weights(
@@ -867,10 +1206,8 @@ static void ba_encoder_init_weights(
     BalatroEncoderWeights* ew = (BalatroEncoderWeights*)w;
     puf_kaiming_init(&ew->token_w, 1.0f, (*seed)++, stream);
     puf_normal_init(&ew->token_b, 0.01f, (*seed)++, stream);
-    puf_normal_init(&ew->center_embed, 0.02f, (*seed)++, stream);
-    puf_normal_init(&ew->rank_embed, 0.02f, (*seed)++, stream);
-    puf_normal_init(&ew->suit_embed, 0.02f, (*seed)++, stream);
-    puf_normal_init(&ew->zone_embed, 0.02f, (*seed)++, stream);
+    puf_normal_init(&ew->token_embed, 0.02f, (*seed)++, stream);
+    puf_normal_init(&ew->state_embed, 0.02f, (*seed)++, stream);
     puf_kaiming_init(&ew->proj_w, sqrtf(2.0f), (*seed)++, stream);
 }
 
@@ -878,17 +1215,13 @@ static void ba_encoder_reg_params(void* w, Allocator* alloc) {
     BalatroEncoderWeights* ew = (BalatroEncoderWeights*)w;
     ew->token_w = {.shape = {BA_KEY_DIM, BA_RAW_DIM}};
     ew->token_b = {.shape = {BA_KEY_DIM}};
-    ew->center_embed = {.shape = {CENTER_COUNT, BA_KEY_DIM}};
-    ew->rank_embed = {.shape = {15, BA_KEY_DIM}};
-    ew->suit_embed = {.shape = {4, BA_KEY_DIM}};
-    ew->zone_embed = {.shape = {BA_ZONES, BA_KEY_DIM}};
+    ew->token_embed = {.shape = {BA_TOKEN_EMBED_ROWS, BA_KEY_DIM}};
+    ew->state_embed = {.shape = {BA_STATE_EMBED_ROWS, BA_STATE_EMBED_DIM}};
     ew->proj_w = {.shape = {ew->hidden, BA_TOTAL}};
     alloc_register(alloc, &ew->token_w);
     alloc_register(alloc, &ew->token_b);
-    alloc_register(alloc, &ew->center_embed);
-    alloc_register(alloc, &ew->rank_embed);
-    alloc_register(alloc, &ew->suit_embed);
-    alloc_register(alloc, &ew->zone_embed);
+    alloc_register(alloc, &ew->token_embed);
+    alloc_register(alloc, &ew->state_embed);
     alloc_register(alloc, &ew->proj_w);
 }
 
@@ -904,18 +1237,14 @@ static void ba_encoder_reg_train(
     a->keys = {.shape = {B_TT, MAX_OBS_TOKENS, BA_KEY_DIM}};
     a->counts = {.shape = {B_TT, BA_POOL_SECTIONS}};
     a->pool_argmax = {.shape = {B_TT, BA_POOL_SECTIONS, BA_KEY_DIM}};
-    a->center_acc = {.shape = {CENTER_COUNT, BA_KEY_DIM}};
-    a->rank_acc = {.shape = {15, BA_KEY_DIM}};
-    a->suit_acc = {.shape = {4, BA_KEY_DIM}};
-    a->zone_acc = {.shape = {BA_ZONES, BA_KEY_DIM}};
+    a->token_embed_acc = {.shape = {BA_TOKEN_EMBED_ROWS, BA_KEY_DIM}};
+    a->state_embed_acc = {.shape = {BA_STATE_EMBED_ROWS, BA_STATE_EMBED_DIM}};
     a->token_w_acc = {.shape = {BA_KEY_DIM, BA_RAW_DIM}};
     a->token_b_acc = {.shape = {BA_KEY_DIM}};
     a->token_wgrad = {.shape = {BA_KEY_DIM, BA_RAW_DIM}};
     a->token_bgrad = {.shape = {BA_KEY_DIM}};
-    a->center_grad = {.shape = {CENTER_COUNT, BA_KEY_DIM}};
-    a->rank_grad = {.shape = {15, BA_KEY_DIM}};
-    a->suit_grad = {.shape = {4, BA_KEY_DIM}};
-    a->zone_grad = {.shape = {BA_ZONES, BA_KEY_DIM}};
+    a->token_embed_grad = {.shape = {BA_TOKEN_EMBED_ROWS, BA_KEY_DIM}};
+    a->state_embed_grad = {.shape = {BA_STATE_EMBED_ROWS, BA_STATE_EMBED_DIM}};
     a->proj_wgrad = {.shape = {ew->hidden, BA_TOTAL}};
     alloc_register(acts, &a->pooled);
     alloc_register(acts, &a->out);
@@ -923,18 +1252,14 @@ static void ba_encoder_reg_train(
     alloc_register(acts, &a->keys);
     alloc_register(acts, &a->counts);
     alloc_register(acts, &a->pool_argmax);
-    alloc_register(acts, &a->center_acc);
-    alloc_register(acts, &a->rank_acc);
-    alloc_register(acts, &a->suit_acc);
-    alloc_register(acts, &a->zone_acc);
     alloc_register(acts, &a->token_w_acc);
     alloc_register(acts, &a->token_b_acc);
+    alloc_register(acts, &a->token_embed_acc);
+    alloc_register(acts, &a->state_embed_acc);
     alloc_register(grads, &a->token_wgrad);
     alloc_register(grads, &a->token_bgrad);
-    alloc_register(grads, &a->center_grad);
-    alloc_register(grads, &a->rank_grad);
-    alloc_register(grads, &a->suit_grad);
-    alloc_register(grads, &a->zone_grad);
+    alloc_register(grads, &a->token_embed_grad);
+    alloc_register(grads, &a->state_embed_grad);
     alloc_register(grads, &a->proj_wgrad);
     ba_enc_last = a;
 }
@@ -977,12 +1302,6 @@ static void create_balatro_encoder(Encoder* enc) {
     };
 }
 
-static constexpr int BA_PRIMARY_TYPES[POLICY_PRIMARY_HEADS] = {
-    ACTION_BUY_CARD, ACTION_SELL_JOKER, ACTION_SELL_CONSUMABLE,
-    ACTION_USE_CONSUMABLE, ACTION_REDEEM_VOUCHER, ACTION_OPEN_BOOSTER,
-    ACTION_PICK_PACK_CARD, ACTION_SWAP_JOKERS_LEFT, ACTION_SWAP_JOKERS_RIGHT,
-    ACTION_SWAP_HAND_LEFT, ACTION_SWAP_HAND_RIGHT, ACTION_BUY_AND_USE};
-
 static constexpr int BA_PRIMARY_ZONES[POLICY_PRIMARY_HEADS] = {
     ZONE_SHOP_MAIN, ZONE_JOKER, ZONE_CONSUMABLE, ZONE_CONSUMABLE,
     ZONE_SHOP_VOUCHER, ZONE_SHOP_BOOSTER, ZONE_PACK_CARD, ZONE_JOKER,
@@ -997,13 +1316,28 @@ __device__ __forceinline__ int ba_key_index(
         for (int s = 0; s < zone; ++s) start += counts[s];
         return start + option;
     }
-    if (option >= counts[ZONE_HAND]) return -1;
-    return option;
+    int zone = query == BA_ORDER_QUERY_JOKER ? ZONE_JOKER : ZONE_HAND;
+    if (option >= counts[zone]) return -1;
+    int start = 0;
+    for (int s = 0; s < zone; ++s) start += counts[s];
+    return start + option;
 }
 
-__global__ void ba_primary_probability_kernel(
+__global__ void ba_decoder_linear_kernel(
+        precision_t* __restrict__ out,
+        const precision_t* __restrict__ fused, int B) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * BA_LINEAR_ROWS) return;
+    int b = idx / BA_LINEAR_ROWS;
+    int c = idx % BA_LINEAR_ROWS;
+    int out_col = c < 23 ? c
+        : c < 29 ? BA_COUNT_OFFSET + c - 23 : BA_VALUE_OFFSET;
+    out[(int64_t)b * BA_DEC_ROWS + out_col] =
+        fused[(int64_t)b * BA_FUSED_ROWS + c];
+}
+
+__global__ void ba_decoder_pointer_kernel(
         precision_t* __restrict__ probability,
-        precision_t* __restrict__ lse_out,
         precision_t* __restrict__ out,
         const precision_t* __restrict__ fused,
         const precision_t* __restrict__ keys,
@@ -1013,20 +1347,31 @@ __global__ void ba_primary_probability_kernel(
     int lane = threadIdx.x & (WARP - 1);
     int warp = threadIdx.x / WARP;
     int idx = blockIdx.x * WARPS + warp;
-    bool active = idx < B * BA_PRIMARY_QUERY_COUNT;
-    int b = active ? idx / BA_PRIMARY_QUERY_COUNT : 0;
-    int query_id = active ? idx % BA_PRIMARY_QUERY_COUNT : 0;
+    bool active = idx < B * BA_QUERY_COUNT;
+    int b = active ? idx / BA_QUERY_COUNT : 0;
+    int query_id = active ? idx % BA_QUERY_COUNT : 0;
     int counts[BA_POOL_SECTIONS];
     for (int s = 0; s < BA_POOL_SECTIONS; ++s) {
         counts[s] = active ? counts_data[b * BA_POOL_SECTIONS + s] : 0;
     }
-    int candidates = active ? counts[BA_PRIMARY_ZONES[query_id]] : 0;
-    precision_t* p = probability +
-        ((int64_t)b * BA_PRIMARY_QUERY_COUNT + query_id) * POLICY_PRIMARY_COUNT;
-    precision_t* output = out + (int64_t)b * BA_DEC_ROWS
-        + BA_PRIMARY_OFFSET + query_id * POLICY_PRIMARY_COUNT;
+    int zone = query_id < BA_PRIMARY_QUERY_COUNT
+        ? BA_PRIMARY_ZONES[query_id]
+        : query_id == BA_ORDER_QUERY_JOKER ? ZONE_JOKER : ZONE_HAND;
+    int candidates = active ? counts[zone] : 0;
+    int head_size = query_id == BA_ORDER_QUERY_JOKER
+        ? OBS_MAX_JOKERS : POLICY_PRIMARY_COUNT;
+    int out_col = query_id < BA_PRIMARY_QUERY_COUNT
+        ? BA_PRIMARY_OFFSET + query_id * POLICY_PRIMARY_COUNT
+        : query_id < BA_ORDER_QUERY_HAND
+            ? BA_CARD_OFFSET
+                + (query_id - BA_PRIMARY_QUERY_COUNT) * POLICY_PRIMARY_COUNT
+            : query_id == BA_ORDER_QUERY_HAND
+                ? BA_ORDER_HAND_OFFSET : BA_ORDER_JOKER_OFFSET;
+    precision_t* output = out + (int64_t)b * BA_DEC_ROWS + out_col;
     const precision_t* q = fused + (int64_t)b * BA_FUSED_ROWS
         + BA_LINEAR_PAD + query_id * BA_KEY_DIM;
+    __shared__ float s_q[WARPS][BA_KEY_DIM];
+    s_q[warp][lane] = active ? to_float(q[lane]) : 0.0f;
     float score[2] = {-INFINITY, -INFINITY};
     #pragma unroll
     for (int part = 0; part < 2; ++part) {
@@ -1038,117 +1383,75 @@ __global__ void ba_primary_probability_kernel(
             float dot = 0.0f;
             #pragma unroll
             for (int d = 0; d < BA_KEY_DIM; ++d) {
-                dot += to_float(q[d]) * to_float(k[d]);
+                dot += s_q[warp][d] * to_float(k[d]);
             }
             score[part] = dot * BA_QUERY_SCALE;
         }
     }
-    float max_score = fmaxf(score[0], score[1]);
-    #pragma unroll
-    for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-        max_score = fmaxf(max_score,
-            __shfl_down_sync(PUF_WARP_MASK, max_score, offset, WARP));
-    }
-    max_score = __shfl_sync(PUF_WARP_MASK, max_score, 0, WARP);
-    float sum = candidates > 0
-        ? __expf(score[0] - max_score) + __expf(score[1] - max_score)
-        : 0.0f;
-    #pragma unroll
-    for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(PUF_WARP_MASK, sum, offset, WARP);
-    }
-    sum = __shfl_sync(PUF_WARP_MASK, sum, 0, WARP);
-    float lse = candidates > 0 ? max_score + __logf(sum) : -INFINITY;
-    if (active && lane == 0) lse_out[idx] = from_float(lse);
-    #pragma unroll
-    for (int part = 0; part < 2; ++part) {
-        int option = lane + part * WARP;
-        if (active) {
-            bool valid = option < candidates;
-            output[option] = from_float(valid ? score[part] : 0.0f);
-            p[option] = from_float(valid ? __expf(score[part] - lse) : 0.0f);
+    if (query_id < BA_PRIMARY_QUERY_COUNT) {
+        float max_score = fmaxf(score[0], score[1]);
+        #pragma unroll
+        for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+            max_score = fmaxf(max_score,
+                __shfl_down_sync(PUF_WARP_MASK, max_score, offset, WARP));
+        }
+        max_score = __shfl_sync(PUF_WARP_MASK, max_score, 0, WARP);
+        float sum = candidates > 0
+            ? __expf(score[0] - max_score) + __expf(score[1] - max_score)
+            : 0.0f;
+        #pragma unroll
+        for (int offset = WARP / 2; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(PUF_WARP_MASK, sum, offset, WARP);
+        sum = __shfl_sync(PUF_WARP_MASK, sum, 0, WARP);
+        float lse = candidates > 0 ? max_score + __logf(sum) : -INFINITY;
+        precision_t* p = probability
+            + ((int64_t)b * BA_PRIMARY_QUERY_COUNT + query_id)
+                * POLICY_PRIMARY_COUNT;
+        #pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            int option = lane + part * WARP;
+            if (active) {
+                bool valid = option < candidates;
+                output[option] = from_float(valid ? score[part] : 0.0f);
+                p[option] = from_float(
+                    valid ? __expf(score[part] - lse) : 0.0f);
+            }
+        }
+        if (active && lane == 0 && candidates > 0) {
+            int type = BA_PRIMARY_TYPES[query_id];
+            int type_idx = (int64_t)b * BA_DEC_ROWS + type;
+            out[type_idx] = from_float(to_float(out[type_idx]) + lse);
+        }
+    } else {
+        #pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            int option = lane + part * WARP;
+            if (active && option < head_size)
+                output[option] = from_float(
+                    option < candidates ? score[part] : 0.0f);
         }
     }
 }
 
-__global__ void ba_decoder_type_lse_kernel(
-        precision_t* __restrict__ out,
-        const precision_t* __restrict__ lse,
-        const int* __restrict__ counts_data, int B) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * BA_PRIMARY_QUERY_COUNT) return;
-    int b = idx / BA_PRIMARY_QUERY_COUNT;
-    int query = idx % BA_PRIMARY_QUERY_COUNT;
-    int zone = BA_PRIMARY_ZONES[query];
-    if (counts_data[b * BA_POOL_SECTIONS + zone] == 0) return;
-    int col = BA_PRIMARY_TYPES[query];
-    out[(int64_t)b * BA_DEC_ROWS + col] = from_float(
-        to_float(out[(int64_t)b * BA_DEC_ROWS + col]) + to_float(lse[idx]));
-}
-
-__global__ void ba_decoder_assemble_kernel(
-        precision_t* __restrict__ out,
-        const precision_t* __restrict__ fused,
-        const precision_t* __restrict__ keys,
-        const int* __restrict__ counts_data,
-        int B) {
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)B * BA_DEC_ROWS) return;
-    int b = idx / BA_DEC_ROWS;
-    int c = idx % BA_DEC_ROWS;
-    const precision_t* b_fused = fused + (int64_t)b * BA_FUSED_ROWS;
-    if (c < 23) {
-        out[idx] = b_fused[c];
-        return;
-    }
-    if ((c >= BA_COUNT_OFFSET && c < BA_CARD_OFFSET) || c == BA_VALUE_OFFSET) {
-        int linear_col = c < BA_CARD_OFFSET ? 23 + c - BA_COUNT_OFFSET : 29;
-        out[idx] = b_fused[linear_col];
-        return;
-    }
-    if (c >= BA_PRIMARY_OFFSET && c < BA_COUNT_OFFSET) return;
-    int query_id;
-    int option;
-    int p = c - BA_CARD_OFFSET;
-    query_id = BA_PRIMARY_QUERY_COUNT + p / POLICY_PRIMARY_COUNT;
-    option = p % POLICY_PRIMARY_COUNT;
-    int counts[BA_POOL_SECTIONS];
-    for (int s = 0; s < BA_POOL_SECTIONS; ++s)
-        counts[s] = counts_data[b * BA_POOL_SECTIONS + s];
-    int key = ba_key_index(counts, query_id, option);
-    if (key < 0) {
-        out[idx] = from_float(0.0f);
-        return;
-    }
-    const precision_t* q = b_fused + BA_LINEAR_PAD + query_id * BA_KEY_DIM;
-    const precision_t* k = keys + ((int64_t)b * MAX_OBS_TOKENS + key) * BA_KEY_DIM;
-    float dot = 0.0f;
-    for (int d = 0; d < BA_KEY_DIM; ++d)
-        dot += to_float(q[d]) * to_float(k[d]);
-    out[idx] = from_float(dot * BA_QUERY_SCALE);
-}
-
 __global__ void ba_decoder_prepare_grad_kernel(
         precision_t* __restrict__ dall,
-        const precision_t* __restrict__ grad_out, int B) {
+        const float* __restrict__ grad_logits,
+        const float* __restrict__ grad_value, int B) {
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (int64_t)B * BA_LINEAR_PAD) return;
     int b = idx / BA_LINEAR_PAD;
     int c = idx % BA_LINEAR_PAD;
     int64_t out_idx = (int64_t)b * BA_FUSED_ROWS + c;
-    if (c < 23)
-        dall[out_idx] = grad_out[(int64_t)b * BA_DEC_ROWS + c];
-    else if (c < 29)
-        dall[out_idx] = grad_out[(int64_t)b * BA_DEC_ROWS + BA_COUNT_OFFSET + c - 23];
-    else if (c == 29)
-        dall[out_idx] = grad_out[(int64_t)b * BA_DEC_ROWS + BA_VALUE_OFFSET];
-    else
-        dall[out_idx] = from_float(0.0f);
+    int64_t grad_base = (int64_t)b * BA_VALUE_OFFSET;
+    float value = c < 23 ? grad_logits[grad_base + c]
+        : c < 29 ? grad_logits[grad_base + BA_COUNT_OFFSET + c - 23]
+        : c == 29 ? grad_value[b] : 0.0f;
+    dall[out_idx] = from_float(value);
 }
 
 __global__ void ba_decoder_query_backward_kernel(
         precision_t* __restrict__ dall,
-        const precision_t* __restrict__ grad_out,
+        const float* __restrict__ grad_logits,
         const precision_t* __restrict__ keys,
         const precision_t* __restrict__ primary_probability,
         const int* __restrict__ counts_data, int B) {
@@ -1162,7 +1465,9 @@ __global__ void ba_decoder_query_backward_kernel(
     for (int s = 0; s < BA_POOL_SECTIONS; ++s)
         counts[s] = counts_data[b * BA_POOL_SECTIONS + s];
 
-    int zone = (query_id < BA_PRIMARY_QUERY_COUNT) ? BA_PRIMARY_ZONES[query_id] : ZONE_HAND;
+    int zone = query_id < BA_PRIMARY_QUERY_COUNT
+        ? BA_PRIMARY_ZONES[query_id]
+        : query_id == BA_ORDER_QUERY_JOKER ? ZONE_JOKER : ZONE_HAND;
     int candidates = counts[zone];
     if (candidates > POLICY_PRIMARY_COUNT) candidates = POLICY_PRIMARY_COUNT;
     int64_t out_idx = (int64_t)b * BA_FUSED_ROWS + BA_LINEAR_PAD + query_id * BA_KEY_DIM + d;
@@ -1174,126 +1479,31 @@ __global__ void ba_decoder_query_backward_kernel(
     for (int s = 0; s < zone; ++s) start += counts[s];
 
     float sum = 0.0f;
-    int64_t b_dec = (int64_t)b * BA_DEC_ROWS;
+    int64_t b_grad = (int64_t)b * BA_VALUE_OFFSET;
     int64_t b_prob = (int64_t)b * BA_PRIMARY_QUERY_COUNT * POLICY_PRIMARY_COUNT;
     int64_t b_keys = (int64_t)b * MAX_OBS_TOKENS * BA_KEY_DIM;
-    int out_col_base = (query_id < BA_PRIMARY_QUERY_COUNT)
-        ? BA_PRIMARY_OFFSET + query_id * POLICY_PRIMARY_COUNT
-        : BA_CARD_OFFSET + (query_id - BA_PRIMARY_QUERY_COUNT) * POLICY_PRIMARY_COUNT;
+    int out_col_base;
+    if (query_id < BA_PRIMARY_QUERY_COUNT)
+        out_col_base = BA_PRIMARY_OFFSET + query_id * POLICY_PRIMARY_COUNT;
+    else if (query_id < BA_ORDER_QUERY_HAND)
+        out_col_base = BA_CARD_OFFSET
+            + (query_id - BA_PRIMARY_QUERY_COUNT) * POLICY_PRIMARY_COUNT;
+    else if (query_id == BA_ORDER_QUERY_HAND)
+        out_col_base = BA_ORDER_HAND_OFFSET;
+    else
+        out_col_base = BA_ORDER_JOKER_OFFSET;
     float type_grad = (query_id < BA_PRIMARY_QUERY_COUNT)
-        ? to_float(grad_out[b_dec + BA_PRIMARY_TYPES[query_id]]) : 0.0f;
+        ? grad_logits[b_grad + BA_PRIMARY_TYPES[query_id]] : 0.0f;
 
     for (int option = 0; option < candidates; ++option) {
         int key = start + option;
-        float scalar = to_float(grad_out[b_dec + out_col_base + option]);
+        float scalar = grad_logits[b_grad + out_col_base + option];
         if (query_id < BA_PRIMARY_QUERY_COUNT) {
             scalar += type_grad * to_float(primary_probability[b_prob + query_id * POLICY_PRIMARY_COUNT + option]);
         }
         sum += scalar * to_float(keys[b_keys + key * BA_KEY_DIM + d]);
     }
     dall[out_idx] = from_float(sum * BA_QUERY_SCALE);
-}
-
-__global__ void ba_decoder_key_backward_kernel(
-        precision_t* __restrict__ keygrad,
-        const precision_t* __restrict__ grad_out,
-        const precision_t* __restrict__ fused,
-        const precision_t* __restrict__ primary_probability,
-        const int* __restrict__ counts_data, int B) {
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)B * MAX_OBS_TOKENS * BA_KEY_DIM) return;
-    int d = idx % BA_KEY_DIM;
-    int slot = (idx / BA_KEY_DIM) % MAX_OBS_TOKENS;
-    int b = idx / ((int64_t)MAX_OBS_TOKENS * BA_KEY_DIM);
-    int counts[BA_POOL_SECTIONS];
-    #pragma unroll
-    for (int s = 0; s < BA_POOL_SECTIONS; ++s)
-        counts[s] = counts_data[b * BA_POOL_SECTIONS + s];
-    int local;
-    int zone = ba_slot_section(counts, slot, &local);
-    if (zone < 0) {
-        keygrad[idx] = from_float(0.0f);
-        return;
-    }
-    float sum = 0.0f;
-    int64_t b_dec = (int64_t)b * BA_DEC_ROWS;
-    int64_t b_prob = (int64_t)b * BA_PRIMARY_QUERY_COUNT * POLICY_PRIMARY_COUNT;
-    const precision_t* b_query = fused + (int64_t)b * BA_FUSED_ROWS + BA_LINEAR_PAD;
-
-    if (zone == ZONE_SHOP_MAIN) {
-        static constexpr int q_list[2] = {0, 11};
-        #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            int q = q_list[i];
-            int out_col = BA_PRIMARY_OFFSET + q * POLICY_PRIMARY_COUNT + local;
-            float scalar = to_float(grad_out[b_dec + out_col]);
-            float type_grad = to_float(grad_out[b_dec + BA_PRIMARY_TYPES[q]]);
-            scalar += type_grad * to_float(primary_probability[b_prob + q * POLICY_PRIMARY_COUNT + local]);
-            sum += scalar * to_float(b_query[q * BA_KEY_DIM + d]);
-        }
-    } else if (zone == ZONE_JOKER) {
-        static constexpr int q_list[3] = {1, 7, 8};
-        #pragma unroll
-        for (int i = 0; i < 3; ++i) {
-            int q = q_list[i];
-            int out_col = BA_PRIMARY_OFFSET + q * POLICY_PRIMARY_COUNT + local;
-            float scalar = to_float(grad_out[b_dec + out_col]);
-            float type_grad = to_float(grad_out[b_dec + BA_PRIMARY_TYPES[q]]);
-            scalar += type_grad * to_float(primary_probability[b_prob + q * POLICY_PRIMARY_COUNT + local]);
-            sum += scalar * to_float(b_query[q * BA_KEY_DIM + d]);
-        }
-    } else if (zone == ZONE_CONSUMABLE) {
-        static constexpr int q_list[2] = {2, 3};
-        #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            int q = q_list[i];
-            int out_col = BA_PRIMARY_OFFSET + q * POLICY_PRIMARY_COUNT + local;
-            float scalar = to_float(grad_out[b_dec + out_col]);
-            float type_grad = to_float(grad_out[b_dec + BA_PRIMARY_TYPES[q]]);
-            scalar += type_grad * to_float(primary_probability[b_prob + q * POLICY_PRIMARY_COUNT + local]);
-            sum += scalar * to_float(b_query[q * BA_KEY_DIM + d]);
-        }
-    } else if (zone == ZONE_SHOP_VOUCHER) {
-        int q = 4;
-        int out_col = BA_PRIMARY_OFFSET + q * POLICY_PRIMARY_COUNT + local;
-        float scalar = to_float(grad_out[b_dec + out_col]);
-        float type_grad = to_float(grad_out[b_dec + BA_PRIMARY_TYPES[q]]);
-        scalar += type_grad * to_float(primary_probability[b_prob + q * POLICY_PRIMARY_COUNT + local]);
-        sum += scalar * to_float(b_query[q * BA_KEY_DIM + d]);
-    } else if (zone == ZONE_SHOP_BOOSTER) {
-        int q = 5;
-        int out_col = BA_PRIMARY_OFFSET + q * POLICY_PRIMARY_COUNT + local;
-        float scalar = to_float(grad_out[b_dec + out_col]);
-        float type_grad = to_float(grad_out[b_dec + BA_PRIMARY_TYPES[q]]);
-        scalar += type_grad * to_float(primary_probability[b_prob + q * POLICY_PRIMARY_COUNT + local]);
-        sum += scalar * to_float(b_query[q * BA_KEY_DIM + d]);
-    } else if (zone == ZONE_PACK_CARD) {
-        int q = 6;
-        int out_col = BA_PRIMARY_OFFSET + q * POLICY_PRIMARY_COUNT + local;
-        float scalar = to_float(grad_out[b_dec + out_col]);
-        float type_grad = to_float(grad_out[b_dec + BA_PRIMARY_TYPES[q]]);
-        scalar += type_grad * to_float(primary_probability[b_prob + q * POLICY_PRIMARY_COUNT + local]);
-        sum += scalar * to_float(b_query[q * BA_KEY_DIM + d]);
-    } else if (zone == ZONE_HAND && local < POLICY_PRIMARY_COUNT) {
-        static constexpr int q_list[2] = {9, 10};
-        #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            int q = q_list[i];
-            int out_col = BA_PRIMARY_OFFSET + q * POLICY_PRIMARY_COUNT + local;
-            float scalar = to_float(grad_out[b_dec + out_col]);
-            float type_grad = to_float(grad_out[b_dec + BA_PRIMARY_TYPES[q]]);
-            scalar += type_grad * to_float(primary_probability[b_prob + q * POLICY_PRIMARY_COUNT + local]);
-            sum += scalar * to_float(b_query[q * BA_KEY_DIM + d]);
-        }
-        #pragma unroll
-        for (int card_pos = 0; card_pos < 5; ++card_pos) {
-            int q = BA_PRIMARY_QUERY_COUNT + card_pos;
-            int out_col = BA_CARD_OFFSET + card_pos * POLICY_PRIMARY_COUNT + local;
-            float scalar = to_float(grad_out[b_dec + out_col]);
-            sum += scalar * to_float(b_query[q * BA_KEY_DIM + d]);
-        }
-    }
-    keygrad[idx] = from_float(sum * BA_QUERY_SCALE);
 }
 
 struct BalatroDecoderWeights {
@@ -1310,8 +1520,8 @@ struct BalatroDecoderActivations {
         condition_scratch;
     Float condition_accum, cond_accum_parts;
     BalatroEncoderActivations* enc;
-    Prec fused, primary_probability, primary_lse;
-    Prec dall, keygrad;
+    Prec fused, primary_probability;
+    Prec dall;
     Prec weight_grad;
 };
 
@@ -1322,17 +1532,14 @@ static Prec ba_decoder_forward(
     int B = input.shape[0];
     if (a->saved_input.data) puf_copy(&a->saved_input, &input, stream);
     puf_mm(&input, &dw->weight, &a->fused, stream);
-    ba_decoder_assemble_kernel<<<grid_size(B * BA_DEC_ROWS), BLOCK_SIZE, 0, stream>>>(
-        a->out.data, a->fused.data, a->enc->keys.data,
-        a->enc->counts.data, B);
-    constexpr int primary_warps = BLOCK_SIZE / 32;
-    int primary_blocks = (B * BA_PRIMARY_QUERY_COUNT + primary_warps - 1)
-        / primary_warps;
-    ba_primary_probability_kernel<<<primary_blocks, BLOCK_SIZE, 0, stream>>>(
-        a->primary_probability.data, a->primary_lse.data, a->out.data,
+    ba_decoder_linear_kernel<<<grid_size(B * BA_LINEAR_ROWS), BLOCK_SIZE, 0, stream>>>(
+        a->out.data, a->fused.data, B);
+    constexpr int pointer_warps = BLOCK_SIZE / 32;
+    int pointer_blocks = (B * BA_QUERY_COUNT + pointer_warps - 1)
+        / pointer_warps;
+    ba_decoder_pointer_kernel<<<pointer_blocks, BLOCK_SIZE, 0, stream>>>(
+        a->primary_probability.data, a->out.data,
         a->fused.data, a->enc->keys.data, a->enc->counts.data, B);
-    ba_decoder_type_lse_kernel<<<grid_size(B * BA_PRIMARY_QUERY_COUNT), BLOCK_SIZE, 0, stream>>>(
-        a->out.data, a->primary_lse.data, a->enc->counts.data, B);
     return a->out;
 }
 
@@ -1343,17 +1550,13 @@ static Prec ba_decoder_backward(void* w, void* activations,
     BalatroDecoderWeights* dw = (BalatroDecoderWeights*)w;
     BalatroDecoderActivations* a = (BalatroDecoderActivations*)activations;
     int B = a->saved_input.shape[0];
-    assemble_decoder_grad<<<grid_size(B * BA_DEC_ROWS), BLOCK_SIZE, 0, stream>>>(
-        a->grad_out.data, grad_logits.data, grad_value.data,
-        B, dw->output_dim, BA_DEC_ROWS);
+    a->enc->decoder_grad_logits = grad_logits.data;
+    a->enc->decoder_fused = a->fused.data;
+    a->enc->decoder_probability = a->primary_probability.data;
     ba_decoder_prepare_grad_kernel<<<grid_size(B * BA_LINEAR_PAD), BLOCK_SIZE, 0, stream>>>(
-        a->dall.data, a->grad_out.data, B);
+        a->dall.data, grad_logits.data, grad_value.data, B);
     ba_decoder_query_backward_kernel<<<grid_size((int64_t)B * BA_QUERY_DIM), BLOCK_SIZE, 0, stream>>>(
-        a->dall.data, a->grad_out.data, a->enc->keys.data,
-        a->primary_probability.data,
-        a->enc->counts.data, B);
-    ba_decoder_key_backward_kernel<<<grid_size((int64_t)B * MAX_OBS_TOKENS * BA_KEY_DIM), BLOCK_SIZE, 0, stream>>>(
-        a->keygrad.data, a->grad_out.data, a->fused.data,
+        a->dall.data, grad_logits.data, a->enc->keys.data,
         a->primary_probability.data,
         a->enc->counts.data, B);
     puf_mm_tn(&a->dall, &a->saved_input, &a->weight_grad, stream);
@@ -1388,7 +1591,6 @@ static void ba_decoder_reg_train(void* w, void* activations,
     *a = {};
     a->enc = ba_enc_last;
     a->out = {.shape = {B_TT, BA_DEC_ROWS}};
-    a->grad_out = {.shape = {B_TT, BA_DEC_ROWS}};
     a->saved_input = {.shape = {B_TT, dw->hidden_dim}};
     a->grad_input = {.shape = {B_TT, dw->hidden_dim}};
     a->condition_scratch = {.shape = {AR_CONDITION_SIZE}};
@@ -1396,24 +1598,18 @@ static void ba_decoder_reg_train(void* w, void* activations,
     a->cond_accum_parts = {.shape = {COND_STRIPE_COUNT, AR_CONDITION_SIZE}};
     a->fused = {.shape = {B_TT, BA_FUSED_ROWS}};
     a->primary_probability = {.shape = {B_TT, BA_PRIMARY_QUERY_COUNT, POLICY_PRIMARY_COUNT}};
-    a->primary_lse = {.shape = {B_TT, BA_PRIMARY_QUERY_COUNT}};
     a->dall = {.shape = {B_TT, BA_FUSED_ROWS}};
-    a->keygrad = {.shape = {B_TT, MAX_OBS_TOKENS, BA_KEY_DIM}};
     a->weight_grad = {.shape = {BA_FUSED_ROWS, dw->hidden_dim}};
     alloc_register(acts, &a->out);
-    alloc_register(acts, &a->grad_out);
     alloc_register(acts, &a->saved_input);
     alloc_register(acts, &a->grad_input);
     alloc_register(acts, &a->condition_accum);
     alloc_register(acts, &a->cond_accum_parts);
     alloc_register(acts, &a->fused);
     alloc_register(acts, &a->primary_probability);
-    alloc_register(acts, &a->primary_lse);
     alloc_register(acts, &a->dall);
-    alloc_register(acts, &a->keygrad);
     alloc_register(grads, &a->weight_grad);
     alloc_register(grads, &a->condition_scratch);
-    ba_ptr_keygrad = &a->keygrad;
 }
 
 static void ba_decoder_reg_rollout(void* w, void* activations,
@@ -1423,11 +1619,9 @@ static void ba_decoder_reg_rollout(void* w, void* activations,
     a->out = {.shape = {B, BA_DEC_ROWS}};
     a->fused = {.shape = {B, BA_FUSED_ROWS}};
     a->primary_probability = {.shape = {B, BA_PRIMARY_QUERY_COUNT, POLICY_PRIMARY_COUNT}};
-    a->primary_lse = {.shape = {B, BA_PRIMARY_QUERY_COUNT}};
     alloc_register(alloc, &a->out);
     alloc_register(alloc, &a->fused);
     alloc_register(alloc, &a->primary_probability);
-    alloc_register(alloc, &a->primary_lse);
 }
 
 static void* ba_decoder_create_weights(void* self) {

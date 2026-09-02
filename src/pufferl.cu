@@ -73,6 +73,13 @@ int grid_size(int N) {
 // Exclusive env: -DENV_HEADER=ocean/<env>/<env>.h or .cu (--gpu). Never both.
 #include ENV_HEADER
 
+#ifndef POLICY_NUM_ATNS
+#define POLICY_NUM_ATNS NUM_ATNS
+#endif
+#ifndef ACTION_STORAGE_SIZE
+#define ACTION_STORAGE_SIZE NUM_ATNS
+#endif
+
 typedef struct {
     float* data;
     int64_t shape[PUF_MAX_DIMS];
@@ -617,7 +624,7 @@ typedef struct PuffeRL {
     cudaStream_t* streams;  // per-buffer raw CUDA streams
     cudaStream_t default_stream;  // main-thread stream (captured once at init)
     cudaStream_t train_stream;    // dedicated learner stream (always non-default)
-    int* act_sizes;        // device ACT_SIZES (NUM_ATNS ints)
+    int* act_sizes;        // device ACT_SIZES (POLICY_NUM_ATNS ints)
     float* losses;         // device loss accumulator (NUM_LOSSES)
     PPOBufs ppo_bufs; // Pre-allocated buffers for ppo_loss_fwd_bwd
     Prec actor_param;      // async flat actor params
@@ -667,12 +674,13 @@ __global__ void rng_init(curandStatePhilox4_32_10_t* states, uint64_t seed, int 
 }
 
 // Action logits and value share one row: [logits..., value]. logstd empty ⇒ discrete.
-// Discrete: always-cache logsumexp + inverse-CDF; mask always present (all-ones if env has none).
+// Discrete: core heads use cached logsumexp + inverse-CDF; Balatro order
+// heads use an exact Plackett-Luce exponential race. Mask always present.
 // Continuous: ignores mask.
 __global__ void sample_logits(
         Prec dec_out,              // (B, logits_dim + 1)
         Prec logstd,           // (1, od) continuous only; .data null if discrete
-        int* act_sizes,            // (NUM_ATNS,)
+        int* act_sizes,            // (POLICY_NUM_ATNS,)
         precision_t* actions,                 // (B, num_atns)
         precision_t* logprobs,                // (B,)
         precision_t* value_out,               // (B,)
@@ -684,7 +692,7 @@ __global__ void sample_logits(
         const precision_t* condition) {
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
-    int num_atns = NUM_ATNS;
+    int num_atns = POLICY_NUM_ATNS;
     precision_t* logits = dec_out.data;
     bool is_continuous = logstd.data != NULL && numel(logstd.shape) > 0;
     precision_t* logstd_data = logstd.data;
@@ -710,12 +718,12 @@ __global__ void sample_logits(
             float lp, ent;
             ppo_continuous_head(mean, log_std, to_float(stored_p), &lp, &ent);
             total_log_prob += lp;
-            actions[idx * num_atns + h] = stored_p;
+            actions[idx * ACTION_STORAGE_SIZE + h] = stored_p;
         }
     } else {
         int logits_offset = 0;
         int mask_base = idx * mask_stride;
-        int action_base = idx * num_atns;
+        int action_base = idx * ACTION_STORAGE_SIZE;
 #ifdef POLICY_MASK_SIZE
         // AR sampling: heads 0-2 (type/primary/count) populate the context
         // incrementally, then card heads 3-7 sample against the hoisted prefix.
@@ -852,7 +860,11 @@ __global__ void sample_logits(
         }
         ar_ctx_set_count(&ar, actions, action_base);
 
+#ifdef PUFFER_BALATRO
+        for (int h = 3; h < BALATRO_BASE_ACTION_HEADS; h++) {
+#else
         for (int h = 3; h < num_atns; h++) {
+#endif
             int A = act_sizes[h];
             actions[action_base + h] = from_float(0.0f);
             if (!ar_head_active(&ar, h)) {
@@ -893,6 +905,60 @@ __global__ void sample_logits(
             logits_offset += A;
             ar_ctx_advance(&ar, actions, action_base, condition);
         }
+#ifdef PUFFER_BALATRO
+        for (int h = BALATRO_ORDER_HAND_HEAD;
+             h <= BALATRO_ORDER_JOKER_HEAD; ++h) {
+            int A = act_sizes[h];
+            int count = order_count(&ar, h);
+            int output_offset = order_offset(h);
+            int score_offset = logits_offset;
+            for (int i = 0; i < (h == BALATRO_ORDER_HAND_HEAD
+                    ? OBS_MAX_HAND : OBS_MAX_JOKERS); ++i)
+                actions[action_base + output_offset + i] = from_float(0.0f);
+            if (!ar_head_active(&ar, h)) {
+                logits_offset += A;
+                continue;
+            }
+            float score[POLICY_PRIMARY_COUNT];
+            for (int option = 0; option < count; ++option)
+                score[option] = to_float(logits[
+                    logits_base + score_offset + option])
+                    + order_bias(&ar, condition, h, option);
+            float maximum = -INFINITY;
+            for (int option = 0; option < count; ++option)
+                maximum = fmaxf(maximum, score[option]);
+            float sample_key[POLICY_PRIMARY_COUNT];
+            for (int option = 0; option < count; ++option) {
+                /* Exponential races are an exact Plackett-Luce sample. */
+                sample_key[option] = __logf(-__logf(curand_uniform(&state)))
+                    - (score[option] - maximum);
+            }
+            for (int position = 0; position < count; ++position) {
+                float minimum = INFINITY;
+                int sampled = -1;
+                for (int option = 0; option < count; ++option) {
+                    if (sample_key[option] <= minimum) {
+                        minimum = sample_key[option];
+                        sampled = option;
+                    }
+                }
+                assert(sampled >= 0);
+                actions[action_base + output_offset + position] =
+                    from_float((float)sampled);
+                sample_key[sampled] = INFINITY;
+            }
+            float suffix_log = -INFINITY;
+            for (int position = count - 1; position >= 0; --position) {
+                int sampled = (int)to_float(
+                    actions[action_base + output_offset + position]);
+                float item_log = score[sampled] - maximum;
+                float high = fmaxf(item_log, suffix_log);
+                float lower = fminf(item_log, suffix_log);
+                suffix_log = high + __logf(1.0f + __expf(lower - high));
+                total_log_prob += score[sampled] - maximum - suffix_log;
+            }
+            logits_offset += A;
+        }
 #else
         for (int h = 0; h < num_atns; h++) {
             int A = act_sizes[h];
@@ -921,12 +987,360 @@ __global__ void sample_logits(
             logits_offset += A;
         }
 #endif
+#endif
     }
 
     logprobs[idx] = from_float(total_log_prob);
     value_out[idx] = logits[logits_base + fused_cols - 1];
     rng_states[idx] = state;
 }
+
+#ifdef BALATRO_POINTER_DECODER
+#ifndef PUF_WARP_MASK
+#ifdef USE_ROCM
+#define PUF_WARP_MASK 0xffffffffffffffffULL
+#else
+#define PUF_WARP_MASK 0xffffffffU
+#endif
+#endif
+
+// Wave-per-row Balatro AR sampler: 1 wave32 per observation row.
+// Eliminates per-thread stack spilling by holding contexts, candidate scores,
+// and Plackett-Luce sample keys in per-warp shared memory.
+__global__ void sample_logits_balatro(
+        Prec dec_out,                          // (B, fused_cols)
+        Prec logstd,                           // unused for discrete
+        int* act_sizes,                        // (POLICY_NUM_ATNS,)
+        precision_t* actions,                  // (B, num_atns)
+        precision_t* logprobs,                 // (B,)
+        precision_t* value_out,                // (B,)
+        curandStatePhilox4_32_10_t* rng_states,
+        precision_t* action_mask,              // (B, A_total)
+        int mask_stride,
+        const precision_t* condition) {
+    constexpr int WARP = 32;
+    constexpr int WARPS = BLOCK_SIZE / WARP;
+    int lane = threadIdx.x & (WARP - 1);
+    int warp = threadIdx.x / WARP;
+    int idx = blockIdx.x * WARPS + warp;
+    int B = dec_out.shape[0];
+    bool valid = idx < B;
+    int fused_cols = dec_out.shape[1];
+    int logits_base = idx * fused_cols;
+    int mask_base = idx * mask_stride;
+    int action_base = idx * ACTION_STORAGE_SIZE;
+
+    __shared__ ARContext s_ar[WARPS];
+    __shared__ float s_cache[WARPS][POLICY_PRIMARY_COUNT];
+    __shared__ float s_order_scores[WARPS][POLICY_PRIMARY_COUNT];
+    __shared__ float s_order_keys[WARPS][POLICY_PRIMARY_COUNT];
+
+    float total_log_prob = 0.0f;
+    curandStatePhilox4_32_10_t state;
+
+    if (valid && lane == 0) {
+        state = rng_states[idx];
+        if (value_out) {
+            value_out[idx] = dec_out.data[logits_base + fused_cols - 1];
+        }
+    }
+    __syncwarp();
+
+    if (valid) {
+        int logits_offset = 0;
+
+        // Head 0 (Action Type)
+        int A0 = act_sizes[0];
+        if (lane == 0) actions[action_base] = from_float(0.0f);
+        float l0 = (lane < A0 && mask_byte(action_mask, mask_base, lane) != 0)
+            ? to_float(dec_out.data[logits_base + logits_offset + lane]) : -1e4f;
+        s_cache[warp][lane] = l0;
+        float max_l0 = (lane < A0 && mask_byte(action_mask, mask_base, lane) != 0) ? l0 : -INFINITY;
+        #pragma unroll
+        for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+            max_l0 = fmaxf(max_l0, __shfl_down_sync(PUF_WARP_MASK, max_l0, offset, WARP));
+        }
+        max_l0 = __shfl_sync(PUF_WARP_MASK, max_l0, 0, WARP);
+
+        float sum_val0 = (lane < A0 && mask_byte(action_mask, mask_base, lane) != 0)
+            ? __expf(l0 - max_l0) : 0.0f;
+        #pragma unroll
+        for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+            sum_val0 += __shfl_down_sync(PUF_WARP_MASK, sum_val0, offset, WARP);
+        }
+        sum_val0 = __shfl_sync(PUF_WARP_MASK, sum_val0, 0, WARP);
+        float logsumexp0 = max_l0 + __logf(sum_val0);
+
+        if (lane == 0) {
+            float rand_val = curand_uniform(&state);
+            float cumsum = 0.0f;
+            int sampled = -1;
+            for (int a = 0; a < A0; ++a) {
+                if (mask_byte(action_mask, mask_base, a) == 0) continue;
+                cumsum += __expf(s_cache[warp][a] - logsumexp0);
+                if (rand_val < cumsum) { sampled = a; break; }
+            }
+            if (sampled < 0) {
+                for (int a = 0; a < A0; ++a) {
+                    if (mask_byte(action_mask, mask_base, a) != 0) { sampled = a; break; }
+                }
+            }
+            if (sampled < 0) sampled = 0;
+            actions[action_base] = from_float((float)sampled);
+            total_log_prob += s_cache[warp][sampled] - logsumexp0;
+            s_ar[warp] = ar_ctx_init(action_mask, mask_base, actions, action_base);
+        }
+        __syncwarp();
+        logits_offset += A0;
+
+        // Head 1 (Primary Head, up to 64 options)
+        int A1 = act_sizes[1];
+        if (lane == 0) actions[action_base + 1] = from_float(0.0f);
+        bool h1_active = ar_head_active(&s_ar[warp], 1);
+        if (h1_active) {
+            int primary_slice = policy_primary_head_offset(s_ar[warp].type);
+            assert(primary_slice >= 0);
+            int primary_offset = primary_slice * POLICY_PRIMARY_COUNT;
+
+            float max_l1 = -INFINITY;
+            #pragma unroll
+            for (int part = 0; part < 2; ++part) {
+                int a = lane + part * WARP;
+                bool legal = ar_option_legal(&s_ar[warp], action_mask, mask_base, 1, a);
+                float l = legal ? to_float(dec_out.data[logits_base + logits_offset + primary_offset + a]) : -1e4f;
+                s_cache[warp][a] = l;
+                if (legal) max_l1 = fmaxf(max_l1, l);
+            }
+            #pragma unroll
+            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+                max_l1 = fmaxf(max_l1, __shfl_down_sync(PUF_WARP_MASK, max_l1, offset, WARP));
+            }
+            max_l1 = __shfl_sync(PUF_WARP_MASK, max_l1, 0, WARP);
+
+            float sum_val1 = 0.0f;
+            #pragma unroll
+            for (int part = 0; part < 2; ++part) {
+                int a = lane + part * WARP;
+                bool legal = ar_option_legal(&s_ar[warp], action_mask, mask_base, 1, a);
+                if (legal) sum_val1 += __expf(s_cache[warp][a] - max_l1);
+            }
+            #pragma unroll
+            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+                sum_val1 += __shfl_down_sync(PUF_WARP_MASK, sum_val1, offset, WARP);
+            }
+            sum_val1 = __shfl_sync(PUF_WARP_MASK, sum_val1, 0, WARP);
+            float logsumexp1 = max_l1 + __logf(sum_val1);
+
+            if (lane == 0) {
+                float rand_val = curand_uniform(&state);
+                float cumsum = 0.0f;
+                int sampled = -1;
+                for (int a = 0; a < POLICY_PRIMARY_COUNT; ++a) {
+                    if (!ar_option_legal(&s_ar[warp], action_mask, mask_base, 1, a)) continue;
+                    cumsum += __expf(s_cache[warp][a] - logsumexp1);
+                    if (rand_val < cumsum) { sampled = a; break; }
+                }
+                if (sampled < 0) {
+                    for (int a = 0; a < POLICY_PRIMARY_COUNT; ++a) {
+                        if (ar_option_legal(&s_ar[warp], action_mask, mask_base, 1, a)) { sampled = a; break; }
+                    }
+                }
+                if (sampled < 0) sampled = 0;
+                actions[action_base + 1] = from_float((float)sampled);
+                total_log_prob += s_cache[warp][sampled] - logsumexp1;
+                s_ar[warp] = ar_ctx_init(action_mask, mask_base, actions, action_base);
+            }
+            __syncwarp();
+        }
+        logits_offset += A1;
+
+        // Head 2 (Count Head, 6 options)
+        int A2 = act_sizes[2];
+        if (lane == 0) actions[action_base + 2] = from_float(0.0f);
+        bool h2_active = ar_head_active(&s_ar[warp], 2);
+        if (h2_active) {
+            bool legal2 = lane < A2 && ar_option_legal(&s_ar[warp], action_mask, mask_base, 2, lane);
+            float l2 = legal2 ? to_float(dec_out.data[logits_base + logits_offset + lane])
+                + ar_cond_bias(&s_ar[warp], condition, 2, lane) : -1e4f;
+            if (lane < A2) s_cache[warp][lane] = l2;
+            float max_l2 = legal2 ? l2 : -INFINITY;
+            #pragma unroll
+            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+                max_l2 = fmaxf(max_l2, __shfl_down_sync(PUF_WARP_MASK, max_l2, offset, WARP));
+            }
+            max_l2 = __shfl_sync(PUF_WARP_MASK, max_l2, 0, WARP);
+
+            float sum_val2 = legal2 ? __expf(l2 - max_l2) : 0.0f;
+            #pragma unroll
+            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+                sum_val2 += __shfl_down_sync(PUF_WARP_MASK, sum_val2, offset, WARP);
+            }
+            sum_val2 = __shfl_sync(PUF_WARP_MASK, sum_val2, 0, WARP);
+            float logsumexp2 = max_l2 + __logf(sum_val2);
+
+            if (lane == 0) {
+                float rand_val = curand_uniform(&state);
+                float cumsum = 0.0f;
+                int sampled = -1;
+                for (int a = 0; a < A2; ++a) {
+                    if (!ar_option_legal(&s_ar[warp], action_mask, mask_base, 2, a)) continue;
+                    cumsum += __expf(s_cache[warp][a] - logsumexp2);
+                    if (rand_val < cumsum) { sampled = a; break; }
+                }
+                if (sampled < 0) {
+                    for (int a = 0; a < A2; ++a) {
+                        if (ar_option_legal(&s_ar[warp], action_mask, mask_base, 2, a)) { sampled = a; break; }
+                    }
+                }
+                if (sampled < 0) sampled = 0;
+                actions[action_base + 2] = from_float((float)sampled);
+                total_log_prob += s_cache[warp][sampled] - logsumexp2;
+                ar_ctx_set_count(&s_ar[warp], actions, action_base);
+            }
+            __syncwarp();
+        } else {
+            if (lane == 0) ar_ctx_set_count(&s_ar[warp], actions, action_base);
+            __syncwarp();
+        }
+        logits_offset += A2;
+
+        // Card Heads 3..7
+        for (int h = 3; h < BALATRO_BASE_ACTION_HEADS; ++h) {
+            int A = act_sizes[h];
+            if (lane == 0) actions[action_base + h] = from_float(0.0f);
+            bool active = ar_head_active(&s_ar[warp], h);
+            if (!active) {
+                logits_offset += A;
+                continue;
+            }
+            float max_lh = -INFINITY;
+            #pragma unroll
+            for (int part = 0; part < 2; ++part) {
+                int a = lane + part * WARP;
+                if (a < A) {
+                    bool legal = ar_option_legal(&s_ar[warp], action_mask, mask_base, h, a);
+                    float l = legal ? to_float(dec_out.data[logits_base + logits_offset + a])
+                        + ar_cond_bias(&s_ar[warp], condition, h, a) : -1e4f;
+                    s_cache[warp][a] = l;
+                    if (legal) max_lh = fmaxf(max_lh, l);
+                }
+            }
+            #pragma unroll
+            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+                max_lh = fmaxf(max_lh, __shfl_down_sync(PUF_WARP_MASK, max_lh, offset, WARP));
+            }
+            max_lh = __shfl_sync(PUF_WARP_MASK, max_lh, 0, WARP);
+
+            float sum_valh = 0.0f;
+            #pragma unroll
+            for (int part = 0; part < 2; ++part) {
+                int a = lane + part * WARP;
+                if (a < A) {
+                    bool legal = ar_option_legal(&s_ar[warp], action_mask, mask_base, h, a);
+                    if (legal) sum_valh += __expf(s_cache[warp][a] - max_lh);
+                }
+            }
+            #pragma unroll
+            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+                sum_valh += __shfl_down_sync(PUF_WARP_MASK, sum_valh, offset, WARP);
+            }
+            sum_valh = __shfl_sync(PUF_WARP_MASK, sum_valh, 0, WARP);
+            float logsumexph = max_lh + __logf(sum_valh);
+
+            if (lane == 0) {
+                float rand_val = curand_uniform(&state);
+                float cumsum = 0.0f;
+                int sampled = -1;
+                for (int a = 0; a < A; ++a) {
+                    if (!ar_option_legal(&s_ar[warp], action_mask, mask_base, h, a)) continue;
+                    cumsum += __expf(s_cache[warp][a] - logsumexph);
+                    if (rand_val < cumsum) { sampled = a; break; }
+                }
+                if (sampled < 0) {
+                    for (int a = 0; a < A; ++a) {
+                        if (ar_option_legal(&s_ar[warp], action_mask, mask_base, h, a)) { sampled = a; break; }
+                    }
+                }
+                if (sampled < 0) sampled = 0;
+                actions[action_base + h] = from_float((float)sampled);
+                total_log_prob += s_cache[warp][sampled] - logsumexph;
+                ar_ctx_advance(&s_ar[warp], actions, action_base, condition);
+            }
+            __syncwarp();
+            logits_offset += A;
+        }
+
+        // Order Heads 8 & 9 (Hand & Joker Order)
+        for (int h = BALATRO_ORDER_HAND_HEAD; h <= BALATRO_ORDER_JOKER_HEAD; ++h) {
+            int A = act_sizes[h];
+            int count = order_count(&s_ar[warp], h);
+            int output_offset = order_offset(h);
+            int max_slots = (h == BALATRO_ORDER_HAND_HEAD ? OBS_MAX_HAND : OBS_MAX_JOKERS);
+            for (int i = lane; i < max_slots; i += WARP) {
+                actions[action_base + output_offset + i] = from_float(0.0f);
+            }
+            bool active = ar_head_active(&s_ar[warp], h);
+            if (!active) {
+                logits_offset += A;
+                continue;
+            }
+
+            float max_sc = -INFINITY;
+            #pragma unroll
+            for (int part = 0; part < 2; ++part) {
+                int opt = lane + part * WARP;
+                if (opt < count) {
+                    float sc = to_float(dec_out.data[logits_base + logits_offset + opt])
+                        + order_bias(&s_ar[warp], condition, h, opt);
+                    s_order_scores[warp][opt] = sc;
+                    max_sc = fmaxf(max_sc, sc);
+                }
+            }
+            #pragma unroll
+            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+                max_sc = fmaxf(max_sc, __shfl_down_sync(PUF_WARP_MASK, max_sc, offset, WARP));
+            }
+            max_sc = __shfl_sync(PUF_WARP_MASK, max_sc, 0, WARP);
+
+            if (lane == 0) {
+                for (int opt = 0; opt < count; ++opt) {
+                    s_order_keys[warp][opt] = __logf(-__logf(curand_uniform(&state)))
+                        - (s_order_scores[warp][opt] - max_sc);
+                }
+                for (int position = 0; position < count; ++position) {
+                    float minimum = INFINITY;
+                    int sampled = -1;
+                    for (int opt = 0; opt < count; ++opt) {
+                        if (s_order_keys[warp][opt] <= minimum) {
+                            minimum = s_order_keys[warp][opt];
+                            sampled = opt;
+                        }
+                    }
+                    assert(sampled >= 0);
+                    actions[action_base + output_offset + position] = from_float((float)sampled);
+                    s_order_keys[warp][sampled] = INFINITY;
+                }
+                float suffix_log = -INFINITY;
+                for (int position = count - 1; position >= 0; --position) {
+                    int sampled = (int)to_float(actions[action_base + output_offset + position]);
+                    float item_log = s_order_scores[warp][sampled] - max_sc;
+                    float high = fmaxf(item_log, suffix_log);
+                    float lower = fminf(item_log, suffix_log);
+                    suffix_log = high + __logf(1.0f + __expf(lower - high));
+                    total_log_prob += s_order_scores[warp][sampled] - max_sc - suffix_log;
+                }
+            }
+            __syncwarp();
+            logits_offset += A;
+        }
+
+        if (lane == 0) {
+            logprobs[idx] = from_float(total_log_prob);
+            rng_states[idx] = state;
+        }
+    }
+}
+#endif
 
 // Index into (L, agents, H): element-parallel over L*count*H.
 // state_row is agent index within the state tensor's agent dim.
@@ -1128,12 +1542,23 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         // Offset RNG by off so policies don't collide on per-buffer rng slots.
         int hc_stride_s = 0;
         const signed char* hc_dev_s = get_head_consume_dev(&hc_stride_s);
+#ifdef BALATRO_POINTER_DECODER
+        constexpr int sample_warps = BLOCK_SIZE / 32;
+        int sample_blocks = (n + sample_warps - 1) / sample_warps;
+        sample_logits_balatro<<<sample_blocks, BLOCK_SIZE, 0, stream>>>(
+            dec, p_logstd, pufferl->act_sizes,
+            act_b.data, lp_b.data, val_b.data,
+            pufferl->rng_states[buf] + off,
+            mask_b.data, mask_stride,
+            dw->condition.data);
+#else
         sample_logits<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
             dec, p_logstd, pufferl->act_sizes,
             act_b.data, lp_b.data, val_b.data,
             pufferl->rng_states[buf] + off,
             mask_b.data, mask_stride, hc_dev_s, hc_stride_s,
             dw->ar ? dw->condition.data : NULL);
+#endif
 
         cast<<<grid_size(numel(act_b.shape)), BLOCK_SIZE, 0, stream>>>(
                 env->actions.data + (long)sub * act_cols,
@@ -1366,7 +1791,7 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     size_t obs_bytes = total_agents * OBS_SIZE * sizeof(obs_t);
     size_t mask_bytes = total_agents * vec->mask_size * sizeof(unsigned char);
     cudaHostAlloc((void**)&vec->observations, obs_bytes, cudaHostAllocPortable);
-    cudaHostAlloc((void**)&vec->actions, total_agents * NUM_ATNS * sizeof(float),
+    cudaHostAlloc((void**)&vec->actions, total_agents * ACTION_STORAGE_SIZE * sizeof(float),
         cudaHostAllocPortable);
     cudaHostAlloc((void**)&vec->rewards, total_agents * sizeof(float),
         cudaHostAllocPortable);
@@ -1420,7 +1845,7 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
                 int phys = cursors[policy]++;
                 Agent* a = &eptr->agents[s];
                 a->observations = vec->observations + (size_t)phys * OBS_SIZE;
-                a->actions = vec->actions + (size_t)phys * NUM_ATNS;
+                a->actions = vec->actions + (size_t)phys * ACTION_STORAGE_SIZE;
                 a->rewards = vec->rewards + phys;
                 a->terminals = vec->terminals + phys;
                 a->action_mask = vec->action_mask + (size_t)phys * vec->mask_size;
@@ -1542,9 +1967,9 @@ static void* vec_thread_main(void* arg) {
             pufferl_forward(pufferl, buf, t, stream);
             cudaEventRecord(ev[MODEL_END], stream);
             cudaMemcpyAsync(
-                &vec->actions[agent_start * NUM_ATNS],
-                &pufferl->env.actions.data[agent_start * NUM_ATNS],
-                apb * NUM_ATNS * sizeof(float),
+                &vec->actions[agent_start * ACTION_STORAGE_SIZE],
+                &pufferl->env.actions.data[agent_start * ACTION_STORAGE_SIZE],
+                apb * ACTION_STORAGE_SIZE * sizeof(float),
                 cudaMemcpyDeviceToHost, stream);
             cudaEventRecord(ev[COPY_END], stream);
             // Wait only for this stream's work (forward + action copy), not
@@ -1828,47 +2253,56 @@ __global__ void transpose_102(precision_t* dst, const precision_t* src,
     dst[b * A * C + a * C + c] = src[idx];
 }
 
+__global__ void transpose_scalars_fused(
+        precision_t* dst_lp, const precision_t* src_lp,
+        precision_t* dst_rew, const precision_t* src_rew,
+        precision_t* dst_rst, const precision_t* src_rst,
+        precision_t* dst_don, const precision_t* src_don,
+        precision_t* dst_val, const precision_t* src_val,
+        int A, int B) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = A * B;
+    if (idx >= total) return;
+    int a = idx / B;
+    int b = idx % B;
+    int dst_idx = b * A + a;
+    dst_lp[dst_idx] = src_lp[idx];
+    float r = to_float(src_rew[idx]);
+    dst_rew[dst_idx] = from_float(fminf(fmaxf(r, -100.0f), 100.0f));
+    dst_rst[dst_idx] = src_rst[idx];
+    dst_don[dst_idx] = src_don[idx];
+    dst_val[dst_idx] = src_val[idx];
+}
+
 __global__ void transpose_102_bytes(unsigned char* dst,
         const unsigned char* src, int A, int B, int C) {
-    // 2D grid (blockIdx.x = a, blockIdx.y = b): one block streams one
-    // (a, b) row as 8-byte words when C is divisible by 8 (packed obs is
-    // 8120 bytes). No per-element div/mod and full-width coalescing on both
-    // sides. Byte-scalar fallback keeps non-multiple C correct.
-    if ((C & 7) == 0) {
-        int a = blockIdx.x;
-        int b = blockIdx.y;
-        int C8 = C >> 3;
-        const unsigned long long* s =
-            (const unsigned long long*)(src + ((long)a * B + b) * C);
-        unsigned long long* d =
-            (unsigned long long*)(dst + ((long)b * A + a) * C);
-        for (int c8 = threadIdx.x; c8 < C8; c8 += blockDim.x) d[c8] = s[c8];
-        return;
+    int a = blockIdx.x;
+    int b = blockIdx.y;
+    if (a >= A || b >= B) return;
+    const unsigned char* s = src + ((long)a * B + b) * C;
+    unsigned char* d = dst + ((long)b * A + a) * C;
+    int C4 = C >> 2;
+    for (int i = threadIdx.x; i < C4; i += blockDim.x) {
+        uint32_t val;
+        memcpy(&val, s + i * 4, sizeof(val));
+        memcpy(d + i * 4, &val, sizeof(val));
     }
-    long idx = ((long)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x
-        + threadIdx.x;
-    long total = (long)A * B * C;
-    for (; idx < total; idx += (long)gridDim.x * gridDim.y * blockDim.x) {
-        int a = (int)(idx / (B * C));
-        int rem = (int)(idx % (B * C));
-        int b = rem / C;
-        int c = rem % C;
-        dst[b * A * C + a * C + c] = src[idx];
+    int rem = C4 << 2;
+    for (int i = rem + threadIdx.x; i < C; i += blockDim.x) {
+        d[i] = s[i];
     }
 }
 
-// Transpose (A, B, C) → (B, A, C) for float32 rows (actions).
-__global__ void transpose_102(float* dst, const float* src, int A, int B, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = A * B * C;
-    if (idx >= total) {
-        return;
+template <typename T>
+__global__ void transpose_102_2d(T* dst, const T* src, int A, int B, int C) {
+    int a = blockIdx.x;
+    int b = blockIdx.y;
+    if (a >= A || b >= B) return;
+    const T* s = src + ((long)a * B + b) * C;
+    T* d = dst + ((long)b * A + a) * C;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        d[i] = s[i];
     }
-    int a = idx / (B * C);
-    int rem = idx % (B * C);
-    int b = rem / C;
-    int c = rem % C;
-    dst[b * A * C + a * C + c] = src[idx];
 }
 
 // Cosine decay base → min over t in [0, T). Double for t/T (float loses
@@ -1907,22 +2341,14 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
 #endif
     transpose_102<<<grid_size(T * B * num_atns), BLOCK_SIZE, 0, stream>>>(
         rollouts->actions.data, src.actions.data, T, B, num_atns);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->logprobs.data, src.logprobs.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->rewards.data, src.rewards.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->rnn_resets.data, src.rnn_resets.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->transition_dones.data, src.transition_dones.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->values.data, src.values.data, T, B, 1);
-    transpose_102<<<grid_size(T * B * mask_c), BLOCK_SIZE, 0, stream>>>(
+    transpose_scalars_fused<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
+        rollouts->logprobs.data, src.logprobs.data,
+        rollouts->rewards.data, src.rewards.data,
+        rollouts->rnn_resets.data, src.rnn_resets.data,
+        rollouts->transition_dones.data, src.transition_dones.data,
+        rollouts->values.data, src.values.data, T, B);
+    transpose_102_2d<<<dim3(T, B), BLOCK_SIZE, 0, stream>>>(
         rollouts->action_mask.data, src.action_mask.data, T, B, mask_c);
-
-    clamp_precision_kernel<<<grid_size(
-        numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
-        rollouts->rewards.data, -100.0f, 100.0f, numel(rollouts->rewards.shape));
 
     if (hypers->reset_every_horizon || src.initial_states.data == NULL) {
         cudaMemsetAsync(pufferl->train_state.data, 0,
@@ -1972,6 +2398,8 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         if (dw_train->continuous) {
             p_logstd = dw_train->logstd;
         }
+        cudaMemsetAsync(pufferl->ppo_bufs.grad_logits.data, 0,
+            numel(pufferl->ppo_bufs.grad_logits.shape) * sizeof(float), stream);
         Prec dec = arch_forward_train(&primary->arch, primary->weights,
             pufferl->train_activs, graph.mb_obs, graph.mb_state,
             graph.mb_rnn_resets, dest_off, graph, p_logstd,
@@ -2009,12 +2437,8 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
                 pufferl->nccl_comm, stream);
         }
         normuon_step(&pufferl->normuon, primary->master_weights,
-            pufferl->grad, hypers->max_grad_norm, stream);
-        if (USE_BF16) {
-            int n = numel(primary->param.shape);
-            cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-                primary->param.data, primary->master_weights.data, n);
-        }
+            pufferl->grad, hypers->max_grad_norm, stream,
+            USE_BF16 ? primary->param.data : NULL);
     }
     cudaEventRecord(ev[TE_FE], stream);
 }
@@ -2344,7 +2768,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         && "GPU env backend does not support selfplay or multi-policy (match)");
 
     // Discrete action layout. Continuous dims are size 1. Mask width is act_n.
-    int num_action_heads = NUM_ATNS;
+    int num_action_heads = POLICY_NUM_ATNS;
     int act_sizes[] = ACT_SIZES;
     int act_n = 0;
     int n_cont = 0;
@@ -2373,7 +2797,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     // Device env IO (EnvBuf).
     pufferl->env = {
         .obs =         {.shape = {total_agents, OBS_SIZE}},
-        .actions =     {.shape = {total_agents, NUM_ATNS}},
+        .actions =     {.shape = {total_agents, ACTION_STORAGE_SIZE}},
         .rewards =     {.shape = {total_agents}},
         .terminals =   {.shape = {total_agents}},
         .action_mask = {.shape = {total_agents, vec->mask_size}},
@@ -2381,12 +2805,14 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     EnvBuf* env = &pufferl->env;
     size_t mask_bytes = total_agents * vec->mask_size * sizeof(unsigned char);
     cudaMalloc((void**)&env->obs.data, total_agents * OBS_SIZE * sizeof(obs_t));
-    cudaMalloc((void**)&env->actions.data, total_agents * NUM_ATNS * sizeof(float));
+    cudaMalloc((void**)&env->actions.data,
+        total_agents * ACTION_STORAGE_SIZE * sizeof(float));
     cudaMalloc((void**)&env->rewards.data, total_agents * sizeof(float));
     cudaMalloc((void**)&env->terminals.data, total_agents * sizeof(float));
     cudaMalloc((void**)&env->action_mask.data, mask_bytes);
     cudaMemset(env->obs.data, 0, total_agents * OBS_SIZE * sizeof(obs_t));
-    cudaMemset(env->actions.data, 0, total_agents * NUM_ATNS * sizeof(float));
+    cudaMemset(env->actions.data, 0,
+        total_agents * ACTION_STORAGE_SIZE * sizeof(float));
     cudaMemset(env->rewards.data, 0, total_agents * sizeof(float));
     cudaMemset(env->terminals.data, 0, total_agents * sizeof(float));
     cudaMemset(env->action_mask.data, 1, mask_bytes);
@@ -2528,7 +2954,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     pufferl->async_num_slots = async_slots;
     int rollout_horizon = async_slots * horizon;
     register_rollout_buffers(&pufferl->rollouts,
-        acts, rollout_horizon, total_agents, input_size, num_action_heads,
+        acts, rollout_horizon, total_agents, input_size, ACTION_STORAGE_SIZE,
         vec->mask_size);
     pufferl->bootstrap_observations = {
         .shape = {1, total_agents, input_size}};
@@ -2545,7 +2971,8 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     }
     register_train_buffers(pufferl->train_buf, acts, minibatch_segments, horizon);
     register_rollout_buffers(&pufferl->train_rollouts,
-        acts, total_agents, horizon, input_size, num_action_heads, vec->mask_size);
+        acts, total_agents, horizon, input_size, ACTION_STORAGE_SIZE,
+        vec->mask_size);
     register_ppo_buffers(pufferl->ppo_bufs, acts, minibatch_segments,
         hypers.horizon, decoder_output_size, is_continuous);
     pufferl->train_state = {.shape = {num_layers, total_agents, hidden_size}};
@@ -3138,6 +3565,39 @@ typedef struct {
     char key[64];
 } SweepParam;
 
+typedef struct {
+    SweepSpace *space;
+    int agents_idx, buffers_idx, horizon_idx, minibatch_idx, gpus_idx, steps_idx;
+    long agents, buffers, horizon, minibatch, gpus, steps;
+} SweepValidity;
+
+static int sweep_valid(const float *sample, void *data) {
+    SweepValidity *ctx = (SweepValidity *)data;
+    long agents = ctx->agents_idx >= 0
+        ? (long)space_unnormalize(&ctx->space->spaces[ctx->agents_idx],
+            sample[ctx->agents_idx]) : ctx->agents;
+    long buffers = ctx->buffers_idx >= 0
+        ? (long)space_unnormalize(&ctx->space->spaces[ctx->buffers_idx],
+            sample[ctx->buffers_idx]) : ctx->buffers;
+    long horizon = ctx->horizon_idx >= 0
+        ? (long)space_unnormalize(&ctx->space->spaces[ctx->horizon_idx],
+            sample[ctx->horizon_idx]) : ctx->horizon;
+    long minibatch = ctx->minibatch_idx >= 0
+        ? (long)space_unnormalize(&ctx->space->spaces[ctx->minibatch_idx],
+            sample[ctx->minibatch_idx]) : ctx->minibatch;
+    long gpus = ctx->gpus_idx >= 0
+        ? (long)space_unnormalize(&ctx->space->spaces[ctx->gpus_idx],
+            sample[ctx->gpus_idx]) : ctx->gpus;
+    long steps = ctx->steps_idx >= 0
+        ? (long)space_unnormalize(&ctx->space->spaces[ctx->steps_idx],
+            sample[ctx->steps_idx]) : ctx->steps;
+    long batch = agents * horizon;
+    return agents > 0 && buffers > 0 && agents % buffers == 0
+        && horizon > 0 && horizon % ADV_VEC_WIDTH == 0
+        && minibatch > 0 && minibatch % horizon == 0
+        && minibatch <= batch && gpus >= 1 && steps >= batch * gpus;
+}
+
 extern char** environ;
 
 typedef struct {
@@ -3234,6 +3694,43 @@ void run_sweep(Ini* ini, const char* exe_path) {
     }
     space->num = n_params;
 
+    SweepValidity validity = {
+        .space = space,
+        .agents_idx = -1,
+        .buffers_idx = -1,
+        .horizon_idx = -1,
+        .minibatch_idx = -1,
+        .gpus_idx = -1,
+        .steps_idx = -1,
+        .agents = (long)puf_ini_get(ini, "vec", "total_agents"),
+        .buffers = (long)puf_ini_get(ini, "vec", "num_buffers"),
+        .horizon = (long)puf_ini_get(ini, "train", "horizon"),
+        .minibatch = (long)puf_ini_get(ini, "train", "minibatch_size"),
+        .gpus = (long)puf_ini_get(ini, "train", "gpus"),
+        .steps = (long)puf_ini_get(ini, "train", "total_timesteps"),
+    };
+    for (int i = 0; i < n_params; i++) {
+        if (strcmp(params[i].section, "vec") == 0
+                && strcmp(params[i].key, "total_agents") == 0) {
+            validity.agents_idx = i;
+        } else if (strcmp(params[i].section, "vec") == 0
+                && strcmp(params[i].key, "num_buffers") == 0) {
+            validity.buffers_idx = i;
+        } else if (strcmp(params[i].section, "train") == 0
+                && strcmp(params[i].key, "horizon") == 0) {
+            validity.horizon_idx = i;
+        } else if (strcmp(params[i].section, "train") == 0
+                && strcmp(params[i].key, "minibatch_size") == 0) {
+            validity.minibatch_idx = i;
+        } else if (strcmp(params[i].section, "train") == 0
+                && strcmp(params[i].key, "gpus") == 0) {
+            validity.gpus_idx = i;
+        } else if (strcmp(params[i].section, "train") == 0
+                && strcmp(params[i].key, "total_timesteps") == 0) {
+            validity.steps_idx = i;
+        }
+    }
+
     int max_runs = puf_ini_get(ini, "sweep", "max_runs");
     int downsample = puf_ini_get(ini, "sweep", "downsample");
     int prune_pareto = puf_ini_get(ini, "sweep", "prune_pareto");
@@ -3271,10 +3768,9 @@ void run_sweep(Ini* ini, const char* exe_path) {
         .optimizer_reset_frequency = 50,
         .gp_max_obs = 750,
         .infer_batch_size = 4096,
-        .use_success_prob = 1,
+        .use_success_prob = downsample == 1,
         .prune_pareto = prune_pareto,
         .use_logit = use_logit,
-        .use_quantile = strcmp(metric_dist, "quantile") == 0,
         .global_search_scale = 1.0f,
         .max_suggestion_cost = max_cost,
         .expansion_rate = 0.1f,
@@ -3283,6 +3779,9 @@ void run_sweep(Ini* ini, const char* exe_path) {
         .success_cap = success_cap,
         .failure_cap = 1024,
         .top_k = 5,
+        .select_k = (int)puf_ini_get(ini, "sweep", "select_k"),
+        .valid = sweep_valid,
+        .valid_data = &validity,
         .rng_seed = (unsigned long long)puf_ini_get(ini, "sweep", "rng_seed"),
     });
 
@@ -3326,6 +3825,8 @@ void run_sweep(Ini* ini, const char* exe_path) {
 
             for (int p = 0; p < space->num; p++) {
                 float val = space_unnormalize(&space->spaces[p], samples[p]);
+                samples[p] = space_normalize(&space->spaces[p], val);
+                job.sample[p] = samples[p];
                 char buf[64];
                 snprintf(buf, sizeof(buf), "%.9g", val);
                 char key[256];
@@ -3333,29 +3834,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
                     params[p].section, params[p].key);
                 puf_ini_put(ini, key, buf);
             }
-            int agents = puf_ini_get(ini, "vec", "total_agents");
-            int buffers = puf_ini_get(ini, "vec", "num_buffers");
-            int horizon = puf_ini_get(ini, "train", "horizon");
-            int minibatch = puf_ini_get(ini, "train", "minibatch_size");
-            int gpus = puf_ini_get(ini, "train", "gpus");
-            long timesteps = (long)puf_ini_get(ini, "train", "total_timesteps");
-            long batch = (long)agents * horizon;
-            int valid = agents > 0 && buffers > 0 && agents % buffers == 0
-                && horizon > 0 && horizon % ADV_VEC_WIDTH == 0
-                && minibatch > 0 && minibatch % horizon == 0
-                && (long)minibatch <= batch && gpus >= 1
-                && timesteps >= batch * gpus;
-            if (!valid) {
-                fprintf(stderr,
-                    "sweep run=%d rejected: agents=%d buffers=%d horizon=%d"
-                    " minibatch=%d timesteps=%ld gpus=%d\n",
-                    job.run, agents, buffers, horizon, minibatch, timesteps, gpus);
-                protein_sweep_observe(
-                    protein, job.sample, NAN, max_cost, 1, 1);
-                assert(++failed_workers <= 1000
-                    && "too many invalid sweep configurations");
-                continue;
-            }
+            assert(sweep_valid(job.sample, &validity));
             snprintf(job.run_id, sizeof(job.run_id), "sweep_%ld_%04d",
                 (long)(1000.0 * wall_clock()), job.run);
             puf_ini_put(ini, "base.run_id", job.run_id);
@@ -3445,7 +3924,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
                 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             fprintf(stderr, "sweep worker run=%d failed; marking sample bad\n",
                 job->run);
-            protein_sweep_observe(protein, job->sample, NAN, max_cost, 1, 1);
+            protein_sweep_observe(protein, job->sample, NAN, max_cost, 1);
             assert(++failed_workers <= 1000 && "too many failed sweep workers");
             continue;
         }
@@ -3459,8 +3938,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
                 observed[space->cost_idx] = space_normalize(budget, steps);
             }
             protein_sweep_observe(protein, observed,
-                job->result.scores[pi], job->result.costs[pi], 0,
-                pi + 1 == job->result.points);
+                job->result.scores[pi], job->result.costs[pi], 0);
         }
         char acquisition_path[4096];
         snprintf(acquisition_path, sizeof(acquisition_path), "%s/%s/%s.ini",
@@ -3475,61 +3953,23 @@ void run_sweep(Ini* ini, const char* exe_path) {
         fprintf(acquisition, "steps = %.9g\n", job->result.steps);
         if (job->info.n_candidates > 0) {
             float score_error = job->result.score - job->info.predicted_score;
-            float predicted_z = score_error / fmaxf(job->info.predicted_std, 1e-6f);
             float cost_ratio = job->result.cost / job->info.predicted_cost;
             fprintf(acquisition, "predicted_score = %.9g\n", job->info.predicted_score);
-            fprintf(acquisition, "predicted_std = %.9g\n", job->info.predicted_std);
-            fprintf(acquisition, "latent_std = %.9g\n", job->info.latent_std);
-            fprintf(acquisition, "score_error = %.9g\n", score_error);
-            fprintf(acquisition, "predicted_z = %.9g\n", predicted_z);
-            fprintf(acquisition, "best_score = %.9g\n", job->info.best_score);
-            fprintf(acquisition, "expected_improvement = %.9g\n",
-                job->info.expected_improvement);
-            fprintf(acquisition, "rating = %.9g\n", job->info.rating);
-            fprintf(acquisition, "target_cost = %.9g\n", job->info.target_cost);
-            fprintf(acquisition, "cost_weight = %.9g\n", job->info.cost_weight);
-            fprintf(acquisition, "limit_probability = %.9g\n",
-                job->info.limit_probability);
-            fprintf(acquisition, "valid_probability = %.9g\n",
-                job->info.valid_probability);
             fprintf(acquisition, "predicted_cost = %.9g\n", job->info.predicted_cost);
-            fprintf(acquisition, "predicted_cost_std = %.9g\n",
-                job->info.predicted_cost_std);
-            fprintf(acquisition, "predicted_cost_upper = %.9g\n",
-                job->info.predicted_cost_upper);
+            fprintf(acquisition, "score_error = %.9g\n", score_error);
+            fprintf(acquisition, "rating = %.9g\n", job->info.rating);
             fprintf(acquisition, "cost_ratio = %.9g\n", cost_ratio);
-            fprintf(acquisition, "nearest_distance = %.9g\n",
-                job->info.nearest_distance);
-            fprintf(acquisition, "boundary_count = %d\n", job->info.boundary_count);
             fprintf(acquisition, "score_loss = %.9g\n", job->info.score_loss);
             fprintf(acquisition, "cost_loss = %.9g\n", job->info.cost_loss);
             fprintf(acquisition, "pareto_size = %d\n", job->info.n_pareto);
             fprintf(acquisition, "gp_observations = %d\n", job->info.n_gp_obs);
             fprintf(acquisition, "candidates = %d\n", job->info.n_candidates);
 
-            printf("sweep run=%d score=%.4f predicted=%.4f std=%.4f "
-                   "error=%+.4f z=%+.2f steps=%.0f\n",
+            printf("sweep run=%d score=%.4f pred_score=%.4f score_err=%+.4f "
+                   "cost=%.2f pred_cost=%.2f cost_ratio=%.3f steps=%.0f rating=%.6g\n",
                 job->run, job->result.score, job->info.predicted_score,
-                job->info.predicted_std, score_error, predicted_z,
-                job->result.steps);
-            printf("  acq rating=%.6g ei=%.6g best=%.4f latent_std=%.4f "
-                   "target_cost=%.2f\n",
-                job->info.rating, job->info.expected_improvement,
-                job->info.best_score, job->info.latent_std, job->info.target_cost);
-            printf("  weights cost=%.3f limit=%.3f valid=%.3f nearest=%.3f "
-                   "boundaries=%d\n",
-                job->info.cost_weight, job->info.limit_probability,
-                job->info.valid_probability, job->info.nearest_distance,
-                job->info.boundary_count);
-            printf("  cost actual=%.2f predicted=%.2f std=%.2f upper95=%.2f "
-                   "ratio=%.3f\n",
-                job->result.cost, job->info.predicted_cost,
-                job->info.predicted_cost_std, job->info.predicted_cost_upper,
-                cost_ratio);
-            printf("  model score_loss=%.4f cost_loss=%.4f observations=%d "
-                   "pareto=%d candidates=%d\n",
-                job->info.score_loss, job->info.cost_loss, job->info.n_gp_obs,
-                job->info.n_pareto, job->info.n_candidates);
+                score_error, job->result.cost, job->info.predicted_cost,
+                cost_ratio, job->result.steps, job->info.rating);
         } else {
             printf("sweep run=%d score=%.4f cost=%.2f steps=%.0f\n",
                 job->run, job->result.score, job->result.cost, job->result.steps);

@@ -440,6 +440,7 @@ PPOProfile* create_ppoloss(int N, int T, int A) {
         .num_atns = 1,
         .clip_coef = 0.1f, .vf_clip_coef = 0.1f, .vf_coef = 0.5f, .ent_coef = 0.01f,
         .T_seq = T, .A_total = A, .N = N,
+        .action_stride = 1,
         .logits_stride_n = T * fused_cols, .logits_stride_t = fused_cols, .logits_stride_a = 1,
         .values_stride_n = T * fused_cols, .values_stride_t = fused_cols,
         .is_continuous = false,

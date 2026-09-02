@@ -8,6 +8,7 @@
 #define PUFFER_CURRICULUM
 
 #include <assert.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,8 +19,19 @@
 #include "policy.h"
 
 #define OBS_SIZE ((int)sizeof(Observation))
-#define NUM_ATNS 8
-#define ACT_SIZES {23, POLICY_PRIMARY_HEAD_SIZE, 6, 64, 64, 64, 64, 64}
+#define BALATRO_BASE_ACTION_HEADS 8
+#define BALATRO_ORDER_HAND_OFFSET BALATRO_BASE_ACTION_HEADS
+#define BALATRO_ORDER_JOKER_OFFSET \
+    (BALATRO_ORDER_HAND_OFFSET + OBS_MAX_HAND)
+#define BALATRO_ORDER_HAND_HEAD 8
+#define BALATRO_ORDER_JOKER_HEAD 9
+#define BALATRO_ACTION_STORAGE_SIZE \
+    (BALATRO_ORDER_JOKER_OFFSET + OBS_MAX_JOKERS)
+#define BALATRO_POLICY_HEADS 10
+#define ACTION_STORAGE_SIZE BALATRO_ACTION_STORAGE_SIZE
+#define POLICY_NUM_ATNS BALATRO_POLICY_HEADS
+#define NUM_ATNS ACTION_STORAGE_SIZE
+#define ACT_SIZES {23, POLICY_PRIMARY_HEAD_SIZE, 6, 64, 64, 64, 64, 64, 64, 32}
 #define BALATRO_POINTER_DECODER
 #define ACTION_MASK_SIZE POLICY_MASK_SIZE
 #define INVALID_ACTION_REWARD (-0.002f)
@@ -36,14 +48,44 @@ typedef struct ScoreAnim {
     int played_count;
     HandType hand_type;
     int level;
-    int base_chips;
-    int base_mult;
+    int chips;  /* engine-final chips for the played hand (all jokers/enhancements) */
+    int mult;   /* engine-final mult */
     double total;
     double chips_before;
     double blind_target;
+    uint8_t scoring_mask; /* bit i: played[i] contributes to the score */
+    HandType allowed_hand_type;
+    bool hand_not_allowed;
     bool blind_beaten;
     bool bust;
 } ScoreAnim;
+
+typedef struct ConsumableAnim {
+    bool pending;
+    bool active;
+    bool hand_changed;
+    bool jokers_changed;
+    float t;
+    float duration;
+    Card used;
+    Card before_hand[MAX_HAND];
+    Card after_hand[MAX_HAND];
+    Card before_jokers[MAX_JOKERS];
+    Card after_jokers[MAX_JOKERS];
+    uint16_t before_deck_ids[MAX_DECK];
+    uint16_t selected_ids[MAX_SELECTION];
+    uint8_t selected_count;
+    uint8_t before_hand_count;
+    uint8_t after_hand_count;
+    uint8_t before_joker_count;
+    uint8_t after_joker_count;
+    uint16_t before_deck_count;
+    bool pack_pick;
+    uint8_t before_levels[HAND_COUNT];
+    uint8_t after_levels[HAND_COUNT];
+    int32_t before_dollars;
+    int32_t after_dollars;
+} ConsumableAnim;
 
 typedef struct Client {
     int width;
@@ -52,6 +94,8 @@ typedef struct Client {
     int auto_play_timer;
     int selected_count;
     uint8_t selected_indices[MAX_SELECTION];
+    int forced_index; /* Cerulean Bell: last hand slot auto-selected as forced */
+    uint8_t last_phase; /* phase rendered last frame (selection reset on entry) */
 
     bool show_tooltip;
     char tooltip_title[64];
@@ -66,6 +110,7 @@ typedef struct Client {
     int step_delay_frames;
     int step_cooldown;
     ScoreAnim score_anim;
+    ConsumableAnim consumable_anim;
 } Client;
 
 typedef struct Log {
@@ -174,19 +219,23 @@ static int puffer_observe(Env *env) {
     if (env->agents[0].action_mask) {
         memset(env->agents[0].action_mask, 0, ACTION_MASK_SIZE);
         for (int type = 0; type < ACTION_TYPE_COUNT; ++type) {
-            if (!env->reorder_actions && type >= ACTION_SWAP_JOKERS_LEFT &&
-                type <= ACTION_SORT_HAND_SUIT)
+            /* Reordering is an atomic policy suffix, not a standalone RL
+               transition. The primitive actions remain available to the
+               renderer, but never enter the learned action distribution. */
+            if (type >= ACTION_SWAP_JOKERS_LEFT && type <= ACTION_SORT_HAND_SUIT)
                 continue;
             if (!env->legal_masks.primary[type]) continue;
+            uint64_t primaries = env->legal_masks.primary[type];
             env->agents[0].action_mask[type] = 1;
             store_u64(env->agents[0].action_mask + POLICY_PRIMARY_OFFSET +
-                type * POLICY_PRIMARY_BYTES, env->legal_masks.primary[type]);
+                type * POLICY_PRIMARY_BYTES, primaries);
         }
         /* Per-option card attrs for the AR selection heads: (suit << 4) | rank per
            hand slot. Zero past hand_count; options are masked illegal there. */
         int attr_n = env->state.hand_count < POLICY_CARD_ATTR_BYTES
             ? env->state.hand_count : POLICY_CARD_ATTR_BYTES;
         for (int i = 0; i < attr_n; ++i) {
+            if (env->state.hand[i].flags & CARD_FACEDOWN) continue;
             env->agents[0].action_mask[POLICY_CARD_ATTR_OFFSET + i] =
                 (unsigned char)((env->state.hand[i].suit << POLICY_CARD_ATTR_SUIT_SHIFT)
                     | (env->state.hand[i].rank & POLICY_CARD_ATTR_RANK_MASK));
@@ -209,6 +258,13 @@ static int puffer_observe(Env *env) {
             store_selection(env->agents[0].action_mask,
                 policy_selection_entry(ACTION_PICK_PACK_CARD, i),
                 &env->legal_masks.pack[i]);
+        env->agents[0].action_mask[POLICY_ORDER_HAND_COUNT_OFFSET] =
+            env->state.hand_count;
+        env->agents[0].action_mask[POLICY_ORDER_JOKER_COUNT_OFFSET] =
+            env->state.joker_count;
+        env->agents[0].action_mask[POLICY_ORDER_ENABLED_OFFSET] =
+            env->reorder_actions != 0 && env->state.phase != PHASE_ROUND_EVAL &&
+            env->state.phase != PHASE_GAME_OVER;
     }
     return OK;
 }
@@ -232,6 +288,15 @@ void puf_init(Env *env, Dict *kwargs) {
     default_config(&env->config);
     env->deck_config = 0;
     env->stake_config = 1;
+    DictItem *seed = dict_find(kwargs, "seed");
+    if (seed) {
+        assert(seed->value >= 0.0 && seed->value <= UINT_MAX);
+        assert(seed->value == (double)(unsigned int)seed->value);
+        /* The vectorizer preloads rng with the environment index. Offset it
+           by the configured base so parallel environments keep distinct,
+           reproducible game-seed streams. */
+        env->rng += (unsigned int)seed->value;
+    }
     DictItem *deck_item = dict_find(kwargs, "deck");
     if (deck_item) {
         if (deck_item->str && (strcmp(deck_item->str, "all") == 0 || strcmp(deck_item->str, "random") == 0 || strcmp(deck_item->str, "any") == 0)) {
@@ -314,7 +379,9 @@ void puf_init(Env *env, Dict *kwargs) {
     FLOAT_REWARD_OPT("ante_bonus", ante_bonus, >);
     FLOAT_REWARD_OPT("win_bonus", win_bonus, >=);
     FLOAT_REWARD_OPT("loss_penalty", loss_penalty, >=);
+    FLOAT_REWARD_OPT("money_reward", money_reward, >=);
 #undef FLOAT_REWARD_OPT
+    assert(env->config.blind_bonus <= 0.5f);
     env->config.shaped_reward = shaped ? (shaped->value != 0.0) : 1;
     env->reorder_actions = reorder_actions && reorder_actions->value != 0.0;
     env->config.potential_scale = 0;
@@ -413,9 +480,11 @@ static void truncate_episode(Env *env) {
 
 static void score_anim_capture(Client *client, const State *state, const Action *action);
 static void score_anim_start(Client *client, const State *state);
+static void capture_consumable(Client *client, const State *state, const Action *action);
+static void start_consumable(Client *client, const State *state);
 
 void puf_step(Env *env) {
-    if (env->client && env->client->score_anim.active) {
+    if (env->client && (env->client->score_anim.active || env->client->consumable_anim.active)) {
         env->agents[0].rewards[0] = 0.0f;
         env->agents[0].terminals[0] = 0.0f;
         return;
@@ -495,6 +564,71 @@ void puf_step(Env *env) {
             }
         }
     }
+    /* Reordering is a zero-time policy suffix. Apply the sampled final order
+       before the consequential action, then translate the action's stable
+       pre-order slot identities into their new positions. Manual renderer
+       actions retain the core's primitive swap/sort behavior. */
+    if (action_is_legal && env->reorder_actions &&
+        env->state.phase != PHASE_ROUND_EVAL &&
+        env->state.phase != PHASE_GAME_OVER &&
+        (policy.type < ACTION_SWAP_JOKERS_LEFT ||
+         policy.type > ACTION_SORT_HAND_SUIT)) {
+        int hand_count = env->state.hand_count;
+        int joker_count = env->state.joker_count;
+        int hand_order[OBS_MAX_HAND];
+        int joker_order[OBS_MAX_JOKERS];
+        int hand_map[OBS_MAX_HAND];
+        int joker_map[OBS_MAX_JOKERS];
+        bool hand_seen[OBS_MAX_HAND] = {0};
+        bool joker_seen[OBS_MAX_JOKERS] = {0};
+        bool hand_identity = 1;
+        bool joker_identity = 1;
+        for (int i = 0; i < hand_count; ++i) {
+            int old = (int)env->agents[0].actions[
+                BALATRO_ORDER_HAND_OFFSET + i];
+            assert(old >= 0 && old < hand_count);
+            assert(!hand_seen[old]);
+            hand_seen[old] = 1;
+            hand_order[i] = old;
+            hand_map[old] = i;
+            if (old != i) hand_identity = 0;
+        }
+        for (int i = 0; i < joker_count; ++i) {
+            int old = (int)env->agents[0].actions[
+                BALATRO_ORDER_JOKER_OFFSET + i];
+            assert(old >= 0 && old < joker_count);
+            assert(!joker_seen[old]);
+            joker_seen[old] = 1;
+            joker_order[i] = old;
+            joker_map[old] = i;
+            if (old != i) joker_identity = 0;
+        }
+        if (!hand_identity) {
+            Card hand_copy[OBS_MAX_HAND];
+            for (int i = 0; i < hand_count; ++i)
+                hand_copy[i] = env->state.hand[hand_order[i]];
+            memcpy(env->state.hand, hand_copy, sizeof(Card) * hand_count);
+            for (int i = 0; i < policy.selection_count; ++i)
+                policy.selection[i] = (uint8_t)hand_map[policy.selection[i]];
+            for (int i = 1; i < policy.selection_count; ++i) {
+                uint8_t value = policy.selection[i];
+                int j = i;
+                while (j > 0 && policy.selection[j - 1] > value) {
+                    policy.selection[j] = policy.selection[j - 1];
+                    --j;
+                }
+                policy.selection[j] = value;
+            }
+        }
+        if (!joker_identity) {
+            Card joker_copy[OBS_MAX_JOKERS];
+            for (int i = 0; i < joker_count; ++i)
+                joker_copy[i] = env->state.jokers[joker_order[i]];
+            memcpy(env->state.jokers, joker_copy, sizeof(Card) * joker_count);
+        }
+        if (policy.type == ACTION_SELL_JOKER && !joker_identity)
+            policy.primary = (uint8_t)joker_map[policy.primary];
+    }
     env->agents[0].rewards[0] = 0.0f;
     env->agents[0].terminals[0] = 0.0f;
     if (env->episode_steps < UINT32_MAX) env->episode_steps++;
@@ -503,6 +637,10 @@ void puf_step(Env *env) {
     if (action_is_legal && policy.type == ACTION_PLAY_HAND && env->client) {
         score_anim_capture(env->client, &env->state, &policy);
     }
+    if (action_is_legal && env->client &&
+        (policy.type == ACTION_USE_CONSUMABLE || policy.type == ACTION_BUY_AND_USE ||
+         policy.type == ACTION_PICK_PACK_CARD))
+        capture_consumable(env->client, &env->state, &policy);
     StepResult result = {0};
     int error = action_is_legal
         ? apply_step(&env->state, &policy, &env->legal_masks, &result)
@@ -510,6 +648,8 @@ void puf_step(Env *env) {
     if (error == OK && policy.type == ACTION_PLAY_HAND && env->client) {
         score_anim_start(env->client, &env->state);
     }
+    if (error == OK && env->client && env->client->consumable_anim.pending)
+        start_consumable(env->client, &env->state);
     if (error == OK && env->client) {
         env->client->step_cooldown = env->client->step_delay_frames;
     }

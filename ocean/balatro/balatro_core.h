@@ -150,7 +150,8 @@ typedef enum CardFlag {
     CARD_ETERNAL = 1u << 1,
     CARD_PERISHABLE = 1u << 2,
     CARD_RENTAL = 1u << 3,
-    CARD_FORCED = 1u << 4
+    CARD_FORCED = 1u << 4,
+    CARD_FACEDOWN = 1u << 5
 } CardFlag;
 
 typedef enum HandType {
@@ -168,6 +169,14 @@ typedef enum HandType {
     HIGH_CARD,
     HAND_COUNT
 } HandType;
+
+typedef enum PackKind {
+    PACK_STANDARD = 0,
+    PACK_TAROT = 1,
+    PACK_PLANET = 2,
+    PACK_SPECTRAL = 3,
+    PACK_JOKER = 5
+} PackKind;
 
 typedef struct Card {
     uint16_t center_id;
@@ -204,6 +213,7 @@ typedef struct Config {
     float ante_bonus;
     float win_bonus;
     float loss_penalty;
+    float money_reward; /* x dollar change per step (economy shaping) */
 } Config;
 
 typedef struct RngStream {
@@ -243,6 +253,8 @@ typedef struct State {
     double chips;
     double blind_chips;
     double last_hand_score;
+    double last_hand_chips;
+    double last_hand_mult;
     int32_t reroll_cost;
     int32_t round_earnings;
     int16_t interest_cap;
@@ -534,6 +546,7 @@ uint64_t state_hash(const State *state);
 HandType classify_hand(const Card *cards, size_t count, uint8_t *scoring_mask,
     int four_fingers, int shortcut, int smeared);
 void hand_base_stats(HandType hand, int level, int *out_chips, int *out_mult);
+int joker_active(const State *state, uint16_t center_id);
 
 #ifdef __cplusplus
 }
