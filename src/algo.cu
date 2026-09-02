@@ -135,13 +135,12 @@ void rocblas_init_handle() {
 }
 #endif
 
-// Dense row-major GEMM: C = alpha * op_a(A) @ op_b(B) + beta * C
-static void cublasGemmExDense(cublasHandle_t handle,
+// Strided row-major GEMM: C = alpha * op_a(A) @ op_b(B) + beta * C
+static void cublasGemmExStrided(cublasHandle_t handle,
         cublasOperation_t op_a, cublasOperation_t op_b,
-        int M, int N, int K, void* A, void* B, void* C,
+        int M, int N, int K, int lda, int ldb, int ldc,
+        void* A, void* B, void* C,
         cudaStream_t stream, float alpha = 1.0f, float beta = 0.0f) {
-    int lda = (op_a == CUBLAS_OP_N) ? K : M;
-    int ldb = (op_b == CUBLAS_OP_N) ? N : K;
     static thread_local cudaStream_t s_last_cublas_stream = (cudaStream_t)-1;
     static thread_local cublasHandle_t s_last_cublas_handle = (cublasHandle_t)-1;
     if (handle != s_last_cublas_handle || stream != s_last_cublas_stream) {
@@ -151,12 +150,24 @@ static void cublasGemmExDense(cublasHandle_t handle,
     }
     cublasStatus_t st = cublasGemmEx(handle, op_b, op_a, N, M, K, &alpha,
         B, CUBLAS_PRECISION, ldb, A, CUBLAS_PRECISION, lda, &beta,
-        C, CUBLAS_PRECISION, N, CUBLAS_COMPUTE, CUBLAS_GEMM_DEFAULT);
+        C, CUBLAS_PRECISION, ldc, CUBLAS_COMPUTE, CUBLAS_GEMM_DEFAULT);
     if (st != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "GEMM failed: %d (%d x %d x %d, ops %d %d, ld %d %d)\n",
-            (int)st, M, N, K, (int)op_a, (int)op_b, lda, ldb);
+        fprintf(stderr, "GEMM failed: %d (%d x %d x %d, ops %d %d, ld %d %d %d)\n",
+            (int)st, M, N, K, (int)op_a, (int)op_b, lda, ldb, ldc);
         abort();
     }
+}
+
+// Dense row-major GEMM: C = alpha * op_a(A) @ op_b(B) + beta * C
+static void cublasGemmExDense(cublasHandle_t handle,
+        cublasOperation_t op_a, cublasOperation_t op_b,
+        int M, int N, int K, void* A, void* B, void* C,
+        cudaStream_t stream, float alpha = 1.0f, float beta = 0.0f) {
+    int lda = (op_a == CUBLAS_OP_N) ? K : M;
+    int ldb = (op_b == CUBLAS_OP_N) ? N : K;
+    int ldc = N;
+    cublasGemmExStrided(handle, op_a, op_b, M, N, K, lda, ldb, ldc,
+        A, B, C, stream, alpha, beta);
 }
 
 // out(...,N) = alpha * a(...,K) @ b(N,K)^T + beta * out  — leading dims folded into M
@@ -188,6 +199,20 @@ void puf_mm_nn(Prec* a, Prec* b, Prec* out, cudaStream_t stream,
     int N = b->shape[ndim(b->shape)-1];
     cublasGemmExDense(g_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
         a->data, b->data, out->data, stream, alpha, beta);
+}
+
+// out(..., col_start..col_start+slice_cols) = alpha * a(...,K) @ b(K, col_start..col_start+slice_cols) + beta * out
+void puf_mm_nn_slice(Prec* a, Prec* b, Prec* out,
+        int col_start, int slice_cols, cudaStream_t stream,
+        float alpha = 1.0f, float beta = 0.0f) {
+    int M = batch_size(a->shape) * a->shape[ndim(a->shape)-2];
+    int K = a->shape[ndim(a->shape)-1];
+    int total_N = b->shape[ndim(b->shape)-1];
+    int N = slice_cols;
+    precision_t* b_ptr = b->data + col_start;
+    precision_t* c_ptr = out->data + col_start;
+    cublasGemmExStrided(g_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
+        K, total_N, total_N, a->data, b_ptr, c_ptr, stream, alpha, beta);
 }
 
 #ifdef USE_ROCM

@@ -52,7 +52,9 @@ static constexpr int BA_TOKEN_FLAG_ROW = BA_TOKEN_ZONE_ROW + BA_ZONES;
 static constexpr int BA_TOKEN_ENH_ROW = BA_TOKEN_FLAG_ROW + BA_CARD_FLAG_ROWS;
 static constexpr int BA_TOKEN_ED_ROW = BA_TOKEN_ENH_ROW + BA_ENH_EMBED_ROWS;
 static constexpr int BA_TOKEN_SEAL_ROW = BA_TOKEN_ED_ROW + BA_ED_EMBED_ROWS;
-static constexpr int BA_TOKEN_EMBED_ROWS = BA_TOKEN_SEAL_ROW + BA_SEAL_EMBED_ROWS;
+static constexpr int BA_TOKEN_JOKER_POS_ROW = BA_TOKEN_SEAL_ROW + BA_SEAL_EMBED_ROWS;
+static constexpr int BA_TOKEN_JOKER_POS_ROWS = 8;
+static constexpr int BA_TOKEN_EMBED_ROWS = BA_TOKEN_JOKER_POS_ROW + BA_TOKEN_JOKER_POS_ROWS;
 
 static constexpr int BA_STATE_BLIND_ROW = 0;
 static constexpr int BA_STATE_DECK_ROW = BA_STATE_BLIND_ROW + BA_BLIND_EMBED_ROWS;
@@ -740,8 +742,8 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
     if (threadIdx.x < BA_POOL_SECTIONS)
         counts_out[b * BA_POOL_SECTIONS + threadIdx.x] = s_counts[threadIdx.x];
     for (int i = threadIdx.x; i < BA_POOL_SECTIONS * BA_KEY_DIM; i += blockDim.x) {
-        int s = i / BA_KEY_DIM;
-        int d = i % BA_KEY_DIM;
+        int s = i >> 5;
+        int d = i & 31;
         s_pool_sum[s][d] = 0.0f;
         s_pool_max_pair[s][d] = 0ULL;
     }
@@ -752,9 +754,8 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
     int lane = threadIdx.x & (TOKEN_WARP - 1);
     int warp = threadIdx.x / TOKEN_WARP;
     for (int slot = warp; slot < total; slot += TOKEN_WARPS) {
-        int id, sec, playing, enh, ed, seal, flags;
+        int id, sec, playing, enh, ed, seal, flags, local;
         if (lane == 0) {
-            int local;
             sec = ba_slot_section(s_counts, slot, &local);
             ba_token_features(obs, in, slot, s_raw[warp]);
             int token_base = offsetof(Observation, tokens)
@@ -767,11 +768,12 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
             seal = ba_byte(obs, in, token_base + offsetof(CardToken, seal));
             flags = ba_byte(obs, in, token_base + offsetof(CardToken, flags));
         }
-        uint32_t p0 = __shfl_sync(PUF_WARP_MASK, (id & 0xFFFF) | (sec << 16) | (playing << 24), 0);
+        uint32_t p0 = __shfl_sync(PUF_WARP_MASK, (id & 0xFFFF) | (sec << 16) | (playing << 24) | ((local & 0x7F) << 25), 0);
         uint32_t p1 = __shfl_sync(PUF_WARP_MASK, enh | (ed << 8) | (seal << 16) | (flags << 24), 0);
         id = p0 & 0xFFFF;
         sec = (p0 >> 16) & 0xFF;
         playing = (p0 >> 24) & 1;
+        local = (p0 >> 25) & 0x7F;
         enh = p1 & 0xFF;
         ed = (p1 >> 8) & 0xFF;
         seal = (p1 >> 16) & 0xFF;
@@ -782,10 +784,14 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
         float z = to_float(token_b[lane])
             + to_float(token_embed[(BA_TOKEN_ZONE_ROW + sec) * BA_KEY_DIM + lane]);
         if (playing) {
-            z += to_float(token_embed[(BA_TOKEN_RANK_ROW + rank) * BA_KEY_DIM + lane]);
-            z += to_float(token_embed[(BA_TOKEN_SUIT_ROW + suit) * BA_KEY_DIM + lane]);
+            float r_emb = to_float(token_embed[(BA_TOKEN_RANK_ROW + rank) * BA_KEY_DIM + lane]);
+            float s_emb = to_float(token_embed[(BA_TOKEN_SUIT_ROW + suit) * BA_KEY_DIM + lane]);
+            z += r_emb + s_emb + (r_emb * s_emb);
         } else {
             z += to_float(token_embed[(BA_TOKEN_CENTER_ROW + id) * BA_KEY_DIM + lane]);
+            if (sec == ZONE_JOKER && local < BA_TOKEN_JOKER_POS_ROWS) {
+                z += to_float(token_embed[(BA_TOKEN_JOKER_POS_ROW + local) * BA_KEY_DIM + lane]);
+            }
         }
         if (enh > 0 && enh < 9)
             z += to_float(token_embed[(BA_TOKEN_ENH_ROW + enh) * BA_KEY_DIM + lane]);
@@ -815,10 +821,10 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
 
     // 3. Compute Permutation-Invariant Set Pools (Mean + Max across 7 zones)
     for (int c = threadIdx.x; c < BA_POOLED_FEATURES; c += blockDim.x) {
-        int sec = c / (BA_KEY_DIM * 2);
-        int rem = c % (BA_KEY_DIM * 2);
-        int is_max = rem / BA_KEY_DIM;
-        int d = rem % BA_KEY_DIM;
+        int sec = c >> 6;
+        int rem = c & 63;
+        int is_max = (rem >> 5) & 1;
+        int d = rem & 31;
 
         int cnt = s_counts[sec];
         if (is_max) {
@@ -861,6 +867,7 @@ __global__ void ba_token_backward_kernel(
         long* __restrict__ state_embed_acc,
         long* __restrict__ token_w_acc,
         long* __restrict__ token_b_acc,
+        const precision_t* __restrict__ token_embed,
         const unsigned char* __restrict__ obs,
         int obs_size,
         int B) {
@@ -887,9 +894,7 @@ __global__ void ba_token_backward_kernel(
         s_token_b[i] = 0.0f;
     }
     for (int i = threadIdx.x; i < BA_KEY_DIM * BA_RAW_DIM; i += blockDim.x) {
-        int d_idx = i / BA_RAW_DIM;
-        int k_idx = i % BA_RAW_DIM;
-        s_token_w[d_idx][k_idx] = 0.0f;
+        ((float*)s_token_w)[i] = 0.0f;
     }
     __syncthreads();
 
@@ -1112,10 +1117,15 @@ __global__ void ba_token_backward_kernel(
 
         ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_ZONE_ROW + zone) * BA_KEY_DIM + d], g);
         if (is_playing) {
-            ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_RANK_ROW + rank) * BA_KEY_DIM + d], g);
-            ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_SUIT_ROW + suit) * BA_KEY_DIM + d], g);
+            float r_emb = to_float(token_embed[(BA_TOKEN_RANK_ROW + rank) * BA_KEY_DIM + d]);
+            float s_emb = to_float(token_embed[(BA_TOKEN_SUIT_ROW + suit) * BA_KEY_DIM + d]);
+            ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_RANK_ROW + rank) * BA_KEY_DIM + d], g * (1.0f + s_emb));
+            ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_SUIT_ROW + suit) * BA_KEY_DIM + d], g * (1.0f + r_emb));
         } else {
             ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_CENTER_ROW + id) * BA_KEY_DIM + d], g);
+            if (zone == ZONE_JOKER && local < BA_TOKEN_JOKER_POS_ROWS) {
+                ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_JOKER_POS_ROW + local) * BA_KEY_DIM + d], g);
+            }
         }
         if (enh > 0 && enh < 9)
             ba_fxp_atomic_add(&token_embed_acc[(BA_TOKEN_ENH_ROW + enh) * BA_KEY_DIM + d], g);
@@ -1185,7 +1195,11 @@ static void ba_encoder_backward(
     assert(a->decoder_grad_logits && a->decoder_fused
         && a->decoder_probability);
     puf_mm_tn(&grad, &a->pooled, &a->proj_wgrad, stream);
-    puf_mm_nn(&grad, &ew->proj_w, &a->d_pooled, stream);
+    // Sliced backward projection: backpropagate only into the 563 columns that have upstream learnable parameters,
+    // skipping the 488 columns of static observation constants (deck matrix, poker stats, vouchers, blind signatures).
+    puf_mm_nn_slice(&grad, &ew->proj_w, &a->d_pooled, 0, 102, stream);
+    puf_mm_nn_slice(&grad, &ew->proj_w, &a->d_pooled, BA_OFF_TAGS, 13, stream);
+    puf_mm_nn_slice(&grad, &ew->proj_w, &a->d_pooled, BA_OFF_POOLED, BA_POOLED_FEATURES, stream);
     constexpr int ACC_TOTAL_ELEMS = BA_KEY_DIM * BA_RAW_DIM + BA_KEY_DIM
         + BA_TOKEN_EMBED_ROWS * BA_KEY_DIM + BA_STATE_EMBED_ROWS * BA_STATE_EMBED_DIM;
     cudaMemsetAsync(a->token_w_acc.data, 0, ACC_TOTAL_ELEMS * sizeof(long), stream);
@@ -1196,6 +1210,7 @@ static void ba_encoder_backward(
         a->counts.data, a->pool_argmax.data,
         a->token_embed_acc.data, a->state_embed_acc.data,
         a->token_w_acc.data, a->token_b_acc.data,
+        ew->token_embed.data,
         a->obs_data, ew->obs_size, B);
     ba_fxp_to_precision_kernel<<<grid_size(ACC_TOTAL_ELEMS), BLOCK_SIZE, 0, stream>>>(
         a->token_wgrad.data, a->token_w_acc.data, ACC_TOTAL_ELEMS);
