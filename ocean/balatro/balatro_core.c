@@ -124,8 +124,6 @@ typedef struct ScoreContext {
     int mime_count;
 } ScoreContext;
 
-enum { PUBLIC_CARD_PLAYED_THIS_ANTE = 1u << 5 };
-
 static const float small_integer_log2p1[] = {
     0.0f, 1.0f, 1.5849625f, 2.0f, 2.3219280f, 2.5849625f,
     2.8073549f, 3.0f, 3.1699250f, 3.3219280f, 3.4594316f,
@@ -704,8 +702,13 @@ static double blind_amount(uint8_t ante, uint8_t scaling) {
     double c = (double)ante - 8.0;
     double d = 1.0 + 0.2 * c;
     double raw = floor(amounts[scaling - 1][7] * pow(1.6 + pow(0.75 * c, d), c));
+    /* Unrepresentable requirements saturate to +Inf (never NaN): an infinite
+       blind is beaten only by an infinite score, decided by direct
+       comparison at the beat check. See finish_blind. */
+    if (!isfinite(raw)) return INFINITY;
     double rounding = pow(10.0, floor(log10(raw) - 1.0));
-    return raw - fmod(raw, rounding);
+    double out = raw - fmod(raw, rounding);
+    return isfinite(out) ? out : INFINITY;
 }
 
 static int32_t calculate_round_earnings(const State *state) {
@@ -826,7 +829,7 @@ void reset_round_rerolls(State *state) {
     state->reroll_cost = chaos ? 0 : (state->tag_d_six_active ? 0 : state->reroll_base);
 }
 
-static double shaped_transition_reward(const State *state,
+static double shaped_transition_reward(State *state,
                                        const Action *action,
                                        double previous_chips,
                                        double previous_blind_chips,
@@ -835,10 +838,22 @@ static double shaped_transition_reward(const State *state,
                                        uint8_t previous_blind_skipped_mask,
                                        int32_t previous_dollars) {
     double reward = 0.0;
-    /* Economy shaping: scale with the dollar change of the step. Universal
-       across decks and phases; captures interest, blind rewards, seals and
-       joker income while keeping spends mildly taxed at the coefficient. */
-    reward += state->config.money_reward * (double)(state->dollars - previous_dollars);
+    /* Legacy economy shaping: scale with the dollar change of the step. */
+    if (state->config.money_reward > 0.0f)
+        reward += (double)state->config.money_reward * (double)(state->dollars - previous_dollars);
+
+    /* 1. Step-Level High-Pass Log-Power Potential (Only rewards scores > 10,000) */
+    if (action->type == ACTION_PLAY_HAND &&
+        state->config.power_reward > 0.0f &&
+        isfinite(state->last_hand_score) && state->last_hand_score > 10000.0) {
+        double cur_log = log10(state->last_hand_score) - 4.0;
+        if (cur_log > state->peak_hand_log) {
+            reward += (double)state->config.power_reward * (cur_log - state->peak_hand_log);
+            state->peak_hand_log = cur_log;
+        }
+    }
+
+    /* 2. Intra-round step-level progress (potential-based, normalized to blind) */
     if (action->type == ACTION_PLAY_HAND &&
         isfinite(previous_chips) && previous_chips >= 0.0 &&
         isfinite(previous_blind_chips) && previous_blind_chips > 0.0 &&
@@ -863,6 +878,8 @@ static double shaped_transition_reward(const State *state,
             }
         }
     }
+
+    /* 3. Blind clearance outcomes */
     if (action->type == ACTION_PLAY_HAND &&
         previous_phase == PHASE_SELECTING_HAND &&
         state->phase == PHASE_ROUND_EVAL) {
@@ -872,9 +889,52 @@ static double shaped_transition_reward(const State *state,
         } else {
             uint8_t skipped = previous_blind_skipped_mask & 3u;
             int completed = 2 - __builtin_popcount((unsigned)skipped);
-            reward += state->config.ante_bonus - blind_reward * completed;
+            double base_ante_reward = state->config.ante_bonus - blind_reward * completed;
+            if (state->config.ante_escalation > 0.0f) {
+                uint8_t completed_ante = state->ante > 1 ? state->ante - 1 : 1;
+                if (completed_ante >= 8) {
+                    /* Geometric escalation for Ante 8, 9, 10, 11... */
+                    double exp_term = pow(2.0, (double)(completed_ante - 8));
+                    base_ante_reward *= (1.0 + (double)state->config.ante_escalation * 4.0 * exp_term);
+                } else {
+                    base_ante_reward *= (1.0 + (double)state->config.ante_escalation * (double)(completed_ante - 1));
+                }
+            }
+            reward += base_ante_reward;
+        }
+
+        /* Hand efficiency: bonus for hands remaining (disabled when eff_reward == 0) */
+        if (state->config.eff_reward > 0.0f) {
+            uint8_t total_hands = state->hands_left + state->hands_played;
+            if (total_hands > 0) {
+                reward += (double)state->config.eff_reward * ((double)state->hands_left / (double)total_hands);
+            }
+        }
+
+        /* Legacy log-margin scoring headroom (disabled when headroom_reward == 0) */
+        if (state->config.headroom_reward > 0.0f && previous_blind_chips > 0.0 && state->last_hand_score > previous_blind_chips) {
+            double margin = log10(state->last_hand_score / previous_blind_chips);
+            if (margin > 2.5) margin = 2.5;
+            reward += (double)state->config.headroom_reward * margin;
         }
     }
+
+    /* 4. Round Cashout Economy Health: interest banking bonus without purchase penalty */
+    if (action->type == ACTION_CASH_OUT && state->phase == PHASE_SHOP) {
+        if (state->config.interest_reward > 0.0f) {
+            int16_t cap = state->interest_cap > 0 ? state->interest_cap : 25;
+            double bankroll = (double)state->dollars;
+            for (uint8_t i = 0; i < state->joker_count; ++i)
+                bankroll += (double)state->jokers[i].sell_cost;
+            for (uint8_t i = 0; i < state->consumable_count; ++i)
+                bankroll += (double)state->consumables[i].sell_cost;
+            if (bankroll > (double)cap) bankroll = (double)cap;
+            if (bankroll > 0.0) {
+                reward += (double)state->config.interest_reward * (bankroll / (double)cap);
+            }
+        }
+    }
+
     if (state->terminal)
         reward += state->won
             ? state->config.win_bonus : -state->config.loss_penalty;
@@ -3438,72 +3498,6 @@ int action_is_legal(const State *state, const Action *action) {
     return legal_masks(state, &masks) == OK && action_is_legal_masks(&masks, action);
 }
 
-static uint8_t public_playing_flags(const Card *card) {
-    uint8_t flags = card->flags & (CARD_DEBUFFED | CARD_ETERNAL | CARD_PERISHABLE | CARD_RENTAL |
-                                   CARD_FORCED | CARD_FACEDOWN);
-    if (card->state[3]) flags |= PUBLIC_CARD_PLAYED_THIS_ANTE;
-    return flags;
-}
-
-static void observation_poker_hand(const State *state, uint8_t hand, PokerHandStat *out) {
-    static const float base_chips_log[HAND_COUNT] = {7.33091688f, 7.13955116f, 6.9188633f, 6.65821171f,
-                                                     5.9307375f, 5.35755205f, 5.16992521f, 4.95419645f,
-                                                     4.95419645f, 4.3923173f, 3.45943165f, 2.58496261f};
-    static const float base_mult_log[HAND_COUNT] = {4.0874629f, 3.90689063f, 3.70043969f, 3.16992497f,
-                                                    3.0f, 2.32192802f, 2.32192802f, 2.32192802f,
-                                                    2.0f, 1.58496249f, 1.58496249f, 1.0f};
-    uint32_t level = state->hand_levels[hand] ? state->hand_levels[hand] : 1;
-    float chips = level == 1 ? base_chips_log[hand] : observation_signed_log2(base_chips[hand] + (double)level_chips[hand] * (level - 1));
-    float mult = level == 1 ? base_mult_log[hand] : observation_signed_log2(base_mult[hand] + (double)level_mult[hand] * (level - 1));
-    *out = (PokerHandStat){
-        .visible = (uint8_t)(hand >= STRAIGHT_FLUSH || state->hand_plays[hand] != 0),
-        .level = level > 255 ? 255 : (uint8_t)level,
-        .total_plays = state->hand_plays[hand],
-        .round_plays = state->hand_plays_round[hand],
-        .chips_log2 = chips,
-        .mult_log2 = mult,
-    };
-}
-
-static inline void write_card_token(CardToken *dst, const Card *card, uint8_t zone, int is_playing) {
-    dst->id = is_playing ? ((uint16_t)card->rank << 8 | (uint16_t)card->suit) : card->center_id;
-    dst->zone = zone;
-    dst->enhancement = card->enhancement;
-    dst->edition = card->edition;
-    dst->seal = card->seal;
-    dst->flags = is_playing ? public_playing_flags(card) : card->flags;
-    dst->sell_cost = (int8_t)(card->sell_cost > 127 ? 127 : card->sell_cost < -128 ? -128 : card->sell_cost);
-    dst->perma_bonus = card->perma_bonus;
-    dst->state0 = card->state[0];
-    dst->state1 = card->state[1];
-    if (is_playing && (card->flags & CARD_FACEDOWN)) {
-        /* Face-down cards: hide rank, suit and all modifiers; keep zone and
-           the facedown flag so the policy knows which slots are hidden. */
-        dst->id = 0;
-        dst->enhancement = 0;
-        dst->edition = 0;
-        dst->seal = 0;
-        dst->perma_bonus = 0;
-        dst->state0 = 0;
-        dst->state1 = 0;
-    }
-}
-
-static void count_draw_card(DeckMatrix *matrix, const Card *card) {
-    if (card->enhancement == ENHANCEMENT_STONE) {
-        matrix->draw_enhancements[ENHANCEMENT_STONE]++;
-    } else if (card->rank >= 2 && card->rank <= 14 && card->suit < 4) {
-        DeckSlot *slot = &matrix->grid[card->rank - 2][card->suit];
-        slot->draw_count++;
-        slot->enhancement_mask |= (1u << card->enhancement);
-        slot->modifiers_mask |= (1u << card->edition);
-        slot->modifiers_mask |= (1u << (5 + card->seal));
-        if (card->flags & CARD_DEBUFFED) slot->modifiers_mask |= (1u << 10);
-    }
-    if (card->enhancement != ENHANCEMENT_NONE && card->enhancement < 9)
-        matrix->draw_enhancements[card->enhancement]++;
-}
-
 int state_layout_valid(const State *state) {
     return state && state->rng_count <= MAX_RNG_STREAMS && state->deck_count <= MAX_DECK &&
            state->hand_count <= MAX_HAND && state->discard_count <= MAX_DECK && state->joker_count <= MAX_JOKERS &&
@@ -3517,8 +3511,8 @@ int state_layout_valid(const State *state) {
 }
 
 int observe(const State *state, Observation *out, LegalMasks *legal) {
-    if (!state || !out || !legal) return ERR_ARGUMENT;
-    if (!state_layout_valid(state)) return ERR_INVARIANT;
+    assert(state && out && legal);
+    assert(state_layout_valid(state));
     *out = (Observation){0};
 
     uint16_t next_voucher_id = 0;
@@ -3541,16 +3535,38 @@ int observe(const State *state, Observation *out, LegalMasks *legal) {
     }
 
     out->globals = (ObservationGlobals){
-        .deck_id = state->config.deck,
         .blind_id = state->blind_id,
         .next_boss_id = state->next_boss_id,
         .next_voucher_id = next_voucher_id,
+        .pending_free_pack_id = state->pending_free_pack_id,
         .last_tarot_planet = state->last_tarot_planet,
+        .redeemed_vouchers_mask = redeemed_vouchers_mask,
+        .joker_rate = state->joker_rate,
+        .tarot_rate = state->tarot_rate,
+        .planet_rate = state->planet_rate,
+        .spectral_rate = state->spectral_rate,
+        .playing_card_rate = state->playing_card_rate,
+        .edition_rate = state->edition_rate,
+        .dollars = state->dollars,
+        .reroll_cost = state->reroll_cost,
+        .round_earnings = state->round_earnings,
+        .run_hands_played = state->run_hands_played,
+        .unused_discards = state->unused_discards,
+        .tarots_used = state->tarots_used,
+        .planet_usage_mask = state->planet_usage_mask,
+        .blind_hands_mask = state->blind_hands_mask,
+        .interest_cap = state->interest_cap,
+        .interest_amount = state->interest_amount,
+        .rental_rate = state->rental_rate,
+        .blind_reward = state->blind_reward,
+        .deck_id = state->config.deck,
         .stake = state->config.stake,
+        .win_ante = state->config.win_ante,
+        .stake_scaling = state->stake_scaling,
         .phase = state->phase,
+        .blind_on_deck = state->blind_on_deck,
         .ante = state->ante,
         .round = state->round,
-        .blind_on_deck = state->blind_on_deck,
         .blind_disabled = state->blind_disabled,
         .blind_only_hand = state->blind_only_hand,
         .blind_skipped_mask = state->blind_skipped_mask,
@@ -3563,9 +3579,27 @@ int observe(const State *state, Observation *out, LegalMasks *legal) {
         .hands_per_round = state->hands_per_round,
         .discards_per_round = state->discards_per_round,
         .base_hand_size = state->base_hand_size,
+        .hand_size = state->hand_size,
+        .joker_slots = state->joker_slots,
+        .consumable_slots = state->consumable_slots,
+        .skips = state->skips,
+        .pack_choices = state->pack_choices,
         .pack_kind = state->pack_kind,
+        .shop_return_phase = state->shop_return_phase,
+        .first_shop_buffoon = state->first_shop_buffoon,
+        .shop_joker_max = state->shop_joker_max,
+        .ancient_suit = state->ancient_suit,
+        .idol_rank = state->idol_rank,
+        .idol_suit = state->idol_suit,
+        .mail_rank = state->mail_rank,
+        .castle_suit = state->castle_suit,
+        .most_played_hand = state->most_played_hand,
+        .last_hand_type = state->last_hand_type,
         .double_tag = state->double_tag,
         .active_tag = state->active_tag,
+        .blind_tags = {state->blind_tags[0], state->blind_tags[1]},
+        .orbital_hands = {state->orbital_hands[0], state->orbital_hands[1],
+            state->orbital_hands[2]},
         .tag_hand_bonus = state->tag_hand_bonus,
         .tag_force_rarity = state->tag_force_rarity,
         .tag_force_rarity_count = state->tag_force_rarity_count,
@@ -3574,142 +3608,187 @@ int observe(const State *state, Observation *out, LegalMasks *legal) {
         .tag_voucher_pending = state->tag_voucher_pending,
         .tag_coupon_pending = state->tag_coupon_pending,
         .tag_coupon_active = state->tag_coupon_active,
+        .tag_saved_discount = state->tag_saved_discount,
         .tag_investment_pending = state->tag_investment_pending,
         .tag_d_six_pending = state->tag_d_six_pending,
         .tag_d_six_active = state->tag_d_six_active,
         .ecto_penalty = state->ecto_penalty,
         .gros_michel_extinct = state->gros_michel_extinct,
-        .hand_size = state->hand_size,
-        .joker_slots = state->joker_slots,
-        .consumable_slots = state->consumable_slots,
-        .skips = state->skips,
-        .pack_choices = state->pack_choices,
-        .unused_discards = state->unused_discards,
-        .most_played_hand = state->most_played_hand,
-        .last_hand_type = state->last_hand_type,
-        .blind_tags = {state->blind_tags[0], state->blind_tags[1]},
-        .orbital_hands = {state->orbital_hands[0], state->orbital_hands[1]},
         .hands_left = state->hands_left,
         .discards_left = state->discards_left,
         .hands_played = state->hands_played,
         .discards_used = state->discards_used,
-        .blind_hands_mask = state->blind_hands_mask,
-        .tarots_used = state->tarots_used,
-        .planet_usage_mask = state->planet_usage_mask,
-        .run_hands_played = state->run_hands_played,
-        .dollars = state->dollars,
-        .reroll_cost = state->reroll_cost,
-        .round_earnings = state->round_earnings,
-        .chips_log2 = observation_signed_log2(state->chips),
-        .blind_chips_log2 = observation_signed_log2(state->blind_chips),
-        .last_hand_score_log2 = observation_signed_log2(state->last_hand_score),
-        .chips_over_blind_log2 = observation_signed_log2(chips_over_blind),
-        .interest_cap = (uint16_t)(state->interest_cap < 0 ? 0 : state->interest_cap),
-        .interest_amount = (uint16_t)(state->interest_amount < 0 ? 0 : state->interest_amount),
-        .blind_reward = (uint16_t)(state->blind_reward < 0 ? 0 : state->blind_reward),
-        .joker_rate = (uint8_t)(state->joker_rate * 100.0f + 0.5f),
-        .tarot_rate = (uint8_t)(state->tarot_rate * 100.0f + 0.5f),
-        .planet_rate = (uint8_t)(state->planet_rate * 100.0f + 0.5f),
-        .spectral_rate = (uint8_t)(state->spectral_rate * 100.0f + 0.5f),
-        .playing_card_rate = (uint8_t)(state->playing_card_rate * 100.0f + 0.5f),
-        .edition_rate = (uint8_t)(state->edition_rate * 100.0f + 0.5f),
-        .redeemed_vouchers_mask = redeemed_vouchers_mask,
+        .score_features = {
+            observation_signed_log2(state->chips),
+            observation_signed_log2(state->blind_chips),
+            observation_signed_log2(state->last_hand_score),
+            observation_signed_log2(state->last_hand_chips),
+            observation_signed_log2(state->last_hand_mult),
+            observation_signed_log2(chips_over_blind),
+        },
     };
 
-    // DeckMatrix population
-    for (uint16_t i = 0; i < state->deck_count; ++i)
-        count_draw_card(&out->deck_matrix, &state->deck[i]);
-    /* Face-down cards remain part of the unknown draw pool. Count every field
-       exactly as if the card had stayed in the deck, so drawing it face down
-       cannot change any deck-matrix feature and reveal its identity. */
-    int hide_in_deck = !state->blind_disabled &&
-        (state->blind_id == BLIND_BL_HOUSE || state->blind_id == BLIND_BL_WHEEL ||
-         state->blind_id == BLIND_BL_FISH || state->blind_id == BLIND_BL_MARK);
+    out->counts = (ObservationCounts){
+        .deck_count = state->deck_count,
+        .discard_count = state->discard_count,
+        .total_playing_cards = state->deck_count + state->hand_count + state->discard_count,
+        .hand_count = state->hand_count,
+        .joker_count = state->joker_count,
+        .consumable_count = state->consumable_count,
+    };
+
+    const Card *deck_zones[3] = {state->deck, state->discard, state->hand};
+    uint16_t deck_counts[3] = {state->deck_count, state->discard_count, state->hand_count};
+    for (int zone = 0; zone < 3; ++zone) {
+        for (uint16_t i = 0; i < deck_counts[zone]; ++i) {
+            const Card *card = &deck_zones[zone][i];
+            int hidden = (card->flags & CARD_FACEDOWN) != 0;
+            if (zone == 2 && !hidden) continue;
+            uint8_t flags = card->flags & (CARD_DEBUFFED | CARD_ETERNAL | CARD_PERISHABLE |
+                CARD_RENTAL | CARD_FORCED | CARD_FACEDOWN);
+            if (hidden) flags &= (uint8_t)~CARD_FACEDOWN;
+            if (card->state[3]) flags |= PUBLIC_CARD_PLAYED_THIS_ANTE;
+            int plain = card->rank >= 2 && card->rank <= 14 && card->suit < 4 &&
+                card->enhancement == ENHANCEMENT_NONE && card->edition == EDITION_NONE &&
+                card->seal == SEAL_NONE &&
+                (flags & (uint8_t)~PUBLIC_CARD_PLAYED_THIS_ANTE) == 0 &&
+                card->perma_bonus == 0;
+            int location = zone == 1 && !hidden ? 1 : 0;
+            if (plain) {
+                PlainDeckView *entry = &out->plain_deck[card->rank - 2][card->suit];
+                if (flags & PUBLIC_CARD_PLAYED_THIS_ANTE) {
+                    if (location) entry->played_discard++;
+                    else entry->played_unseen++;
+                } else if (location) entry->discard++;
+                else entry->unseen++;
+                continue;
+            }
+            assert(out->counts.special_count < OBS_MAX_PLAYING_CARDS);
+            DeckCardView *entry = &out->specials[out->counts.special_count++];
+            entry->card.attributes = (uint16_t)(card->rank | (card->suit << 4) |
+                (card->enhancement << 6) | (card->edition << 10) | (card->seal << 13));
+            entry->card.flags = flags;
+            entry->card.perma_bonus = card->perma_bonus;
+            entry->location = (uint8_t)location;
+        }
+    }
+    for (uint16_t i = 1; i < out->counts.special_count; ++i) {
+        DeckCardView value = out->specials[i];
+        uint64_t value_key = (uint64_t)value.card.attributes |
+            ((uint64_t)value.card.flags << 16) |
+            ((uint64_t)(uint16_t)value.card.perma_bonus << 24) |
+            ((uint64_t)value.location << 40);
+        uint16_t j = i;
+        while (j > 0) {
+            DeckCardView previous = out->specials[j - 1];
+            uint64_t previous_key = (uint64_t)previous.card.attributes |
+                ((uint64_t)previous.card.flags << 16) |
+                ((uint64_t)(uint16_t)previous.card.perma_bonus << 24) |
+                ((uint64_t)previous.location << 40);
+            if (previous_key <= value_key) break;
+            out->specials[j] = previous;
+            --j;
+        }
+        out->specials[j] = value;
+    }
+
+    static const float base_chips_log[HAND_COUNT] = {7.33091688f, 7.13955116f, 6.9188633f, 6.65821171f,
+        5.9307375f, 5.35755205f, 5.16992521f, 4.95419645f, 4.95419645f, 4.3923173f, 3.45943165f, 2.58496261f};
+    static const float base_mult_log[HAND_COUNT] = {4.0874629f, 3.90689063f, 3.70043969f, 3.16992497f,
+        3.0f, 2.32192802f, 2.32192802f, 2.32192802f, 2.0f, 1.58496249f, 1.58496249f, 1.0f};
+    for (uint8_t hand = 0; hand < HAND_COUNT; ++hand) {
+        uint32_t level = state->hand_levels[hand] ? state->hand_levels[hand] : 1;
+        out->poker_hands[hand] = (PokerHandStat){
+            .level = state->hand_levels[hand],
+            .visible = (uint8_t)(hand >= STRAIGHT_FLUSH || state->hand_plays[hand] != 0),
+            .total_plays = state->hand_plays[hand],
+            .round_plays = state->hand_plays_round[hand],
+            .chips_log2 = level == 1 ? base_chips_log[hand] : observation_signed_log2(
+                base_chips[hand] + (double)level_chips[hand] * (level - 1)),
+            .mult_log2 = level == 1 ? base_mult_log[hand] : observation_signed_log2(
+                base_mult[hand] + (double)level_mult[hand] * (level - 1)),
+        };
+    }
+
+    for (uint8_t i = 0; i < state->joker_count; ++i) {
+        const Card *card = &state->jokers[i];
+        out->jokers[i] = (JokerView){
+            .center_id = card->center_id,
+            .edition = card->edition,
+            .flags = card->flags,
+            .cost = card->cost,
+            .sell_cost = card->sell_cost,
+            .state = {card->state[0], card->state[1], card->state[2], card->state[3]},
+        };
+    }
+    for (uint8_t i = 0; i < state->consumable_count; ++i) {
+        const Card *card = &state->consumables[i];
+        out->consumables[i] = (ConsumableView){
+            .center_id = card->center_id,
+            .edition = card->edition,
+            .flags = card->flags,
+            .cost = card->cost,
+            .sell_cost = card->sell_cost,
+        };
+    }
+
     for (uint8_t i = 0; i < state->hand_count; ++i) {
-        const Card *c = &state->hand[i];
-        if (c->flags & CARD_FACEDOWN) {
-            if (hide_in_deck) count_draw_card(&out->deck_matrix, c);
-            continue;
-        }
-        if (c->rank >= 2 && c->rank <= 14 && c->suit < 4) {
-            DeckSlot *s = &out->deck_matrix.grid[c->rank - 2][c->suit];
-            s->hand_count++;
-            s->enhancement_mask |= (1u << c->enhancement);
-            s->modifiers_mask |= (1u << c->edition);
-            s->modifiers_mask |= (1u << (5 + c->seal));
-            if (c->flags & CARD_DEBUFFED) s->modifiers_mask |= (1u << 10);
+        const Card *card = &state->hand[i];
+        uint8_t flags = card->flags & (CARD_DEBUFFED | CARD_ETERNAL | CARD_PERISHABLE |
+            CARD_RENTAL | CARD_FORCED | CARD_FACEDOWN);
+        if (card->state[3]) flags |= PUBLIC_CARD_PLAYED_THIS_ANTE;
+        PlayingCardView *entry = &out->hand[i];
+        entry->flags = flags;
+        if (!(card->flags & CARD_FACEDOWN)) {
+            entry->attributes = (uint16_t)(card->rank | (card->suit << 4) |
+                (card->enhancement << 6) | (card->edition << 10) | (card->seal << 13));
+            entry->perma_bonus = card->perma_bonus;
+        } else {
+            entry->flags &= (uint8_t)~PUBLIC_CARD_PLAYED_THIS_ANTE;
         }
     }
-    for (uint16_t i = 0; i < state->discard_count; ++i) {
-        const Card *c = &state->discard[i];
-        if (c->flags & CARD_FACEDOWN) {
-            if (hide_in_deck) count_draw_card(&out->deck_matrix, c);
-            continue;
+
+    int market = state->phase == PHASE_SHOP || state->phase == PHASE_PACK_OPENING;
+    if (market) {
+        out->counts.shop_count = state->shop_main_count;
+        out->counts.voucher_count = state->shop_voucher_count;
+        out->counts.booster_count = state->shop_booster_count;
+        out->counts.pack_count = state->pack_count;
+        const Card *offer_zones[2] = {state->shop_main, state->pack_cards};
+        uint8_t offer_counts[2] = {state->shop_main_count, state->pack_count};
+        OfferView *offer_outputs[2] = {out->market.shop, out->market.pack};
+        for (int zone = 0; zone < 2; ++zone) {
+            for (uint8_t i = 0; i < offer_counts[zone]; ++i) {
+                const Card *card = &offer_zones[zone][i];
+                offer_outputs[zone][i] = (OfferView){
+                    .center_id = card->center_id,
+                    .rank = card->rank,
+                    .suit = card->suit,
+                    .enhancement = card->enhancement,
+                    .edition = card->edition,
+                    .seal = card->seal,
+                    .flags = card->flags,
+                    .perma_bonus = card->perma_bonus,
+                    .cost = card->cost,
+                    .sell_cost = card->sell_cost,
+                    .state = {card->state[0], card->state[1], card->state[2], card->state[3]},
+                };
+            }
         }
-        if (c->enhancement == ENHANCEMENT_STONE) {
-            out->deck_matrix.discard_enhancements[ENHANCEMENT_STONE]++;
-        } else if (c->rank >= 2 && c->rank <= 14 && c->suit < 4) {
-            DeckSlot *s = &out->deck_matrix.grid[c->rank - 2][c->suit];
-            s->discard_count++;
-            s->enhancement_mask |= (1u << c->enhancement);
-            s->modifiers_mask |= (1u << c->edition);
-            s->modifiers_mask |= (1u << (5 + c->seal));
-            if (c->flags & CARD_DEBUFFED) s->modifiers_mask |= (1u << 10);
+        const Card *market_zones[2] = {state->shop_vouchers, state->shop_boosters};
+        uint8_t market_counts[2] = {state->shop_voucher_count, state->shop_booster_count};
+        MarketCardView *market_outputs[2] = {out->market.vouchers, out->market.boosters};
+        for (int zone = 0; zone < 2; ++zone) {
+            for (uint8_t i = 0; i < market_counts[zone]; ++i) {
+                const Card *card = &market_zones[zone][i];
+                market_outputs[zone][i] = (MarketCardView){
+                    .center_id = card->center_id,
+                    .cost = card->cost,
+                    .sell_cost = card->sell_cost,
+                };
+            }
         }
-        if (c->enhancement != ENHANCEMENT_NONE && c->enhancement < 9)
-            out->deck_matrix.discard_enhancements[c->enhancement]++;
     }
-    out->deck_matrix.total_deck_size = state->deck_count + state->hand_count + state->discard_count;
-
-    // Poker hands
-    for (uint8_t hand = 0; hand < HAND_COUNT; ++hand)
-        observation_poker_hand(state, hand, &out->poker_hands[hand]);
-
-    // Tokens packing (Phase-First Floors)
-    uint8_t token_idx = 0;
-
-    // 0: Hand
-    out->hand_count = state->hand_count;
-    for (uint8_t i = 0; i < state->hand_count && token_idx < MAX_OBS_TOKENS; ++i)
-        write_card_token(&out->tokens[token_idx++], &state->hand[i], ZONE_HAND, 1);
-
-    // 1: Jokers
-    out->joker_count = state->joker_count;
-    for (uint8_t i = 0; i < state->joker_count && token_idx < MAX_OBS_TOKENS; ++i)
-        write_card_token(&out->tokens[token_idx++], &state->jokers[i], ZONE_JOKER, 0);
-
-    // 2: Consumables
-    out->consumable_count = state->consumable_count;
-    for (uint8_t i = 0; i < state->consumable_count && token_idx < MAX_OBS_TOKENS; ++i)
-        write_card_token(&out->tokens[token_idx++], &state->consumables[i], ZONE_CONSUMABLE, 0);
-
-    // 3: Shop Main
-    out->shop_count = state->shop_main_count;
-    for (uint8_t i = 0; i < state->shop_main_count && token_idx < MAX_OBS_TOKENS; ++i) {
-        uint8_t set = card_set(&state->shop_main[i]);
-        int is_playing = set == SET_DEFAULT || set == SET_ENHANCED;
-        write_card_token(&out->tokens[token_idx++], &state->shop_main[i], ZONE_SHOP_MAIN, is_playing);
-    }
-
-    // 4: Shop Vouchers
-    out->voucher_count = state->shop_voucher_count;
-    for (uint8_t i = 0; i < state->shop_voucher_count && token_idx < MAX_OBS_TOKENS; ++i)
-        write_card_token(&out->tokens[token_idx++], &state->shop_vouchers[i], ZONE_SHOP_VOUCHER, 0);
-
-    // 5: Shop Boosters
-    out->booster_count = state->shop_booster_count;
-    for (uint8_t i = 0; i < state->shop_booster_count && token_idx < MAX_OBS_TOKENS; ++i)
-        write_card_token(&out->tokens[token_idx++], &state->shop_boosters[i], ZONE_SHOP_BOOSTER, 0);
-
-    // 6: Pack Cards
-    out->pack_count = state->pack_count;
-    for (uint8_t i = 0; i < state->pack_count && token_idx < MAX_OBS_TOKENS; ++i) {
-        uint8_t set = card_set(&state->pack_cards[i]);
-        int is_playing = set == SET_PLAYING || set == SET_ENHANCED;
-        write_card_token(&out->tokens[token_idx++], &state->pack_cards[i], ZONE_PACK_CARD, is_playing);
-    }
-
-    out->total_tokens = token_idx;
 
     return legal_masks(state, legal);
 }
@@ -3843,6 +3922,20 @@ static void finish_blind(State *state) {
     state->dollars += gold_hand_bonus;
     state->round_earnings = calculate_round_earnings(state) + tag_eval_bonus;
     state->blind_disabled = 1;
+    /* Beating a blind whose requirement is not representable (+Inf) ends the
+       run as a win: there is nothing further that arithmetic can ask for.
+       Scoring naneinf (+Inf chips) is likewise an immediate win, since an
+       infinite score clears any representable blind and matches an
+       infinite one. NOTE: both halves diverge from base Balatro, where
+       ante 39 is an impassable wall (comparisons against the non-finite
+       requirement always fail, so the run dies there). Our engine counts
+       either clear as a win for reward sake instead. This is the naneinf
+       half of the victory condition, whichever comes first versus
+       ante > win_ante at cash-out. */
+    if (!isfinite(state->blind_chips) || isinf(state->chips)) {
+        state->won = state->terminal = 1;
+        state->phase = PHASE_GAME_OVER;
+    }
 }
 
 
@@ -4099,7 +4192,10 @@ static void play_or_discard(State *state, const Action *action) {
         state->chips += state->last_hand_score;
         state->hands_played++;
         state->run_hands_played++;
-        if (state->chips - state->blind_chips >= 0.0)
+        /* Direct comparison: identical to the subtraction for finite values
+           and additionally true for +Inf chips against a +Inf requirement
+           (where the subtraction yields NaN). NaN never satisfies it. */
+        if (state->chips >= state->blind_chips)
             finish_blind(state);
         else if (state->hands_left == 0) {
             int saved = 0;
@@ -4163,6 +4259,11 @@ void default_config(Config *config) {
         .win_bonus = 10.0f,
         .loss_penalty = 0.25f,
         .money_reward = 0.0f,
+        .ante_escalation = 0.0f,
+        .headroom_reward = 0.0f,
+        .interest_reward = 0.0f,
+        .eff_reward = 0.0f,
+        .power_reward = 0.0f,
     };
 }
 

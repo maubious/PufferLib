@@ -1017,7 +1017,9 @@ __global__ void sample_logits_balatro(
         curandStatePhilox4_32_10_t* rng_states,
         precision_t* action_mask,              // (B, A_total)
         int mask_stride,
-        const precision_t* condition) {
+        const precision_t* condition,
+        const precision_t* keys,
+        const int* counts) {
     constexpr int WARP = 32;
     constexpr int WARPS = BLOCK_SIZE / WARP;
     int lane = threadIdx.x & (WARP - 1);
@@ -1088,7 +1090,9 @@ __global__ void sample_logits_balatro(
             if (sampled < 0) sampled = 0;
             actions[action_base] = from_float((float)sampled);
             total_log_prob += s_cache[warp][sampled] - logsumexp0;
-            s_ar[warp] = ar_ctx_init(action_mask, mask_base, actions, action_base);
+            s_ar[warp] = ar_ctx_init(action_mask, mask_base, actions,
+                action_base, keys + (int64_t)idx * BA_KEY_CAP * BA_KEY_DIM,
+                counts + idx * BA_POOL_SECTIONS);
         }
         __syncwarp();
         logits_offset += A0;
@@ -1148,7 +1152,9 @@ __global__ void sample_logits_balatro(
                 if (sampled < 0) sampled = 0;
                 actions[action_base + 1] = from_float((float)sampled);
                 total_log_prob += s_cache[warp][sampled] - logsumexp1;
-                s_ar[warp] = ar_ctx_init(action_mask, mask_base, actions, action_base);
+                s_ar[warp] = ar_ctx_init(action_mask, mask_base, actions,
+                    action_base, keys + (int64_t)idx * BA_KEY_CAP * BA_KEY_DIM,
+                    counts + idx * BA_POOL_SECTIONS);
             }
             __syncwarp();
         }
@@ -1543,6 +1549,8 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         int hc_stride_s = 0;
         const signed char* hc_dev_s = get_head_consume_dev(&hc_stride_s);
 #ifdef BALATRO_POINTER_DECODER
+        BalatroDecoderActivations* decoder =
+            (BalatroDecoderActivations*)acts->decoder;
         constexpr int sample_warps = BLOCK_SIZE / 32;
         int sample_blocks = (n + sample_warps - 1) / sample_warps;
         sample_logits_balatro<<<sample_blocks, BLOCK_SIZE, 0, stream>>>(
@@ -1550,7 +1558,8 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
             act_b.data, lp_b.data, val_b.data,
             pufferl->rng_states[buf] + off,
             mask_b.data, mask_stride,
-            dw->condition.data);
+            dw->condition.data, decoder->enc->keys.data,
+            decoder->enc->counts.data);
 #else
         sample_logits<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
             dec, p_logstd, pufferl->act_sizes,
@@ -2394,6 +2403,10 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         DecoderWeights* dw_train = (DecoderWeights*)primary->weights.decoder;
         DecoderActivations* da_train =
             (DecoderActivations*)pufferl->train_activs.decoder;
+#ifdef BALATRO_POINTER_DECODER
+        BalatroDecoderActivations* decoder_train =
+            (BalatroDecoderActivations*)pufferl->train_activs.decoder;
+#endif
         Prec p_logstd = {};
         if (dw_train->continuous) {
             p_logstd = dw_train->logstd;
@@ -2422,7 +2435,14 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             pufferl->ppo_bufs.ent_coef,
             pufferl->ppo_bufs, pufferl->is_continuous,
             dw_train->condition, da_train->condition_accum,
-            da_train->condition_scratch, da_train->cond_accum_parts, stream);
+            da_train->condition_scratch, da_train->cond_accum_parts,
+#ifdef BALATRO_POINTER_DECODER
+            decoder_train->enc->keys, decoder_train->enc->counts,
+            decoder_train->enc->key_grad,
+#else
+            Prec(), Int(), Float(),
+#endif
+            stream);
 
         Float grad_logits = pufferl->ppo_bufs.grad_logits;
         Float grad_logstd = pufferl->is_continuous

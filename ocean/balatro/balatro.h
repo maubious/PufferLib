@@ -107,6 +107,7 @@ typedef struct Client {
 
     bool paused;
     bool show_run_menu;
+    bool show_controls_menu;
     int step_delay_frames;
     int step_cooldown;
     ScoreAnim score_anim;
@@ -123,12 +124,16 @@ typedef struct Log {
 	float n;
 	/* Episode-end state snapshots (autopsy), summed at terminal. */
 	float end_dollars;
-	float end_dollars_won;
-	float end_jokers;
-	float end_consumables;
 	float end_hand_levels;
 	float end_deck;
 	float ep_length;
+	float reorder_hand;
+	float reorder_joker;
+	float planets_bought;
+	float planets_used;
+	float celestial_packs_opened;
+	float cleared_ante_8;
+	float deaths_ante[16];
 	float action_counts[ACTION_TYPE_COUNT];
 } Log;
 
@@ -181,15 +186,20 @@ typedef struct Env {
 static inline void log_episode_end(Env *env, int won) {
     const State *state = &env->state;
     env->log.end_dollars += (float)state->dollars;
-    if (won) env->log.end_dollars_won += (float)state->dollars;
-    env->log.end_jokers += (float)state->joker_count;
-    env->log.end_consumables += (float)state->consumable_count;
     float hand_levels = 0.0f;
     for (int i = 0; i < HAND_COUNT; ++i)
         hand_levels += (float)state->hand_levels[i];
     env->log.end_hand_levels += hand_levels;
-    env->log.end_deck += (float)state->deck_count;
+    env->log.end_deck += (float)(state->deck_count + state->hand_count + state->discard_count);
     env->log.ep_length += (float)env->episode_steps;
+
+    if (state->ante >= 9) {
+        env->log.cleared_ante_8 += 1.0f;
+    }
+    int ante_idx = (int)state->ante - 1;
+    if (ante_idx < 0) ante_idx = 0;
+    if (ante_idx > 15) ante_idx = 15;
+    env->log.deaths_ante[ante_idx] += 1.0f;
 }
 
 static inline void store_u64(unsigned char *out, uint64_t value) {
@@ -229,16 +239,6 @@ static int puffer_observe(Env *env) {
             env->agents[0].action_mask[type] = 1;
             store_u64(env->agents[0].action_mask + POLICY_PRIMARY_OFFSET +
                 type * POLICY_PRIMARY_BYTES, primaries);
-        }
-        /* Per-option card attrs for the AR selection heads: (suit << 4) | rank per
-           hand slot. Zero past hand_count; options are masked illegal there. */
-        int attr_n = env->state.hand_count < POLICY_CARD_ATTR_BYTES
-            ? env->state.hand_count : POLICY_CARD_ATTR_BYTES;
-        for (int i = 0; i < attr_n; ++i) {
-            if (env->state.hand[i].flags & CARD_FACEDOWN) continue;
-            env->agents[0].action_mask[POLICY_CARD_ATTR_OFFSET + i] =
-                (unsigned char)((env->state.hand[i].suit << POLICY_CARD_ATTR_SUIT_SHIFT)
-                    | (env->state.hand[i].rank & POLICY_CARD_ATTR_RANK_MASK));
         }
         store_selection(env->agents[0].action_mask,
             policy_selection_entry(ACTION_PLAY_HAND, 0),
@@ -380,6 +380,11 @@ void puf_init(Env *env, Dict *kwargs) {
     FLOAT_REWARD_OPT("win_bonus", win_bonus, >=);
     FLOAT_REWARD_OPT("loss_penalty", loss_penalty, >=);
     FLOAT_REWARD_OPT("money_reward", money_reward, >=);
+    FLOAT_REWARD_OPT("ante_escalation", ante_escalation, >=);
+    FLOAT_REWARD_OPT("headroom_reward", headroom_reward, >=);
+    FLOAT_REWARD_OPT("interest_reward", interest_reward, >=);
+    FLOAT_REWARD_OPT("eff_reward", eff_reward, >=);
+    FLOAT_REWARD_OPT("power_reward", power_reward, >=);
 #undef FLOAT_REWARD_OPT
     assert(env->config.blind_bonus <= 0.5f);
     env->config.shaped_reward = shaped ? (shaped->value != 0.0) : 1;
@@ -484,6 +489,11 @@ static void capture_consumable(Client *client, const State *state, const Action 
 static void start_consumable(Client *client, const State *state);
 
 void puf_step(Env *env) {
+    if (env->client && env->client->paused) {
+        env->agents[0].rewards[0] = 0.0f;
+        env->agents[0].terminals[0] = 0.0f;
+        return;
+    }
     if (env->client && (env->client->score_anim.active || env->client->consumable_anim.active)) {
         env->agents[0].rewards[0] = 0.0f;
         env->agents[0].terminals[0] = 0.0f;
@@ -604,6 +614,7 @@ void puf_step(Env *env) {
             if (old != i) joker_identity = 0;
         }
         if (!hand_identity) {
+            env->log.reorder_hand += 1.0f;
             Card hand_copy[OBS_MAX_HAND];
             for (int i = 0; i < hand_count; ++i)
                 hand_copy[i] = env->state.hand[hand_order[i]];
@@ -621,6 +632,7 @@ void puf_step(Env *env) {
             }
         }
         if (!joker_identity) {
+            env->log.reorder_joker += 1.0f;
             Card joker_copy[OBS_MAX_JOKERS];
             for (int i = 0; i < joker_count; ++i)
                 joker_copy[i] = env->state.jokers[joker_order[i]];
@@ -634,6 +646,32 @@ void puf_step(Env *env) {
     if (env->episode_steps < UINT32_MAX) env->episode_steps++;
     if (policy.type < ACTION_TYPE_COUNT)
         env->log.action_counts[policy.type] += 1.0f;
+    if (action_is_legal &&
+        (policy.type == ACTION_BUY_CARD || policy.type == ACTION_BUY_AND_USE)) {
+        uint16_t center = env->state.shop_main[policy.primary].center_id;
+        if (planet_hand(center) < HAND_COUNT)
+            env->log.planets_bought += 1.0f;
+    }
+    if (action_is_legal && policy.type == ACTION_USE_CONSUMABLE) {
+        uint16_t center = env->state.consumables[policy.primary].center_id;
+        if (planet_hand(center) < HAND_COUNT)
+            env->log.planets_used += 1.0f;
+    }
+    if (action_is_legal && policy.type == ACTION_BUY_AND_USE) {
+        uint16_t center = env->state.shop_main[policy.primary].center_id;
+        if (planet_hand(center) < HAND_COUNT)
+            env->log.planets_used += 1.0f;
+    }
+    if (action_is_legal && policy.type == ACTION_PICK_PACK_CARD) {
+        uint16_t center = env->state.pack_cards[policy.primary].center_id;
+        if (planet_hand(center) < HAND_COUNT)
+            env->log.planets_used += 1.0f;
+    }
+    if (action_is_legal && policy.type == ACTION_OPEN_BOOSTER) {
+        uint16_t center = env->state.shop_boosters[policy.primary].center_id;
+        if (center >= CENTER_P_CELESTIAL_JUMBO_1 && center <= CENTER_P_CELESTIAL_NORMAL_4)
+            env->log.celestial_packs_opened += 1.0f;
+    }
     if (action_is_legal && policy.type == ACTION_PLAY_HAND && env->client) {
         score_anim_capture(env->client, &env->state, &policy);
     }
@@ -712,12 +750,37 @@ void puf_log(Log *log, Dict *out) {
 	dict_set(out, "invalid_actions", log->invalid_actions);
 	dict_set(out, "truncations", log->truncations);
     dict_set(out, "end_dollars", log->end_dollars);
-    dict_set(out, "end_dollars_won", log->end_dollars_won);
-    dict_set(out, "end_jokers", log->end_jokers);
-    dict_set(out, "end_consumables", log->end_consumables);
     dict_set(out, "end_hand_levels", log->end_hand_levels);
     dict_set(out, "end_deck", log->end_deck);
     dict_set(out, "ep_length", log->ep_length);
+    dict_set(out, "cleared_ante_8", log->cleared_ante_8);
+
+    static const char *const deaths_ante_names[16] = {
+        "deaths/ante_1",
+        "deaths/ante_2",
+        "deaths/ante_3",
+        "deaths/ante_4",
+        "deaths/ante_5",
+        "deaths/ante_6",
+        "deaths/ante_7",
+        "deaths/ante_8",
+        "deaths/ante_9",
+        "deaths/ante_10",
+        "deaths/ante_11",
+        "deaths/ante_12",
+        "deaths/ante_13",
+        "deaths/ante_14",
+        "deaths/ante_15",
+        "deaths/ante_16_plus",
+    };
+    for (int i = 0; i < 16; ++i)
+        dict_set(out, deaths_ante_names[i], log->deaths_ante[i]);
+
+    dict_set(out, "reorders/hand", log->reorder_hand);
+    dict_set(out, "reorders/joker", log->reorder_joker);
+    dict_set(out, "planets/bought", log->planets_bought);
+    dict_set(out, "planets/used", log->planets_used);
+    dict_set(out, "planets/celestial_packs_opened", log->celestial_packs_opened);
 
     for (int i = 0; i < ACTION_TYPE_COUNT; ++i)
         dict_set(out, action_log_names[i], log->action_counts[i]);

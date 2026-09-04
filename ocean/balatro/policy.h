@@ -15,16 +15,7 @@
     (POLICY_PRIMARY_OFFSET + POLICY_PRIMARY_BYTES * ACTION_TYPE_COUNT)
 #define POLICY_SELECTION_SIZE \
     (POLICY_SELECTION_OFFSET + POLICY_SELECTION_ENTRIES * POLICY_SELECTION_BYTES)
-/* Per-option card attributes for the AR selection heads: one byte per hand
-   slot, (suit << 4) | rank, written by the env from the live hand. Lets the
-   decoder condition selection scores on the set's suit/rank structure
-   (flush / straight / pair completion) instead of only the last card. */
-#define POLICY_CARD_ATTR_OFFSET POLICY_SELECTION_SIZE
-#define POLICY_CARD_ATTR_BYTES 64
-#define POLICY_CARD_ATTR_SUIT_SHIFT 4
-#define POLICY_CARD_ATTR_RANK_MASK 0x0F
-#define POLICY_ORDER_META_OFFSET \
-    (POLICY_CARD_ATTR_OFFSET + POLICY_CARD_ATTR_BYTES)
+#define POLICY_ORDER_META_OFFSET POLICY_SELECTION_SIZE
 #define POLICY_ORDER_META_BYTES 4
 #define POLICY_ORDER_HAND_COUNT_OFFSET POLICY_ORDER_META_OFFSET
 #define POLICY_ORDER_JOKER_COUNT_OFFSET (POLICY_ORDER_META_OFFSET + 1)
@@ -32,41 +23,21 @@
 #define POLICY_MASK_SIZE \
     (POLICY_ORDER_META_OFFSET + POLICY_ORDER_META_BYTES)
 
-/* Factored low-rank prefix embedding parameter layout (Redesign A).
-   Replaces combinatorial sparse tables with continuous prefix embeddings
-   and head projections (AR_EMBED_DIM=16). */
+/* Prefix context parameters. Candidate and selected-item content comes from
+   the encoder keys; these tables encode only action grammar and set shape. */
 #define AR_EMBED_DIM 16
 
 #define AR_E_TYPE_OFFSET    0
-#define AR_E_TYPE_SIZE      (ACTION_TYPE_COUNT * AR_EMBED_DIM)   /* 23 * 16 = 368 */
-#define AR_E_PRIMARY_OFFSET (AR_E_TYPE_OFFSET + AR_E_TYPE_SIZE)
-#define AR_E_PRIMARY_SIZE   (64 * AR_EMBED_DIM)                  /* 64 * 16 = 1024 */
-#define AR_E_COUNT_OFFSET   (AR_E_PRIMARY_OFFSET + AR_E_PRIMARY_SIZE)
-#define AR_E_COUNT_SIZE     (6 * AR_EMBED_DIM)                   /* 6 * 16 = 96 */
-#define AR_E_CARD_OFFSET    (AR_E_COUNT_OFFSET + AR_E_COUNT_SIZE)
-#define AR_E_CARD_SIZE      (64 * AR_EMBED_DIM)                  /* 64 * 16 = 1024 */
-#define AR_E_POS_OFFSET     (AR_E_CARD_OFFSET + AR_E_CARD_SIZE)
-#define AR_E_POS_SIZE       (5 * AR_EMBED_DIM)                   /* 5 * 16 = 80 */
-#define AR_E_SUIT_OFFSET    (AR_E_POS_OFFSET + AR_E_POS_SIZE)
-#define AR_E_SUIT_SIZE      (5 * AR_EMBED_DIM)                   /* 5 * 16 = 80 */
-#define AR_E_RANK_OFFSET    (AR_E_SUIT_OFFSET + AR_E_SUIT_SIZE)
-#define AR_E_RANK_SIZE      (5 * AR_EMBED_DIM)                   /* 5 * 16 = 80 */
-#define AR_E_RUN_OFFSET     (AR_E_RANK_OFFSET + AR_E_RANK_SIZE)
-#define AR_E_RUN_SIZE       (5 * AR_EMBED_DIM)                   /* 5 * 16 = 80 */
-
-#define AR_W_PRIMARY_OFFSET (AR_E_RUN_OFFSET + AR_E_RUN_SIZE)
-#define AR_W_PRIMARY_SIZE   (64 * AR_EMBED_DIM)                  /* 64 * 16 = 1024 */
-#define AR_W_COUNT_OFFSET   (AR_W_PRIMARY_OFFSET + AR_W_PRIMARY_SIZE)
-#define AR_W_COUNT_SIZE     (6 * AR_EMBED_DIM)                   /* 6 * 16 = 96 */
-#define AR_W_CARD_OFFSET    (AR_W_COUNT_OFFSET + AR_W_COUNT_SIZE)
-#define AR_W_CARD_SIZE      (64 * AR_EMBED_DIM)                  /* 64 * 16 = 1024 */
-
-#define AR_W_ORDER_HAND_OFFSET (AR_W_CARD_OFFSET + AR_W_CARD_SIZE)
-#define AR_W_ORDER_HAND_SIZE   (64 * AR_EMBED_DIM)
-#define AR_W_ORDER_JOKER_OFFSET (AR_W_ORDER_HAND_OFFSET + AR_W_ORDER_HAND_SIZE)
-#define AR_W_ORDER_JOKER_SIZE   (32 * AR_EMBED_DIM)
-
-#define AR_CONDITION_SIZE   (AR_W_ORDER_JOKER_OFFSET + AR_W_ORDER_JOKER_SIZE)
+#define AR_E_TYPE_SIZE      (ACTION_TYPE_COUNT * AR_EMBED_DIM)
+#define AR_E_COUNT_OFFSET   (AR_E_TYPE_OFFSET + AR_E_TYPE_SIZE)
+#define AR_E_COUNT_SIZE     (6 * AR_EMBED_DIM)
+#define AR_E_POS_OFFSET     (AR_E_COUNT_OFFSET + AR_E_COUNT_SIZE)
+#define AR_E_POS_SIZE       (5 * AR_EMBED_DIM)
+#define AR_W_COUNT_OFFSET   (AR_E_POS_OFFSET + AR_E_POS_SIZE)
+#define AR_W_COUNT_SIZE     (6 * AR_EMBED_DIM)
+#define AR_GATE_OFFSET      (AR_W_COUNT_OFFSET + AR_W_COUNT_SIZE)
+#define AR_GATE_SIZE        (ACTION_TYPE_COUNT * AR_EMBED_DIM)
+#define AR_CONDITION_SIZE   (AR_GATE_OFFSET + AR_GATE_SIZE)
 /* Standalone CPU eval (puffercpu.h) aliases the trainer's condition size. */
 #define BALATRO_AR_CONDITION_SIZE AR_CONDITION_SIZE
 

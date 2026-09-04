@@ -214,6 +214,11 @@ typedef struct Config {
     float win_bonus;
     float loss_penalty;
     float money_reward; /* x dollar change per step (economy shaping) */
+    float ante_escalation; /* convex multiplier per ante: ante_bonus * (1 + ante_escalation * (ante - 1)) */
+    float headroom_reward; /* log10(score / blind) bonus on blind win */
+    float interest_reward; /* cashout bonus for maintaining bankroll up to interest cap */
+    float eff_reward;      /* hand conservation bonus on blind win (hands_left / total_hands) */
+    float power_reward;    /* high-pass log-power: max(0, log10(score) - 4.0) */
 } Config;
 
 typedef struct RngStream {
@@ -255,6 +260,7 @@ typedef struct State {
     double last_hand_score;
     double last_hand_chips;
     double last_hand_mult;
+    double peak_hand_log;
     int32_t reroll_cost;
     int32_t round_earnings;
     int16_t interest_cap;
@@ -352,8 +358,6 @@ typedef struct State {
     uint64_t joker_active_flags;
 } State;
 
-#define MAX_OBS_TOKENS 128
-
 typedef enum ItemZone {
     ZONE_HAND = 0,
     ZONE_JOKER = 1,
@@ -398,46 +402,108 @@ static inline const SelectionContract *cached_selection(
 }
 
 #pragma pack(push, 1)
-typedef struct CardToken {
-    uint16_t id;          // Playing card: (rank << 8 | suit) | Consumable/Joker/Voucher: center_id
-    uint8_t  zone;        // ItemZone enum
-    uint8_t  enhancement; // ENHANCEMENT_* (0..8)
-    uint8_t  edition;     // EDITION_* (0..4)
-    uint8_t  seal;        // SEAL_* (0..4)
-    uint8_t  flags;       // Debuffed, Eternal, Perishable, Rental, Forced
-    int8_t   sell_cost;   // Exact sell value
-    int16_t  perma_bonus; // Permanent bonus chips on playing card (Hiker, Stone)
-    int32_t  state0;      // Primary dynamic state (chips, mult, countdown, rank)
-    int32_t  state1;      // Secondary dynamic state (chips, suit, active flag)
-} CardToken;
+enum {
+    PUBLIC_CARD_DEBUFFED = 1u << 0,
+    PUBLIC_CARD_ETERNAL = 1u << 1,
+    PUBLIC_CARD_PERISHABLE = 1u << 2,
+    PUBLIC_CARD_RENTAL = 1u << 3,
+    PUBLIC_CARD_FORCED = 1u << 4,
+    PUBLIC_CARD_FACEDOWN = 1u << 5,
+    PUBLIC_CARD_PLAYED_THIS_ANTE = 1u << 6,
+};
 
-typedef struct DeckSlot {
-    uint8_t  draw_count;       // Count in draw pile
-    uint8_t  hand_count;       // Count in current hand
-    uint8_t  discard_count;    // Count in discard pile
-    uint8_t  _pad;
-    uint16_t enhancement_mask; // Bitmask of present enhancements (1 << enh)
-    uint16_t modifiers_mask;   // Bits 0..4: Edition mask, Bits 5..9: Seal mask, Bit 10: Debuffed
-} DeckSlot;
+typedef struct PlayingCardView {
+    uint16_t attributes;
+    uint8_t flags;
+    int16_t perma_bonus;
+} PlayingCardView;
 
-typedef struct DeckMatrix {
-    DeckSlot grid[13][4];             // 13 ranks (2..14) x 4 suits (0..3) = 52 * 8 = 416 bytes
-    uint16_t draw_enhancements[9];    // Total of each enhancement remaining in draw pile
-    uint16_t discard_enhancements[9]; // Total of each enhancement in discard pile
-    uint16_t total_deck_size;         // Total cards in (deck + hand + discard)
-} DeckMatrix;
+typedef struct DeckCardView {
+    PlayingCardView card;
+    uint8_t location;
+} DeckCardView;
+
+typedef struct JokerView {
+    uint16_t center_id;
+    uint8_t edition;
+    uint8_t flags;
+    int16_t cost;
+    int16_t sell_cost;
+    int32_t state[4];
+} JokerView;
+
+typedef struct ConsumableView {
+    uint16_t center_id;
+    uint8_t edition;
+    uint8_t flags;
+    int16_t cost;
+    int16_t sell_cost;
+} ConsumableView;
+
+typedef struct OfferView {
+    uint16_t center_id;
+    uint8_t rank;
+    uint8_t suit;
+    uint8_t enhancement;
+    uint8_t edition;
+    uint8_t seal;
+    uint8_t flags;
+    int16_t perma_bonus;
+    int16_t cost;
+    int16_t sell_cost;
+    int32_t state[4];
+} OfferView;
+
+typedef struct MarketCardView {
+    uint16_t center_id;
+    int16_t cost;
+    int16_t sell_cost;
+} MarketCardView;
+
+typedef struct PlainDeckView {
+    uint16_t unseen;
+    uint16_t discard;
+    uint16_t played_unseen;
+    uint16_t played_discard;
+} PlainDeckView;
 
 typedef struct ObservationGlobals {
-    uint16_t deck_id;
     uint16_t blind_id;
     uint16_t next_boss_id;
     uint16_t next_voucher_id;
+    uint16_t pending_free_pack_id;
     uint16_t last_tarot_planet;
+    uint64_t redeemed_vouchers_mask;
+
+    float joker_rate;
+    float tarot_rate;
+    float planet_rate;
+    float spectral_rate;
+    float playing_card_rate;
+    float edition_rate;
+
+    int32_t dollars;
+    int32_t reroll_cost;
+    int32_t round_earnings;
+    uint32_t run_hands_played;
+
+    uint16_t unused_discards;
+    uint16_t tarots_used;
+    uint16_t planet_usage_mask;
+    uint16_t blind_hands_mask;
+    int16_t interest_cap;
+    int8_t interest_amount;
+    int8_t rental_rate;
+    int8_t blind_reward;
+
+    uint8_t  deck_id;
     uint8_t  stake;
+    uint8_t  win_ante;
+    uint8_t  stake_scaling;
     uint8_t  phase;
+    uint8_t  blind_on_deck;
     uint8_t  ante;
     uint8_t  round;
-    uint8_t  blind_on_deck;
     uint8_t  blind_disabled;
     uint8_t  blind_only_hand;
     uint8_t  blind_skipped_mask;
@@ -450,9 +516,26 @@ typedef struct ObservationGlobals {
     uint8_t  hands_per_round;
     uint8_t  discards_per_round;
     uint8_t  base_hand_size;
+    uint8_t  hand_size;
+    uint8_t  joker_slots;
+    uint8_t  consumable_slots;
+    uint8_t  skips;
+    uint8_t  pack_choices;
     uint8_t  pack_kind;
+    uint8_t  shop_return_phase;
+    uint8_t  first_shop_buffoon;
+    uint8_t  shop_joker_max;
+    uint8_t  ancient_suit;
+    uint8_t  idol_rank;
+    uint8_t  idol_suit;
+    uint8_t  mail_rank;
+    uint8_t  castle_suit;
+    uint8_t  most_played_hand;
+    uint8_t  last_hand_type;
     uint8_t  double_tag;
     uint8_t  active_tag;
+    uint8_t  blind_tags[2];
+    uint8_t  orbital_hands[3];
     uint8_t  tag_hand_bonus;
     uint8_t  tag_force_rarity;
     uint8_t  tag_force_rarity_count;
@@ -461,70 +544,61 @@ typedef struct ObservationGlobals {
     uint8_t  tag_voucher_pending;
     uint8_t  tag_coupon_pending;
     uint8_t  tag_coupon_active;
+    uint8_t  tag_saved_discount;
     uint8_t  tag_investment_pending;
     uint8_t  tag_d_six_pending;
     uint8_t  tag_d_six_active;
     uint8_t  ecto_penalty;
     uint8_t  gros_michel_extinct;
-    uint8_t  hand_size;
-    uint8_t  joker_slots;
-    uint8_t  consumable_slots;
-    uint8_t  skips;
-    uint8_t  pack_choices;
-    uint8_t  unused_discards;
-    uint8_t  most_played_hand;
-    uint8_t  last_hand_type;
-    uint8_t  blind_tags[2];
-    uint8_t  orbital_hands[2];
-    uint16_t hands_left;
-    uint16_t discards_left;
-    uint16_t hands_played;
-    uint16_t discards_used;
-    uint16_t blind_hands_mask;
-    uint16_t tarots_used;
-    uint16_t planet_usage_mask;
-    uint32_t run_hands_played;
-    int32_t  dollars;
-    int32_t  reroll_cost;
-    int32_t  round_earnings;
-    float    chips_log2;
-    float    blind_chips_log2;
-    float    last_hand_score_log2;
-    float    chips_over_blind_log2;
-    uint16_t interest_cap;
-    uint16_t interest_amount;
-    uint16_t blind_reward;
-    uint8_t  joker_rate;
-    uint8_t  tarot_rate;
-    uint8_t  planet_rate;
-    uint8_t  spectral_rate;
-    uint8_t  playing_card_rate;
-    uint8_t  edition_rate;
-    uint64_t redeemed_vouchers_mask;
+    uint8_t  hands_left;
+    uint8_t  discards_left;
+    uint8_t  hands_played;
+    uint8_t  discards_used;
+
+    float score_features[6];
 } ObservationGlobals;
 
 typedef struct PokerHandStat {
-    uint8_t  visible;
     uint8_t  level;
+    uint8_t  visible;
     uint16_t total_plays;
-    uint16_t round_plays;
+    uint8_t  round_plays;
     float    chips_log2;
     float    mult_log2;
 } PokerHandStat;
 
+typedef struct ObservationCounts {
+    uint16_t deck_count;
+    uint16_t discard_count;
+    uint16_t special_count;
+    uint16_t total_playing_cards;
+    uint8_t hand_count;
+    uint8_t joker_count;
+    uint8_t consumable_count;
+    uint8_t shop_count;
+    uint8_t voucher_count;
+    uint8_t booster_count;
+    uint8_t pack_count;
+} ObservationCounts;
+
+typedef struct MarketView {
+    OfferView shop[OBS_MAX_SHOP_MAIN];
+    MarketCardView vouchers[OBS_MAX_SHOP_VOUCHERS];
+    MarketCardView boosters[OBS_MAX_SHOP_BOOSTERS];
+    OfferView pack[MAX_PACK_CARDS];
+} MarketView;
+
 typedef struct Observation {
     ObservationGlobals globals;
-    DeckMatrix         deck_matrix;
-    PokerHandStat      poker_hands[HAND_COUNT];
-    uint8_t            hand_count;
-    uint8_t            joker_count;
-    uint8_t            consumable_count;
-    uint8_t            shop_count;
-    uint8_t            voucher_count;
-    uint8_t            booster_count;
-    uint8_t            pack_count;
-    uint8_t            total_tokens;
-    CardToken          tokens[MAX_OBS_TOKENS];
+    PlainDeckView plain_deck[13][4];
+    PokerHandStat poker_hands[HAND_COUNT];
+    ObservationCounts counts;
+    DeckCardView specials[OBS_MAX_PLAYING_CARDS];
+    JokerView jokers[OBS_MAX_JOKERS];
+    ConsumableView consumables[OBS_MAX_CONSUMABLES];
+    PlayingCardView hand[OBS_MAX_HAND];
+    MarketView market;
+    uint8_t alignment[7];
 } Observation;
 #pragma pack(pop)
 
@@ -540,6 +614,7 @@ void default_config(Config *config);
 int init(State *state, const Config *config, uint64_t seed);
 int apply_step(State *state, const Action *action, const LegalMasks *masks, StepResult *out);
 int can_afford(const State *state, int32_t cost);
+HandType planet_hand(uint16_t center_id);
 
 int observe(const State *state, Observation *out, LegalMasks *legal);
 uint64_t state_hash(const State *state);

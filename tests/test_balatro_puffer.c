@@ -297,6 +297,12 @@ int main(void) {
         actions[BALATRO_ORDER_JOKER_OFFSET + i] = (float)(1 - i);
     Client render_client = {0};
     env.client = &render_client;
+    render_client.paused = true;
+    puf_step(&env);
+    assert(env.state.joker_count == 2);
+    assert(reward == 0.0f);
+    assert(terminal == 0.0f);
+    render_client.paused = false;
     puf_step(&env);
     env.client = NULL;
     assert(fabsf(reward - 0.1f * 4.0f) < 1e-6f);
@@ -485,5 +491,186 @@ int main(void) {
     assert(env.state.deck_count == 38);
     printf("serpent: initial 8, +3 after play, +3 after discard, hand grows to %d\n",
            env.state.hand_count);
+
+    /* Drawing a face-down card must not reveal its identity by subtracting
+       consecutive deck observations. It remains in the anonymous unseen
+       multiset while its hand slot exposes only the facedown flag. Exercise
+       both the plain-card histogram and the explicit modified-card stream. */
+    for (int modified = 0; modified < 2; ++modified) {
+        Config config;
+        default_config(&config);
+        State state;
+        assert(init(&state, &config, (uint64_t)(100 + modified)) == OK);
+        assert(state.hand_count == 0);
+        assert(state.deck_count > 0);
+        Card *source = &state.deck[state.deck_count - 1];
+        if (modified) {
+            source->enhancement = ENHANCEMENT_GLASS;
+            source->edition = EDITION_FOIL;
+            source->seal = SEAL_RED;
+            source->perma_bonus = 17;
+        }
+        Observation before;
+        Observation after;
+        LegalMasks masks;
+        assert(observe(&state, &before, &masks) == OK);
+        Card hidden = *source;
+        state.deck_count--;
+        hidden.flags |= CARD_FACEDOWN;
+        state.hand[state.hand_count++] = hidden;
+        assert(observe(&state, &after, &masks) == OK);
+        assert(memcmp(before.plain_deck, after.plain_deck,
+            sizeof(before.plain_deck)) == 0);
+        assert(before.counts.special_count == after.counts.special_count);
+        assert(memcmp(before.specials, after.specials,
+            sizeof(before.specials)) == 0);
+        assert(after.hand[0].attributes == 0);
+        assert(after.hand[0].perma_bonus == 0);
+    }
+
+    /* Test high-ante reward components */
+    {
+        /* 1. Ante Escalation Test */
+        Config config;
+        default_config(&config);
+        config.shaped_reward = 1;
+        config.progress_reward = 0.0f;
+        config.blind_bonus = 0.2f;
+        config.ante_bonus = 1.0f;
+        config.win_bonus = 0.0f;
+        config.loss_penalty = 0.0f;
+        config.money_reward = 0.0f;
+        config.ante_escalation = 0.25f;
+
+        State state;
+        assert(init(&state, &config, 42) == OK);
+        state.phase = PHASE_SELECTING_HAND;
+        state.blind_on_deck = 2; /* Boss blind */
+        state.ante = 5;
+        state.blind_skipped_mask = 0;
+        state.blind_chips = 1;
+        state.hands_left = 1;
+        state.hand_count = 1;
+        state.hand[0] = (Card){.center_id = CENTER_C_BASE, .rank = 14, .suit = HEARTS, .sort_id = 1};
+
+        Action play = {.type = ACTION_PLAY_HAND, .selection_count = 1, .selection = {0}};
+        StepResult result;
+        assert(apply_step(&state, &play, NULL, &result) == OK);
+        /* Base boss reward: 1.0 - 0.2 * 2 = 0.6.
+           Completed ante was 5. Ante escalation factor: 1.0 + 0.25 * (5 - 1) = 2.0.
+           Expected ante reward = 0.6 * 2.0 = 1.2. */
+        assert(fabsf(result.reward - 1.2f) < 1e-5f);
+
+        /* Ante 8 geometric escalation */
+        State state8;
+        assert(init(&state8, &config, 48) == OK);
+        state8.phase = PHASE_SELECTING_HAND;
+        state8.blind_on_deck = 2;
+        state8.ante = 8;
+        state8.blind_skipped_mask = 0;
+        state8.blind_chips = 1;
+        state8.hands_left = 1;
+        state8.hand_count = 1;
+        state8.hand[0] = (Card){.center_id = CENTER_C_BASE, .rank = 14, .suit = HEARTS, .sort_id = 1};
+        assert(apply_step(&state8, &play, NULL, &result) == OK);
+        /* Ante 8 factor: 1.0 + 0.25 * 4.0 * 1.0 = 2.0 -> 0.6 * 2.0 = 1.2 */
+        assert(fabsf(result.reward - 1.2f) < 1e-5f);
+
+        /* Ante 9 geometric escalation (doubles the ante 8 term) */
+        State state9;
+        assert(init(&state9, &config, 49) == OK);
+        state9.phase = PHASE_SELECTING_HAND;
+        state9.blind_on_deck = 2;
+        state9.ante = 9;
+        state9.blind_skipped_mask = 0;
+        state9.blind_chips = 1;
+        state9.hands_left = 1;
+        state9.hand_count = 1;
+        state9.hand[0] = (Card){.center_id = CENTER_C_BASE, .rank = 14, .suit = HEARTS, .sort_id = 1};
+        assert(apply_step(&state9, &play, NULL, &result) == OK);
+        /* Ante 9 factor: 1.0 + 0.25 * 4.0 * 2.0 = 3.0 -> 0.6 * 3.0 = 1.8 */
+        assert(fabsf(result.reward - 1.8f) < 1e-5f);
+    }
+    {
+        /* 2. High-Pass Log-Power Reward Test */
+        Config config;
+        default_config(&config);
+        config.shaped_reward = 1;
+        config.progress_reward = 0.0f;
+        config.blind_bonus = 0.0f;
+        config.ante_bonus = 0.0f;
+        config.win_bonus = 0.0f;
+        config.loss_penalty = 0.0f;
+        config.power_reward = 0.5f;
+
+        State state;
+        assert(init(&state, &config, 43) == OK);
+        state.phase = PHASE_SELECTING_HAND;
+        state.blind_on_deck = 0;
+        state.ante = 1;
+        state.blind_chips = 10;
+        state.hands_left = 1;
+        state.hand_count = 1;
+        /* Ace of Hearts: score = 16. 16 <= 10000 -> power reward must be 0! */
+        state.hand[0] = (Card){.center_id = CENTER_C_BASE, .rank = 14, .suit = HEARTS, .sort_id = 1};
+
+        Action play = {.type = ACTION_PLAY_HAND, .selection_count = 1, .selection = {0}};
+        StepResult result;
+        assert(apply_step(&state, &play, NULL, &result) == OK);
+        assert(fabsf(result.reward - 0.0f) < 1e-5f);
+        assert(state.peak_hand_log == 0.0);
+    }
+    {
+        /* 3. Hand Efficiency Reward Test */
+        Config config;
+        default_config(&config);
+        config.shaped_reward = 1;
+        config.progress_reward = 0.0f;
+        config.blind_bonus = 0.0f;
+        config.ante_bonus = 0.0f;
+        config.eff_reward = 0.4f;
+
+        State state;
+        assert(init(&state, &config, 44) == OK);
+        state.phase = PHASE_SELECTING_HAND;
+        state.blind_on_deck = 0;
+        state.ante = 1;
+        state.blind_chips = 1;
+        state.hands_left = 4;
+        state.hands_played = 0;
+        state.hand_count = 1;
+        state.hand[0] = (Card){.center_id = CENTER_C_BASE, .rank = 14, .suit = HEARTS, .sort_id = 1};
+
+        Action play = {.type = ACTION_PLAY_HAND, .selection_count = 1, .selection = {0}};
+        StepResult result;
+        assert(apply_step(&state, &play, NULL, &result) == OK);
+        /* During play, hands_left became 3, hands_played became 1.
+           Total hands = 3 + 1 = 4. hands_left = 3.
+           Efficiency = 3 / 4 = 0.75.
+           Expected reward = 0.4 * 0.75 = 0.3. */
+        assert(fabsf(result.reward - 0.3f) < 1e-5f);
+    }
+    {
+        /* 4. Cashout Interest Reward Test */
+        Config config;
+        default_config(&config);
+        config.shaped_reward = 1;
+        config.interest_reward = 0.2f;
+
+        State state;
+        assert(init(&state, &config, 45) == OK);
+        state.phase = PHASE_ROUND_EVAL;
+        state.dollars = 20;
+        state.round_earnings = 5; /* Total dollars after cashout = 25 */
+        state.interest_cap = 25;
+
+        Action cashout = {.type = ACTION_CASH_OUT};
+        StepResult result;
+        assert(apply_step(&state, &cashout, NULL, &result) == OK);
+        /* After cashout, state.dollars = 25, interest_cap = 25.
+           Reward = 0.2 * (25 / 25) = 0.2. */
+        assert(fabsf(result.reward - 0.2f) < 1e-5f);
+    }
+
     return 0;
 }

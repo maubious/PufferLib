@@ -42,7 +42,13 @@ static const Color BALATRO_RARITY_LEGENDARY = (Color){195, 75, 255, 255};
 /* Consumable Colors */
 static const Color BALATRO_COLOR_TAROT    = (Color){95, 45, 155, 255};
 static const Color BALATRO_COLOR_PLANET   = (Color){25, 45, 120, 255};
+static const Color BALATRO_COLOR_PLANET_TEXT = (Color){130, 195, 255, 255};
 static const Color BALATRO_COLOR_SPECTRAL = (Color){20, 125, 135, 255};
+
+/* Cosmetic wall-clock (card shimmer/pulse). Advanced once per live frame in
+   balatro_render so it freezes while paused. File-static like the rest of
+   this header's state: exactly one translation unit's copy ever runs. */
+static float g_balatro_ui_time = 0.0f;
 static const Color BALATRO_COLOR_VOUCHER  = (Color){180, 135, 60, 255};
 static const Color BALATRO_COLOR_BOOSTER  = (Color){140, 60, 180, 255};
 
@@ -1272,7 +1278,7 @@ static void draw_playing_card(const Card *card, Rectangle r, bool selected, bool
         border_color = (Color){240, 60, 200, 255};
         DrawRectangleRoundedLinesEx(r, 0.08f, 4, 2.0f, border_color);
     } else if (card->edition == EDITION_POLYCHROME) {
-        float t = (float)GetTime() * 3.0f;
+        float t = g_balatro_ui_time * 3.0f;
         border_color = (Color){(unsigned char)(128 + 127*sinf(t)), (unsigned char)(128 + 127*sinf(t + 2.0f)), (unsigned char)(128 + 127*sinf(t + 4.0f)), 255};
         DrawRectangleRoundedLinesEx(r, 0.08f, 4, 2.5f, border_color);
     } else {
@@ -1622,7 +1628,7 @@ static void draw_consumable_card(const Card *card, Rectangle r, bool hovered, in
         DrawCircleV((Vector2){cx, cy}, 4, (Color){92, 45, 155, 255});
         DrawCircleV((Vector2){cx + 1, cy - 1}, 1.5f, BALATRO_WHITE);
     } else {
-        float pulse = 0.88f + 0.12f * sinf((float)GetTime() * 2.4f + card->center_id);
+        float pulse = 0.88f + 0.12f * sinf(g_balatro_ui_time * 2.4f + card->center_id);
         Color cyan = (Color){113, 255, 237, 255};
         Color violet = (Color){205, 126, 255, 255};
         DrawCircleGradient((int)cx, (int)cy, 22.0f * pulse,
@@ -2000,15 +2006,32 @@ static void draw_hud_sidebar(const State *state, const LegalMasks *legal, Rectan
                  (int)(tag_panel.y + tag_panel.height - 15), 10, (Color){140, 160, 158, 255});
     }
 
-    Rectangle info_button = {x, rect.y + rect.height - 38, w, 28};
+    float menu_gap = 6.0f;
+    float menu_button_w = (w - menu_gap) * 0.5f;
+    Rectangle info_button = {x, rect.y + rect.height - 38, menu_button_w, 28};
+    Rectangle controls_button = {x + menu_button_w + menu_gap, info_button.y, menu_button_w, 28};
     bool info_hovered = CheckCollisionPointRec(mouse, info_button);
+    bool controls_hovered = CheckCollisionPointRec(mouse, controls_button);
     DrawRectangleRounded(info_button, 0.25f, 2,
         info_hovered ? (Color){47, 78, 74, 255} : BALATRO_HEADER_BG);
+    DrawRectangleRounded(controls_button, 0.25f, 2,
+        controls_hovered ? (Color){47, 78, 74, 255} : BALATRO_HEADER_BG);
     DrawRectangleRoundedLinesEx(info_button, 0.25f, 2, 1.2f, BALATRO_PANEL_BORDER);
-    const char *info_text = "RUN INFO & HAND LEVELS";
+    DrawRectangleRoundedLinesEx(controls_button, 0.25f, 2, 1.2f, BALATRO_PANEL_BORDER);
+    const char *info_text = "RUN INFO";
+    const char *controls_text = "CONTROLS";
     DrawText(info_text, (int)(info_button.x + (info_button.width - MeasureText(info_text, 10)) * 0.5f),
              (int)(info_button.y + 9), 10, BALATRO_WHITE);
-    if (info_hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) client->show_run_menu = true;
+    DrawText(controls_text, (int)(controls_button.x + (controls_button.width - MeasureText(controls_text, 10)) * 0.5f),
+             (int)(controls_button.y + 9), 10, BALATRO_WHITE);
+    if (info_hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        client->show_run_menu = true;
+        client->show_controls_menu = false;
+    }
+    if (controls_hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        client->show_run_menu = true;
+        client->show_controls_menu = true;
+    }
 }
 
 /* Draws Jokers Bar at top with adaptive flex layout for any count of jokers (>5) */
@@ -2050,8 +2073,9 @@ static void draw_jokers_bar(const State *state, Rectangle rect, Action *out_acti
         if (hovered) {
             client->show_tooltip = true;
             snprintf(client->tooltip_title, sizeof(client->tooltip_title), "%s", get_center_name(state->jokers[i].center_id));
-            snprintf(client->tooltip_type, sizeof(client->tooltip_type), "%sJoker | Left/Right: Move | Right-click: Sell",
-                     (state->jokers[i].flags & CARD_DEBUFFED) ? "DEBUFFED | " : "");
+            snprintf(client->tooltip_type, sizeof(client->tooltip_type), "%sJoker | %s",
+                     (state->jokers[i].flags & CARD_DEBUFFED) ? "DEBUFFED | " : "",
+                     get_edition_name(state->jokers[i].edition));
             get_center_description(&state->jokers[i], state, client->tooltip_desc, sizeof(client->tooltip_desc));
             char value[40];
             if (state->jokers[i].center_id == CENTER_J_RAISED_FIST)
@@ -2115,7 +2139,7 @@ static void draw_consumables_bar(const State *state, Rectangle rect, Action *out
         if (hovered) {
             client->show_tooltip = true;
             snprintf(client->tooltip_title, sizeof(client->tooltip_title), "%s", get_center_name(state->consumables[i].center_id));
-            snprintf(client->tooltip_type, sizeof(client->tooltip_type), "Consumable (Click: Use | Right-Click: Sell)");
+            snprintf(client->tooltip_type, sizeof(client->tooltip_type), "Consumable");
             get_center_description(&state->consumables[i], state, client->tooltip_desc, sizeof(client->tooltip_desc));
             snprintf(client->tooltip_stats, sizeof(client->tooltip_stats), "Sell Value: $%d", state->consumables[i].sell_cost);
             client->tooltip_pos = (Vector2){mouse.x + 16, mouse.y + 16};
@@ -2314,11 +2338,12 @@ static void draw_phase_hand_play(State *state, const LegalMasks *legal, Rectangl
                     snprintf(client->tooltip_title, sizeof(client->tooltip_title), "Stone Card");
                     snprintf(client->tooltip_type, sizeof(client->tooltip_type), "Stone (+50 Chips, No Rank)");
                     snprintf(client->tooltip_desc, sizeof(client->tooltip_desc), "Adds +50 Chips when scored - has no rank or suit (Slot %d)", i + 1);
-                    snprintf(client->tooltip_stats, sizeof(client->tooltip_stats), "Enhancement: Stone");
+                    snprintf(client->tooltip_stats, sizeof(client->tooltip_stats), "Edition: %s | Seal: %s",
+                             get_edition_name(state->hand[i].edition), get_seal_name(state->hand[i].seal));
                 } else {
                     snprintf(client->tooltip_title, sizeof(client->tooltip_title), "%s of %s", get_rank_str(state->hand[i].rank), get_suit_name(state->hand[i].suit));
                     snprintf(client->tooltip_type, sizeof(client->tooltip_type), "%s | %s", get_enhancement_name(state->hand[i].enhancement), get_edition_name(state->hand[i].edition));
-                    snprintf(client->tooltip_desc, sizeof(client->tooltip_desc), "Playing card in active hand | Left/Right: Move (Slot %d)", i + 1);
+                    snprintf(client->tooltip_desc, sizeof(client->tooltip_desc), "Playing card in active hand (Slot %d)", i + 1);
                     snprintf(client->tooltip_stats, sizeof(client->tooltip_stats), "Seal: %s", get_seal_name(state->hand[i].seal));
                 }
                 client->tooltip_pos = (Vector2){mouse.x + 16, mouse.y + 16};
@@ -2397,9 +2422,9 @@ static void draw_phase_hand_play(State *state, const LegalMasks *legal, Rectangl
     btn_x += 154.0f;
     Rectangle sort_r_btn = {btn_x, btn_y + 5, 90, 32};
     bool sort_r_hov = CheckCollisionPointRec(mouse, sort_r_btn);
-    DrawRectangleRounded((Rectangle){sort_r_btn.x, sort_r_btn.y + 3, sort_r_btn.width, sort_r_btn.height}, 0.25f, 2, Fade(BLACK, 0.4f));
-    DrawRectangleRounded(sort_r_btn, 0.25f, 2, sort_r_hov ? BALATRO_HEADER_BG : BALATRO_PANEL_BG);
-    DrawRectangleRoundedLinesEx(sort_r_btn, 0.25f, 2, 1.2f, BALATRO_PANEL_BORDER);
+    DrawRectangleRounded((Rectangle){sort_r_btn.x, sort_r_btn.y + 3, sort_r_btn.width, sort_r_btn.height}, 0.25f, 8, Fade(BLACK, 0.4f));
+    DrawRectangleRounded(sort_r_btn, 0.25f, 8, sort_r_hov ? BALATRO_HEADER_BG : BALATRO_PANEL_BG);
+    DrawRectangleRoundedLinesEx(sort_r_btn, 0.25f, 8, 1.2f, BALATRO_PANEL_BORDER);
     DrawText("SORT RANK", (int)(sort_r_btn.x + (sort_r_btn.width - MeasureText("SORT RANK", 11)) * 0.5f),
              (int)(sort_r_btn.y + (sort_r_btn.height - 11) * 0.5f), 11, BALATRO_WHITE);
     if (sort_r_hov && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
@@ -2410,9 +2435,9 @@ static void draw_phase_hand_play(State *state, const LegalMasks *legal, Rectangl
     btn_x += 104.0f;
     Rectangle sort_s_btn = {btn_x, btn_y + 5, 90, 32};
     bool sort_s_hov = CheckCollisionPointRec(mouse, sort_s_btn);
-    DrawRectangleRounded((Rectangle){sort_s_btn.x, sort_s_btn.y + 3, sort_s_btn.width, sort_s_btn.height}, 0.25f, 2, Fade(BLACK, 0.4f));
-    DrawRectangleRounded(sort_s_btn, 0.25f, 2, sort_s_hov ? BALATRO_HEADER_BG : BALATRO_PANEL_BG);
-    DrawRectangleRoundedLinesEx(sort_s_btn, 0.25f, 2, 1.2f, BALATRO_PANEL_BORDER);
+    DrawRectangleRounded((Rectangle){sort_s_btn.x, sort_s_btn.y + 3, sort_s_btn.width, sort_s_btn.height}, 0.25f, 8, Fade(BLACK, 0.4f));
+    DrawRectangleRounded(sort_s_btn, 0.25f, 8, sort_s_hov ? BALATRO_HEADER_BG : BALATRO_PANEL_BG);
+    DrawRectangleRoundedLinesEx(sort_s_btn, 0.25f, 8, 1.2f, BALATRO_PANEL_BORDER);
     DrawText("SORT SUIT", (int)(sort_s_btn.x + (sort_s_btn.width - MeasureText("SORT SUIT", 11)) * 0.5f),
              (int)(sort_s_btn.y + (sort_s_btn.height - 11) * 0.5f), 11, BALATRO_WHITE);
     if (sort_s_hov && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
@@ -2878,13 +2903,15 @@ static void draw_phase_shop(const State *state, const LegalMasks *legal, Rectang
                     snprintf(client->tooltip_title, sizeof(client->tooltip_title), "%s of %s", get_rank_str(sc->rank), get_suit_name(sc->suit));
                     snprintf(client->tooltip_type, sizeof(client->tooltip_type), "Playing Card | $%d", sc->cost);
                 }
-                snprintf(client->tooltip_desc, sizeof(client->tooltip_desc), "%s | %s", get_enhancement_name(sc->enhancement), get_edition_name(sc->edition));
+                snprintf(client->tooltip_desc, sizeof(client->tooltip_desc), "%s | %s | Seal: %s",
+                         get_enhancement_name(sc->enhancement), get_edition_name(sc->edition), get_seal_name(sc->seal));
             } else {
                 snprintf(client->tooltip_title, sizeof(client->tooltip_title), "%s", get_center_name(sc->center_id));
-                snprintf(client->tooltip_type, sizeof(client->tooltip_type), "Shop Card | $%d", sc->cost);
+                snprintf(client->tooltip_type, sizeof(client->tooltip_type), "%s | $%d",
+                         set == SET_JOKER ? get_edition_name(sc->edition) : "Shop Card", sc->cost);
                 get_center_description(sc, state, client->tooltip_desc, sizeof(client->tooltip_desc));
             }
-            snprintf(client->tooltip_stats, sizeof(client->tooltip_stats), affordable ? "Affordable - click to buy" : "Need $%d more", sc->cost - state->dollars);
+            snprintf(client->tooltip_stats, sizeof(client->tooltip_stats), affordable ? "Affordable" : "Need $%d more", sc->cost - state->dollars);
             if (set == SET_JOKER)
                 client->tooltip_pos = (Vector2){card_r.x + card_r.width * 0.5f - 150.0f,
                                                 card_r.y + card_r.height + 10.0f};
@@ -3067,13 +3094,15 @@ static void draw_phase_pack_opening(const State *state, const LegalMasks *legal,
                     snprintf(client->tooltip_title, sizeof(client->tooltip_title), "%s of %s", get_rank_str(pc->rank), get_suit_name(pc->suit));
                     snprintf(client->tooltip_type, sizeof(client->tooltip_type), "Playing Card");
                 }
-                snprintf(client->tooltip_desc, sizeof(client->tooltip_desc), "%s | %s", get_enhancement_name(pc->enhancement), get_edition_name(pc->edition));
-                snprintf(client->tooltip_stats, sizeof(client->tooltip_stats), "Click to add this card to your deck");
+                snprintf(client->tooltip_desc, sizeof(client->tooltip_desc), "%s | %s | Seal: %s",
+                         get_enhancement_name(pc->enhancement), get_edition_name(pc->edition), get_seal_name(pc->seal));
+                snprintf(client->tooltip_stats, sizeof(client->tooltip_stats), "Adds this card to your deck");
             } else {
                 snprintf(client->tooltip_title, sizeof(client->tooltip_title), "%s", get_center_name(pc->center_id));
-                snprintf(client->tooltip_type, sizeof(client->tooltip_type), "Pack Choice");
+                snprintf(client->tooltip_type, sizeof(client->tooltip_type), "%s",
+                         set == SET_JOKER ? get_edition_name(pc->edition) : "Pack Choice");
                 get_center_description(pc, state, client->tooltip_desc, sizeof(client->tooltip_desc));
-                snprintf(client->tooltip_stats, sizeof(client->tooltip_stats), "Click to choose");
+                snprintf(client->tooltip_stats, sizeof(client->tooltip_stats), "Available pack choice");
             }
             if (set == SET_JOKER)
                 client->tooltip_pos = (Vector2){c_rect.x + c_rect.width * 0.5f - 150.0f,
@@ -3124,7 +3153,8 @@ static void draw_phase_pack_opening(const State *state, const LegalMasks *legal,
                     snprintf(client->tooltip_title, sizeof(client->tooltip_title), "Stone Card");
                     snprintf(client->tooltip_type, sizeof(client->tooltip_type), "Stone (+50 Chips, No Rank)");
                     snprintf(client->tooltip_desc, sizeof(client->tooltip_desc), "Adds +50 Chips when scored - no rank or suit (Slot %d)", i + 1);
-                    snprintf(client->tooltip_stats, sizeof(client->tooltip_stats), "Enhancement: Stone");
+                    snprintf(client->tooltip_stats, sizeof(client->tooltip_stats), "Edition: %s | Seal: %s",
+                             get_edition_name(state->hand[i].edition), get_seal_name(state->hand[i].seal));
                 } else {
                     snprintf(client->tooltip_title, sizeof(client->tooltip_title), "%s of %s",
                              get_rank_str(state->hand[i].rank), get_suit_name(state->hand[i].suit));
@@ -3277,6 +3307,24 @@ static void draw_tooltip(const Client *client) {
              (int)(stats.y + (stats.height - stats_font) * 0.5f), stats_font, (Color){145, 235, 180, 255});
 }
 
+static void draw_controls_section(Rectangle area, const char *title,
+                                  const char *const *keys, const char *const *descriptions,
+                                  int count) {
+    DrawRectangleRounded(area, 0.05f, 3, BALATRO_HEADER_BG);
+    DrawRectangleRoundedLinesEx(area, 0.05f, 3, 1.0f, BALATRO_PANEL_BORDER);
+    DrawText(title, (int)(area.x + 12), (int)(area.y + 10), 14, BALATRO_COLOR_PLANET_TEXT);
+    DrawLine((int)(area.x + 12), (int)(area.y + 31),
+             (int)(area.x + area.width - 12), (int)(area.y + 31), Fade(BALATRO_WHITE, 0.12f));
+    for (int i = 0; i < count; ++i) {
+        float row_y = area.y + 42.0f + i * 25.0f;
+        Rectangle key_box = {area.x + 12, row_y, 70, 19};
+        DrawRectangleRounded(key_box, 0.25f, 2, (Color){35, 61, 59, 255});
+        DrawText(keys[i], (int)(key_box.x + (key_box.width - MeasureText(keys[i], 9)) * 0.5f),
+                 (int)(key_box.y + 5), 9, BALATRO_GOLD);
+        DrawText(descriptions[i], (int)(area.x + 92), (int)(row_y + 4), 10, BALATRO_WHITE);
+    }
+}
+
 /* ========================================================================= */
 /* Client Creation & Main Renderer Entry Point                               */
 /* ========================================================================= */
@@ -3330,6 +3378,12 @@ static inline void balatro_render(Env *env) {
     if (IsKeyPressed(KEY_P)) {
         client->paused = !client->paused;
     }
+    /* Frozen frames still run the full body (hover, tooltips, run menu)
+       but must not advance the sim: gate dispatch and anim clocks on it.
+       N steps exactly one frame while frozen. */
+    bool frozen = client->paused;
+    bool step_once = frozen && IsKeyPressed(KEY_N);
+    bool advance = !frozen || step_once;
     if (IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_RIGHT_BRACKET)) {
         if (client->step_delay_frames > 0) client->step_delay_frames -= 5;
     }
@@ -3470,8 +3524,13 @@ static inline void balatro_render(Env *env) {
     int phase_x = balatro_x + MeasureText("BALATRO", 18) + 24;
     DrawRectangleRounded((Rectangle){phase_x, 7, phase_width, 20}, 0.5f, 3, (Color){25, 53, 55, 255});
     DrawText(phase_name, phase_x + 11, 12, 11, (Color){164, 220, 205, 255});
-    const char *controls = TextFormat("P pause   [ ] speed %.1fx   Enter confirm", playback_rate);
-    DrawText(controls, client->width - MeasureText(controls, 11) - 16, 11, 11, (Color){105, 135, 145, 255});
+    /* Playback speed (right-aligned pill): multiplier from step delay. */
+    const char *speed_text = client->paused ? "PAUSED" : TextFormat("%.1fx", playback_rate);
+    int speed_width = MeasureText(speed_text, 11) + 22;
+    int speed_x = client->width - 16 - speed_width;
+    DrawRectangleRounded((Rectangle){speed_x, 7, speed_width, 20}, 0.5f, 3, (Color){25, 53, 55, 255});
+    DrawText(speed_text, speed_x + 11, 12, 11,
+             client->paused ? BALATRO_RED_MULT : (Color){164, 220, 205, 255});
 
     /* Layout Geometry */
     float sidebar_w = 260.0f;
@@ -3690,10 +3749,20 @@ static inline void balatro_render(Env *env) {
                                              84.0f * pulse, 120.0f * pulse},
                                  false, 0, false, 0);
             char outcome[128] = "EFFECT RESOLVED";
+            int upgraded = 0, first_hand = -1;
             for (int hand = 0; hand < HAND_COUNT; ++hand)
-                if (anim->after_levels[hand] > anim->before_levels[hand])
-                    snprintf(outcome, sizeof(outcome), "%s  LEVEL %d -> %d", get_hand_type_name((HandType)hand),
-                             anim->before_levels[hand], anim->after_levels[hand]);
+                if (anim->after_levels[hand] > anim->before_levels[hand]) {
+                    if (first_hand < 0) first_hand = hand;
+                    upgraded++;
+                }
+            if (upgraded == 1)
+                snprintf(outcome, sizeof(outcome), "%s  LEVEL %d -> %d", get_hand_type_name((HandType)first_hand),
+                         anim->before_levels[first_hand], anim->after_levels[first_hand]);
+            else if (upgraded == HAND_COUNT)
+                snprintf(outcome, sizeof(outcome), "ALL HANDS  +%d LEVEL",
+                         anim->after_levels[first_hand] - anim->before_levels[first_hand]);
+            else if (upgraded > 1)
+                snprintf(outcome, sizeof(outcome), "%d HAND TYPES UPGRADED", upgraded);
             if (anim->after_dollars != anim->before_dollars)
                 snprintf(outcome, sizeof(outcome), "MONEY  $%d -> $%d", anim->before_dollars, anim->after_dollars);
             DrawText(outcome, (int)(center_x - MeasureText(outcome, 16) * 0.5f),
@@ -3729,7 +3798,24 @@ static inline void balatro_render(Env *env) {
         Rectangle menu = {client->width * 0.5f - 330.0f, 70, 660, 580};
         DrawRectangleRounded(menu, 0.04f, 4, (Color){15, 31, 31, 255});
         DrawRectangleRoundedLinesEx(menu, 0.04f, 4, 2.0f, BALATRO_GOLD);
-        DrawText("RUN INFO", (int)(menu.x + 22), (int)(menu.y + 18), 24, BALATRO_GOLD);
+        DrawText("GAME MENU", (int)(menu.x + 22), (int)(menu.y + 21), 20, BALATRO_GOLD);
+
+        Rectangle run_tab = {menu.x + 174, menu.y + 14, 100, 30};
+        Rectangle controls_tab = {menu.x + 282, menu.y + 14, 100, 30};
+        bool run_hovered = CheckCollisionPointRec(mouse, run_tab);
+        bool controls_hovered = CheckCollisionPointRec(mouse, controls_tab);
+        DrawRectangleRounded(run_tab, 0.25f, 2,
+            !client->show_controls_menu ? (Color){50, 91, 84, 255}
+            : run_hovered ? (Color){39, 69, 65, 255} : BALATRO_HEADER_BG);
+        DrawRectangleRounded(controls_tab, 0.25f, 2,
+            client->show_controls_menu ? (Color){50, 91, 84, 255}
+            : controls_hovered ? (Color){39, 69, 65, 255} : BALATRO_HEADER_BG);
+        DrawText("RUN INFO", (int)(run_tab.x + (run_tab.width - MeasureText("RUN INFO", 10)) * 0.5f),
+                 (int)(run_tab.y + 9), 10, BALATRO_WHITE);
+        DrawText("CONTROLS", (int)(controls_tab.x + (controls_tab.width - MeasureText("CONTROLS", 10)) * 0.5f),
+                 (int)(controls_tab.y + 9), 10, BALATRO_WHITE);
+        if (run_hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) client->show_controls_menu = false;
+        if (controls_hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) client->show_controls_menu = true;
 
         Rectangle close_button = {menu.x + menu.width - 92, menu.y + 14, 70, 30};
         bool close_hovered = CheckCollisionPointRec(mouse, close_button);
@@ -3739,52 +3825,85 @@ static inline void balatro_render(Env *env) {
                  (int)(close_button.y + 9), 11, BALATRO_WHITE);
         if (close_hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) client->show_run_menu = false;
 
-        DrawRectangleRounded((Rectangle){menu.x + 20, menu.y + 58, menu.width - 40, 88},
-                             0.08f, 3, BALATRO_HEADER_BG);
-        DrawText(TextFormat("ANTE  %d / %d", env->state.ante, env->state.config.win_ante),
-                 (int)(menu.x + 36), (int)(menu.y + 74), 14, BALATRO_GOLD);
-        DrawText(TextFormat("ROUND  %d", env->state.round),
-                 (int)(menu.x + 36), (int)(menu.y + 102), 13, BALATRO_WHITE);
-        DrawText(TextFormat("HANDS PLAYED  %u", env->state.run_hands_played),
-                 (int)(menu.x + 220), (int)(menu.y + 74), 13, BALATRO_WHITE);
-        DrawText(TextFormat("BLINDS SKIPPED  %d", env->state.skips),
-                 (int)(menu.x + 220), (int)(menu.y + 102), 13, BALATRO_WHITE);
-        DrawText(TextFormat("DECK  %d CARDS", env->state.deck_count + env->state.hand_count + env->state.discard_count),
-                 (int)(menu.x + 445), (int)(menu.y + 74), 13, BALATRO_WHITE);
-        DrawText(TextFormat("MONEY  $%d", env->state.dollars),
-                 (int)(menu.x + 445), (int)(menu.y + 102), 13, BALATRO_GOLD);
+        if (client->show_controls_menu) {
+            static const char *general_keys[] = {"P", "N", "[ / DOWN", "] / UP", "TAB", "ESC"};
+            static const char *general_desc[] = {
+                "Pause or resume", "Advance one paused frame", "Reduce playback speed",
+                "Increase playback speed", "Toggle autoplay", "Close this menu"
+            };
+            static const char *hand_keys[] = {"1 - 9", "CLICK", "ENTER / SPACE", "D", "R", "S", "LEFT / RIGHT"};
+            static const char *hand_desc[] = {
+                "Toggle hand cards", "Toggle a hand card", "Play selected cards",
+                "Discard selected cards", "Sort hand by rank", "Sort hand by suit", "Move hovered card"
+            };
+            static const char *pointer_keys[] = {
+                "CLICK", "RIGHT-CLICK", "SHIFT + CLICK", "CLICK", "RIGHT-CLICK", "HOVER"
+            };
+            static const char *pointer_desc[] = {
+                "Use consumable", "Sell consumable or Joker", "Sell hovered Joker",
+                "Buy or choose item", "Sell where available", "Show card details"
+            };
+            static const char *phase_keys[] = {"ENTER / SPACE", "CLICK", "1 - 9", "R"};
+            static const char *phase_desc[] = {
+                "Confirm or continue phase", "Select Blind / cash out", "Choose pack targets",
+                "Start new run after game over"
+            };
+            draw_controls_section((Rectangle){menu.x + 20, menu.y + 58, 304, 204},
+                                  "GENERAL", general_keys, general_desc, 6);
+            draw_controls_section((Rectangle){menu.x + 20, menu.y + 272, 304, 288},
+                                  "HAND", hand_keys, hand_desc, 7);
+            draw_controls_section((Rectangle){menu.x + 336, menu.y + 58, 304, 204},
+                                  "MOUSE & ITEMS", pointer_keys, pointer_desc, 6);
+            draw_controls_section((Rectangle){menu.x + 336, menu.y + 272, 304, 288},
+                                  "PHASES & PACKS", phase_keys, phase_desc, 4);
+        } else {
+            DrawRectangleRounded((Rectangle){menu.x + 20, menu.y + 58, menu.width - 40, 88},
+                                 0.08f, 3, BALATRO_HEADER_BG);
+            DrawText(TextFormat("ANTE  %d / %d", env->state.ante, env->state.config.win_ante),
+                     (int)(menu.x + 36), (int)(menu.y + 74), 14, BALATRO_GOLD);
+            DrawText(TextFormat("ROUND  %d", env->state.round),
+                     (int)(menu.x + 36), (int)(menu.y + 102), 13, BALATRO_WHITE);
+            DrawText(TextFormat("HANDS PLAYED  %u", env->state.run_hands_played),
+                     (int)(menu.x + 220), (int)(menu.y + 74), 13, BALATRO_WHITE);
+            DrawText(TextFormat("BLINDS SKIPPED  %d", env->state.skips),
+                     (int)(menu.x + 220), (int)(menu.y + 102), 13, BALATRO_WHITE);
+            DrawText(TextFormat("DECK  %d CARDS", env->state.deck_count + env->state.hand_count + env->state.discard_count),
+                     (int)(menu.x + 445), (int)(menu.y + 74), 13, BALATRO_WHITE);
+            DrawText(TextFormat("MONEY  $%d", env->state.dollars),
+                     (int)(menu.x + 445), (int)(menu.y + 102), 13, BALATRO_GOLD);
 
-        DrawText("HAND LEVELS", (int)(menu.x + 22), (int)(menu.y + 166), 16, BALATRO_COLOR_PLANET);
-        DrawLine((int)(menu.x + 22), (int)(menu.y + 190),
-                 (int)(menu.x + menu.width - 22), (int)(menu.y + 190), Fade(BALATRO_WHITE, 0.12f));
-        int hand_rows = (HAND_COUNT + 1) / 2;
-        for (int hand = 0; hand < HAND_COUNT; ++hand) {
-            int column = hand / hand_rows;
-            int row = hand % hand_rows;
-            float row_x = menu.x + 22.0f + column * 310.0f;
-            float row_y = menu.y + 202.0f + row * 54.0f;
-            Rectangle hand_row = {row_x, row_y, 294, 44};
-            DrawRectangleRounded(hand_row, 0.12f, 2,
-                row & 1 ? (Color){20, 42, 41, 255} : (Color){24, 48, 46, 255});
-            int level = env->state.hand_levels[hand];
-            assert(level > 0);
-            int chips = 0;
-            int mult = 0;
-            hand_base_stats((HandType)hand, level, &chips, &mult);
-            const char *hand_name = get_hand_type_name((HandType)hand);
-            DrawText(hand_name, (int)(hand_row.x + 10), (int)(hand_row.y + 7), 12, BALATRO_WHITE);
-            DrawText(TextFormat("LV %d", level), (int)(hand_row.x + hand_row.width - 48),
-                     (int)(hand_row.y + 7), 11, BALATRO_COLOR_PLANET);
-            DrawText(TextFormat("%d chips  x  %d mult", chips, mult),
-                     (int)(hand_row.x + 10), (int)(hand_row.y + 25), 9,
-                     (Color){145, 175, 188, 255});
-            DrawText(TextFormat("%d played", env->state.hand_plays[hand]),
-                     (int)(hand_row.x + hand_row.width - 72), (int)(hand_row.y + 25), 9,
-                     (Color){125, 150, 148, 255});
+            DrawText("HAND LEVELS", (int)(menu.x + 22), (int)(menu.y + 166), 16, BALATRO_COLOR_PLANET_TEXT);
+            DrawLine((int)(menu.x + 22), (int)(menu.y + 190),
+                     (int)(menu.x + menu.width - 22), (int)(menu.y + 190), Fade(BALATRO_WHITE, 0.12f));
+            int hand_rows = (HAND_COUNT + 1) / 2;
+            for (int hand = 0; hand < HAND_COUNT; ++hand) {
+                int column = hand / hand_rows;
+                int row = hand % hand_rows;
+                float row_x = menu.x + 22.0f + column * 310.0f;
+                float row_y = menu.y + 202.0f + row * 54.0f;
+                Rectangle hand_row = {row_x, row_y, 294, 44};
+                DrawRectangleRounded(hand_row, 0.12f, 2,
+                    row & 1 ? (Color){20, 42, 41, 255} : (Color){24, 48, 46, 255});
+                int level = env->state.hand_levels[hand];
+                assert(level > 0);
+                int chips = 0;
+                int mult = 0;
+                hand_base_stats((HandType)hand, level, &chips, &mult);
+                const char *hand_name = get_hand_type_name((HandType)hand);
+                DrawText(hand_name, (int)(hand_row.x + 10), (int)(hand_row.y + 7), 12, BALATRO_WHITE);
+                DrawText(TextFormat("LV %d", level), (int)(hand_row.x + hand_row.width - 48),
+                         (int)(hand_row.y + 7), 11, BALATRO_COLOR_PLANET_TEXT);
+                DrawText(TextFormat("%d chips  x  %d mult", chips, mult),
+                         (int)(hand_row.x + 10), (int)(hand_row.y + 25), 9,
+                         (Color){145, 175, 188, 255});
+                DrawText(TextFormat("%d played", env->state.hand_plays[hand]),
+                         (int)(hand_row.x + hand_row.width - 72), (int)(hand_row.y + 25), 9,
+                         (Color){125, 150, 148, 255});
+            }
         }
     }
 
-    if (client->score_anim.active || client->consumable_anim.active) {
+    if (advance && (client->score_anim.active || client->consumable_anim.active)) {
         action.type = UINT8_MAX;
         client->show_tooltip = false;
     }
@@ -3792,10 +3911,16 @@ static inline void balatro_render(Env *env) {
     /* Tooltip overlay */
     draw_tooltip(client);
 
+    /* Paused: big red bars top-right, drawn over everything. */
+    if (client->paused) {
+        DrawRectangle(client->width - 72, 4, 24, 64, BALATRO_RED_MULT);
+        DrawRectangle(client->width - 40, 4, 24, 64, BALATRO_RED_MULT);
+    }
+
     EndDrawing();
 
     /* Dispatch action if triggered interactively */
-    if (action.type != UINT8_MAX) {
+    if (advance && action.type != UINT8_MAX) {
         if (action.type == ACTION_PLAY_HAND) {
             score_anim_capture(client, &env->state, &action);
         }
@@ -3818,32 +3943,24 @@ static inline void balatro_render(Env *env) {
         puffer_observe(env);
     }
 
-    /* Advance the scoring animation; no pacing delay while it plays */
-    if (client->score_anim.active) {
-        float frame_time = GetFrameTime();
-        if (frame_time > 1.0f / 30.0f) frame_time = 1.0f / 30.0f;
-        client->score_anim.t += frame_time * playback_rate;
-        if (client->score_anim.t >= client->score_anim.duration) {
-            client->score_anim.active = false;
+    /* Cosmetic and animation clocks; frozen while paused. */
+    if (advance) {
+        g_balatro_ui_time += GetFrameTime();
+        if (client->score_anim.active) {
+            float frame_time = GetFrameTime();
+            if (frame_time > 1.0f / 30.0f) frame_time = 1.0f / 30.0f;
+            client->score_anim.t += frame_time * playback_rate;
+            if (client->score_anim.t >= client->score_anim.duration) {
+                client->score_anim.active = false;
+            }
         }
     }
-    if (client->consumable_anim.active) {
+    if (advance && client->consumable_anim.active) {
         float frame_time = GetFrameTime();
         if (frame_time > 1.0f / 30.0f) frame_time = 1.0f / 30.0f;
         client->consumable_anim.t += frame_time * playback_rate;
         if (client->consumable_anim.t >= client->consumable_anim.duration)
             client->consumable_anim.active = false;
-    }
-    while (client->paused && !WindowShouldClose()) {
-        if (IsKeyPressed(KEY_P)) {
-            client->paused = false;
-            break;
-        }
-        if (IsKeyPressed(KEY_N)) {
-            break;
-        }
-        BeginDrawing();
-        EndDrawing();
     }
 }
 

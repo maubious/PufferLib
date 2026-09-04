@@ -633,7 +633,7 @@ void decoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
         // so that bias = 0 initially, but gradients dL/dW = dL/db * E are non-zero immediately.
         Prec e_prefix = {
             .data = dw->condition.data,
-            .shape = {AR_W_PRIMARY_OFFSET / AR_EMBED_DIM, AR_EMBED_DIM},
+            .shape = {AR_W_COUNT_OFFSET / AR_EMBED_DIM, AR_EMBED_DIM},
         };
         puf_kaiming_init(&e_prefix, 1.0f, (*seed)++, stream);
         #endif
@@ -1517,6 +1517,9 @@ struct PPOKernelArgs {
     const int* act_sizes;
     const precision_t* action_mask; // (N, T, mask_size); always present
     const precision_t* condition;
+    const precision_t* keys;
+    const int* counts;
+    float* key_grad;
     float* grad_condition;
     int mask_stride;
     int num_atns;
@@ -1627,8 +1630,8 @@ __device__ __forceinline__ int selection_base(
     return mask_byte(m, 0, p + 1) ? p : -1;
 }
 
-// Per-agent autoregressive context (Redesign A: Factored Prefix Embedding).
-// The sampled prefix (type, primary, count, cards) is maintained incrementally.
+// Per-agent autoregressive context. The sampled prefix is maintained
+// incrementally using the encoder keys of the actual selected entities.
 typedef struct ARContext {
     int type;
     int primary;
@@ -1647,18 +1650,21 @@ typedef struct ARContext {
     int pos;                 // current card position (head - 3)
     int selected_cards[MAX_SELECTION];
     float card_ctx[AR_EMBED_DIM];
-    // Set-synergy stats over `selected` (incremental in ar_ctx_advance):
-    // per-suit and per-rank counts plus a rank bitset (ace at bits 1 and 14).
-    const precision_t* m;    // mask base (card-attr lookups)
+    const precision_t* m;
     int base;                // per-agent mask offset
-    int suit_counts[4];
-    int rank_counts[15];
-    int rmask;
+#ifdef PUFFER_BALATRO
+    const precision_t* keys;
+    const int* counts;
+#endif
 } ARContext;
 
 // Reads act[0..1] (type, primary) and the selection entry from the mask.
 __device__ __forceinline__ ARContext ar_ctx_init(
-        const precision_t* m, int base, const precision_t* act, int ab) {
+        const precision_t* m, int base, const precision_t* act, int ab
+#ifdef PUFFER_BALATRO
+        , const precision_t* keys = NULL, const int* counts = NULL
+#endif
+        ) {
     ARContext c;
     c.type = ar_action_value(act, ab, 0, ACTION_TYPE_COUNT);
     c.has_primary = has_primary(c.type);
@@ -1689,9 +1695,10 @@ __device__ __forceinline__ ARContext ar_ctx_init(
     for (int d = 0; d < AR_EMBED_DIM; ++d) c.card_ctx[d] = 0.0f;
     c.m = m;
     c.base = base;
-    for (int i = 0; i < 4; ++i) c.suit_counts[i] = 0;
-    for (int i = 0; i < 15; ++i) c.rank_counts[i] = 0;
-    c.rmask = 0;
+#ifdef PUFFER_BALATRO
+    c.keys = keys;
+    c.counts = counts;
+#endif
     return c;
 }
 
@@ -1701,37 +1708,10 @@ __device__ __forceinline__ void ar_ctx_set_count(
     c->count = ar_action_value(act, ab, 2, 6);
 }
 
-// Per-option card attribute ((suit << 4) | rank) from the env-written mask table.
-__device__ __forceinline__ int ar_opt_attr(const ARContext* c, int opt) {
-    if (opt < 0 || opt >= POLICY_CARD_ATTR_BYTES) return 0;
-    return mask_byte(c->m, c->base, POLICY_CARD_ATTR_OFFSET + opt);
-}
-
-// Branchless O(1) straight run length containing position p (1..14).
-__device__ __forceinline__ int ar_run_len(int rmask, int p) {
-    uint32_t not_mask = ~rmask;
-    int right = __builtin_ctz((not_mask >> (p + 1)) | 0x80000000);
-    int left = __builtin_clz((not_mask << (32 - p)) | 1);
-    return left + right + 1;
-}
-
-// Straight-completion signal: longest consecutive run through opt's rank.
-__device__ __forceinline__ int ar_run_through(const ARContext* c, int opt) {
-    int rank = ar_opt_attr(c, opt) & POLICY_CARD_ATTR_RANK_MASK;
-    if (rank < 1 || rank > 14) return 1;
-    int bit = (rank == 14) ? ((1 << 1) | (1 << 14)) : (1 << rank);
-    int rmask = c->rmask | bit;
-    int best = ar_run_len(rmask, rank == 14 ? 1 : rank);
-    if (rank == 14) {
-        int hi = ar_run_len(rmask, 14);
-        if (hi > best) best = hi;
-    }
-    return best;
-}
-
 // Advance the card-selection prefix by one position (call after heads 3..7).
 __device__ __forceinline__ void ar_ctx_advance(
-        ARContext* c, const precision_t* act, int ab, const precision_t* cond = nullptr) {
+        ARContext* c, const precision_t* act, int ab,
+        const precision_t* cond = NULL) {
     if (c->pos < MAX_SELECTION) {
         int card = ar_action_value(act, ab, 3 + c->pos, 64);
         c->selected |= UINT64_C(1) << card;
@@ -1740,21 +1720,26 @@ __device__ __forceinline__ void ar_ctx_advance(
         c->pos++;
         c->required_left = c->required & ~c->selected;
         c->allowed_left = __popcll(c->allowed & ~c->selected);
-        int attr = ar_opt_attr(c, card);
-        int suit = attr >> POLICY_CARD_ATTR_SUIT_SHIFT;
-        int rank = attr & POLICY_CARD_ATTR_RANK_MASK;
-        if (suit >= 0 && suit < 4) c->suit_counts[suit]++;
-        if (rank >= 1 && rank <= 14) {
-            c->rank_counts[rank]++;
-            c->rmask |= (rank == 14) ? (1 << 1) | (1 << 14) : (1 << rank);
+#ifdef PUFFER_BALATRO
+        assert(cond);
+        const precision_t* key = c->keys
+            + (token_start(c->counts, ZONE_HAND) + card) * BA_KEY_DIM;
+        const precision_t* gate = cond
+            + AR_GATE_OFFSET + c->type * AR_EMBED_DIM;
+        #pragma unroll
+        for (int d = 0; d < AR_EMBED_DIM; ++d) {
+            c->card_ctx[d] += (1.0f + to_float(gate[d])) * to_float(key[d]);
         }
+#else
         if (cond) {
-            const precision_t* e_card = cond + AR_E_CARD_OFFSET + card * AR_EMBED_DIM;
+            const precision_t* embedding = cond
+                + AR_E_CARD_OFFSET + card * AR_EMBED_DIM;
             #pragma unroll
             for (int d = 0; d < AR_EMBED_DIM; ++d) {
-                c->card_ctx[d] += to_float(e_card[d]);
+                c->card_ctx[d] += to_float(embedding[d]);
             }
         }
+#endif
     }
 }
 
@@ -1826,21 +1811,23 @@ __device__ __forceinline__ float order_bias(
         const ARContext* c, const precision_t* condition,
         int head, int option) {
     if (!condition) return 0.0f;
-    int offset = head == BALATRO_ORDER_HAND_HEAD
-        ? AR_W_ORDER_HAND_OFFSET : AR_W_ORDER_JOKER_OFFSET;
+    int zone = head == BALATRO_ORDER_HAND_HEAD ? ZONE_HAND : ZONE_JOKER;
+    const precision_t* candidate = c->keys
+        + (token_start(c->counts, zone) + option) * BA_KEY_DIM;
     const precision_t* e_type = condition
         + AR_E_TYPE_OFFSET + c->type * AR_EMBED_DIM;
-    const precision_t* e_primary = condition
-        + AR_E_PRIMARY_OFFSET + c->primary * AR_EMBED_DIM;
     const precision_t* e_count = condition
         + AR_E_COUNT_OFFSET + c->count * AR_EMBED_DIM;
-    const precision_t* e_weight = condition + offset + option * AR_EMBED_DIM;
+    int pzone = primary_zone(c->type);
+    const precision_t* primary_key = pzone >= 0 ? c->keys
+        + (token_start(c->counts, pzone) + c->primary) * BA_KEY_DIM : NULL;
     float bias = 0.0f;
     #pragma unroll
     for (int d = 0; d < AR_EMBED_DIM; ++d) {
-        float context = to_float(e_type[d]) + to_float(e_primary[d])
+        float context = to_float(e_type[d])
             + to_float(e_count[d]) + c->card_ctx[d];
-        bias += context * to_float(e_weight[d]);
+        if (primary_key) context += to_float(primary_key[d]);
+        bias += context * to_float(candidate[d]);
     }
     return bias;
 }
@@ -1851,49 +1838,48 @@ __device__ __forceinline__ float ar_cond_bias(
     if (!cond || head == 0) return 0.0f;
     float bias = 0.0f;
     if (head == 1) {
-        const precision_t* e_type = cond + AR_E_TYPE_OFFSET + c->type * AR_EMBED_DIM;
-        const precision_t* w_prim = cond + AR_W_PRIMARY_OFFSET + opt * AR_EMBED_DIM;
-        #pragma unroll
-        for (int d = 0; d < AR_EMBED_DIM; ++d) {
-            bias += to_float(e_type[d]) * to_float(w_prim[d]);
-        }
+        return 0.0f;
     } else if (head == 2) {
         const precision_t* e_type = cond + AR_E_TYPE_OFFSET + c->type * AR_EMBED_DIM;
-        const precision_t* e_prim = cond + AR_E_PRIMARY_OFFSET + c->primary * AR_EMBED_DIM;
         const precision_t* w_count = cond + AR_W_COUNT_OFFSET + opt * AR_EMBED_DIM;
+        int zone = primary_zone(c->type);
+        const precision_t* primary_key = zone >= 0 ? c->keys
+            + (token_start(c->counts, zone) + c->primary) * BA_KEY_DIM : NULL;
         #pragma unroll
         for (int d = 0; d < AR_EMBED_DIM; ++d) {
-            float cd = to_float(e_type[d]) + to_float(e_prim[d]);
+            float cd = to_float(e_type[d]);
+            if (primary_key) {
+                cd += to_float(primary_key[d]);
+#ifdef PUFFER_BALATRO
+            } else if (c->keys && c->counts && c->counts[ZONE_HAND] > 0) {
+                int n_hand = c->counts[ZONE_HAND];
+                int h_start = token_start(c->counts, ZONE_HAND);
+                float sum_k = 0.0f;
+                for (int i = 0; i < n_hand; ++i) {
+                    sum_k += to_float(c->keys[(h_start + i) * BA_KEY_DIM + d]);
+                }
+                cd += (sum_k / (float)n_hand) * 0.25f;
+#endif
+            }
             bias += cd * to_float(w_count[d]);
         }
     } else if (head >= 3 && head <= 7) {
         int pos = head - 3;
         const precision_t* e_type = cond + AR_E_TYPE_OFFSET + c->type * AR_EMBED_DIM;
-        const precision_t* e_prim = cond + AR_E_PRIMARY_OFFSET + c->primary * AR_EMBED_DIM;
         const precision_t* e_count = cond + AR_E_COUNT_OFFSET + c->count * AR_EMBED_DIM;
         const precision_t* e_pos = cond + AR_E_POS_OFFSET + pos * AR_EMBED_DIM;
-        const precision_t* w_card = cond + AR_W_CARD_OFFSET + opt * AR_EMBED_DIM;
-
-        int suit = ar_opt_attr(c, opt) >> POLICY_CARD_ATTR_SUIT_SHIFT;
-        int suit_cnt = (suit >= 0 && suit < 4) ? c->suit_counts[suit] : 0;
-        if (suit_cnt > 4) suit_cnt = 4;
-        const precision_t* e_suit = cond + AR_E_SUIT_OFFSET + suit_cnt * AR_EMBED_DIM;
-
-        int rank = ar_opt_attr(c, opt) & POLICY_CARD_ATTR_RANK_MASK;
-        int rank_cnt = (rank >= 1 && rank <= 14) ? c->rank_counts[rank] : 0;
-        if (rank_cnt > 4) rank_cnt = 4;
-        const precision_t* e_rank = cond + AR_E_RANK_OFFSET + rank_cnt * AR_EMBED_DIM;
-
-        int run = ar_run_through(c, opt);
-        if (run > 5) run = 5;
-        if (run < 1) run = 1;
-        const precision_t* e_run = cond + AR_E_RUN_OFFSET + (run - 1) * AR_EMBED_DIM;
+        const precision_t* candidate = c->keys
+            + (token_start(c->counts, ZONE_HAND) + opt) * BA_KEY_DIM;
+        int zone = primary_zone(c->type);
+        const precision_t* primary_key = zone >= 0 ? c->keys
+            + (token_start(c->counts, zone) + c->primary) * BA_KEY_DIM : NULL;
 
         #pragma unroll
         for (int d = 0; d < AR_EMBED_DIM; ++d) {
-            float cd = to_float(e_type[d]) + to_float(e_prim[d]) + to_float(e_count[d]) + to_float(e_pos[d])
-                     + c->card_ctx[d] + to_float(e_suit[d]) + to_float(e_rank[d]) + to_float(e_run[d]);
-            bias += cd * to_float(w_card[d]);
+            float cd = to_float(e_type[d]) + to_float(e_count[d]) + to_float(e_pos[d])
+                     + c->card_ctx[d];
+            if (primary_key) cd += to_float(primary_key[d]);
+            bias += cd * to_float(candidate[d]);
         }
     }
     return bias;
@@ -2081,6 +2067,8 @@ __global__ void cache_imp_and_v_balatro(
         const precision_t* __restrict__ action_mask,
         const int* __restrict__ act_sizes,
         const precision_t* __restrict__ condition,
+        const precision_t* __restrict__ keys,
+        const int* __restrict__ counts,
         int mask_stride,
         precision_t* __restrict__ imp_out,
         precision_t* __restrict__ value_out,
@@ -2107,7 +2095,9 @@ __global__ void cache_imp_and_v_balatro(
     if (valid && lane == 0) {
         value_out[idx] = dec_out.data[logits_base + A_total];
         contexts[warp] = ar_ctx_init(
-            action_mask, mask_base, actions, action_base);
+            action_mask, mask_base, actions, action_base,
+            keys + (int64_t)idx * BA_KEY_CAP * BA_KEY_DIM,
+            counts + idx * BA_POOL_SECTIONS);
         ar_ctx_set_count(&contexts[warp], actions, action_base);
     }
     __syncwarp();
@@ -2250,11 +2240,15 @@ Prec arch_forward_train(Arch* p, Weights& w,
         w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
     Prec dec = *puf_unsqueeze(&dec_out, 0, B, TT);
     #ifdef BALATRO_POINTER_DECODER
+    BalatroDecoderActivations* decoder =
+        (BalatroDecoderActivations*)activations.decoder;
     constexpr int cache_warps = BLOCK_SIZE / 32;
     int cache_blocks = (B * TT + cache_warps - 1) / cache_warps;
     cache_imp_and_v_balatro<<<cache_blocks, BLOCK_SIZE, 0, stream>>>(
         dec, g.mb_actions.data, g.mb_logprobs.data, g.mb_action_mask.data,
-        act_sizes, condition.data, (int)g.mb_action_mask.shape[2],
+        act_sizes, condition.data, decoder->enc->keys.data,
+        decoder->enc->counts.data,
+        (int)g.mb_action_mask.shape[2],
         g.mb_imp.data, g.mb_gae_v.data, logps, new_lp);
     #else
     cache_imp_and_v<<<grid_size(B * TT), BLOCK_SIZE, 0, stream>>>(
@@ -2420,7 +2414,7 @@ __global__ void ppo_loss_compute(
 #else
                 float d_logp = d_new_logp;
 #endif
-#ifdef POLICY_MASK_SIZE
+#if defined(POLICY_MASK_SIZE) && !defined(BALATRO_POINTER_DECODER)
                 float d_c_base[AR_EMBED_DIM];
                 #pragma unroll
                 for (int d = 0; d < AR_EMBED_DIM; ++d) d_c_base[d] = 0.0f;
@@ -2432,7 +2426,7 @@ __global__ void ppo_loss_compute(
                     float grad_l = ((j == act ? 1.0f : 0.0f) - p) * d_logp
                         + d_entropy_term * p * (-ent - logp);
                     a.grad_logits[at_base + logits_offset + j] = grad_l;
-#ifdef POLICY_MASK_SIZE
+#if defined(POLICY_MASK_SIZE) && !defined(BALATRO_POINTER_DECODER)
                     if (g_cond && a.condition && grad_l != 0.0f && h > 0 &&
                             ar_option_legal(&c, a.action_mask, mask_base, h, j)) {
                         if (h == 1) {
@@ -2495,7 +2489,7 @@ __global__ void ppo_loss_compute(
                     }
 #endif
                 }
-#ifdef POLICY_MASK_SIZE
+#if defined(POLICY_MASK_SIZE) && !defined(BALATRO_POINTER_DECODER)
                 // Accumulate prefix context gradients once per head:
                 if (g_cond && a.condition && h > 0) {
                     if (h == 1) {
@@ -2643,7 +2637,9 @@ __global__ void ppo_loss_balatro(
             }
             d_new_logp = d_ratio * ratio;
             contexts[warp] = ar_ctx_init(
-                a.action_mask, mask_base, g.actions, action_base);
+                a.action_mask, mask_base, g.actions, action_base,
+                a.keys + (int64_t)nt * BA_KEY_CAP * BA_KEY_DIM,
+                a.counts + nt * BA_POOL_SECTIONS);
             ar_ctx_set_count(&contexts[warp], g.actions, action_base);
         }
         d_new_logp = __shfl_sync(
@@ -2829,6 +2825,9 @@ __global__ void ar_condition_backward(
         const precision_t* __restrict__ condition,
         const int* __restrict__ act_sizes,
         float* __restrict__ grad_condition,
+        const precision_t* __restrict__ keys,
+        const int* __restrict__ counts,
+        float* __restrict__ key_grad,
         int mask_stride, int A_total, int total) {
     int lane = threadIdx.x & (BALATRO_PPO_WARP - 1);
     int warp = threadIdx.x / BALATRO_PPO_WARP;
@@ -2837,20 +2836,20 @@ __global__ void ar_condition_backward(
     int h = item % 8 + 2;
     bool valid = nt < total;
     __shared__ ARContext contexts[BALATRO_PPO_WARPS];
-    __shared__ unsigned short metadata[BALATRO_PPO_WARPS][POLICY_PRIMARY_COUNT];
-    __shared__ float context_grads[BALATRO_PPO_WARPS][AR_EMBED_DIM];
+    __shared__ unsigned char legal_options[BALATRO_PPO_WARPS][POLICY_PRIMARY_COUNT];
 
     int mask_base = nt * mask_stride;
     int action_base = nt * ACTION_STORAGE_SIZE;
     if (valid && lane == 0) {
         contexts[warp] = ar_ctx_init(
-            action_mask, mask_base, actions, action_base);
+            action_mask, mask_base, actions, action_base,
+            keys + (int64_t)nt * BA_KEY_CAP * BA_KEY_DIM,
+            counts + nt * BA_POOL_SECTIONS);
         ar_ctx_set_count(&contexts[warp], actions, action_base);
         for (int previous = 3; previous < h &&
                 previous < BALATRO_BASE_ACTION_HEADS; ++previous) {
             if (previous - 3 < contexts[warp].count) {
-                ar_ctx_advance(
-                    &contexts[warp], actions, action_base, condition);
+                ar_ctx_advance(&contexts[warp], actions, action_base, condition);
             }
         }
     }
@@ -2860,28 +2859,11 @@ __global__ void ar_condition_backward(
     int A = valid ? act_sizes[h] : 0;
     bool active = valid && ar_head_active(c, h);
     for (int option = lane; option < A; option += BALATRO_PPO_WARP) {
-        unsigned short packed = 0;
         bool legal = h == BALATRO_ORDER_HAND_HEAD ||
             h == BALATRO_ORDER_JOKER_HEAD
             ? option < order_count(c, h)
             : ar_option_legal(c, action_mask, mask_base, h, option);
-        if (active && legal) {
-            packed = 0x8000;
-            if (h >= 3 && h <= 7) {
-                int attr = ar_opt_attr(c, option);
-                int suit = attr >> POLICY_CARD_ATTR_SUIT_SHIFT;
-                int suit_count = suit >= 0 && suit < 4 ? c->suit_counts[suit] : 0;
-                if (suit_count > 4) suit_count = 4;
-                int rank = attr & POLICY_CARD_ATTR_RANK_MASK;
-                int rank_count = rank >= 1 && rank <= 14 ? c->rank_counts[rank] : 0;
-                if (rank_count > 4) rank_count = 4;
-                int run = ar_run_through(c, option);
-                if (run > 5) run = 5;
-                if (run < 1) run = 1;
-                packed |= suit_count | (rank_count << 3) | ((run - 1) << 6);
-            }
-        }
-        metadata[warp][option] = packed;
+        legal_options[warp][option] = active && legal;
     }
     __syncwarp();
 
@@ -2895,122 +2877,107 @@ __global__ void ar_condition_backward(
         int at_base = nt * A_total + logits_offset;
         float* gradient = grad_condition
             + (nt & (COND_STRIPE_COUNT - 1)) * AR_CONDITION_SIZE;
-        float context_value;
-        int weight_offset;
+        float context_value = to_float(condition[AR_E_TYPE_OFFSET
+            + c->type * AR_EMBED_DIM + d]);
+        int pzone = primary_zone(c->type);
+        int primary_index = pzone >= 0
+            ? token_start(c->counts, pzone) + c->primary : -1;
+        if (primary_index >= 0) {
+            context_value += to_float(c->keys[primary_index * BA_KEY_DIM + d]);
+        } else if (h == 2 && c->keys && c->counts && c->counts[ZONE_HAND] > 0) {
+            int n_hand = c->counts[ZONE_HAND];
+            int h_start = token_start(c->counts, ZONE_HAND);
+            float sum_k = 0.0f;
+            for (int i = 0; i < n_hand; ++i) {
+                sum_k += to_float(c->keys[(h_start + i) * BA_KEY_DIM + d]);
+            }
+            context_value += (sum_k / (float)n_hand) * 0.25f;
+        }
         if (h == 2) {
-            context_value = to_float(condition[AR_E_TYPE_OFFSET
-                + c->type * AR_EMBED_DIM + d])
-                + to_float(condition[AR_E_PRIMARY_OFFSET
-                    + c->primary * AR_EMBED_DIM + d]);
-            weight_offset = AR_W_COUNT_OFFSET;
+            // The count output retains a six-row learned projection. Counts
+            // are grammar values, not observable entities with encoder keys.
         } else if (h >= 3 && h <= 7) {
-            int pos = h - 3;
-            context_value = to_float(condition[AR_E_TYPE_OFFSET
-                + c->type * AR_EMBED_DIM + d])
-                + to_float(condition[AR_E_PRIMARY_OFFSET
-                    + c->primary * AR_EMBED_DIM + d])
-                + to_float(condition[AR_E_COUNT_OFFSET
+                        int pos = h - 3;
+            context_value += to_float(condition[AR_E_COUNT_OFFSET
                     + c->count * AR_EMBED_DIM + d])
                 + to_float(condition[AR_E_POS_OFFSET
                     + pos * AR_EMBED_DIM + d]) + c->card_ctx[d];
-            weight_offset = AR_W_CARD_OFFSET;
         } else {
-            context_value = to_float(condition[AR_E_TYPE_OFFSET
-                + c->type * AR_EMBED_DIM + d])
-                + to_float(condition[AR_E_PRIMARY_OFFSET
-                    + c->primary * AR_EMBED_DIM + d])
-                + to_float(condition[AR_E_COUNT_OFFSET
+            context_value += to_float(condition[AR_E_COUNT_OFFSET
                     + c->count * AR_EMBED_DIM + d]) + c->card_ctx[d];
-            weight_offset = h == BALATRO_ORDER_HAND_HEAD
-                ? AR_W_ORDER_HAND_OFFSET : AR_W_ORDER_JOKER_OFFSET;
         }
 
-        float d_suit[5] = {0.0f};
-        float d_rank[5] = {0.0f};
-        float d_run[5] = {0.0f};
         for (int option = 0; option < A; ++option) {
-            unsigned short packed = metadata[warp][option];
-            if (!(packed & 0x8000)) continue;
+            if (!legal_options[warp][option]) continue;
             float grad = grad_logits[at_base + option];
-            int weight = weight_offset + option * AR_EMBED_DIM + d;
             float option_context = context_value;
-            if (h >= 3 && h <= 7) {
-                int suit = packed & 7;
-                int rank = (packed >> 3) & 7;
-                int run = (packed >> 6) & 7;
-                option_context += to_float(condition[AR_E_SUIT_OFFSET
-                    + suit * AR_EMBED_DIM + d])
-                    + to_float(condition[AR_E_RANK_OFFSET
-                        + rank * AR_EMBED_DIM + d])
-                    + to_float(condition[AR_E_RUN_OFFSET
-                        + run * AR_EMBED_DIM + d]);
-                float derivative = grad * to_float(condition[weight]);
-                d_suit[suit] += derivative;
-                d_rank[rank] += derivative;
-                d_run[run] += derivative;
-                d_context += derivative;
+            int candidate_index = -1;
+            float weight_value;
+            if (h == 2) {
+                int weight = AR_W_COUNT_OFFSET + option * AR_EMBED_DIM + d;
+                weight_value = to_float(condition[weight]);
+                atomicAdd(gradient + weight, grad * option_context);
             } else {
-                d_context += grad * to_float(condition[weight]);
+                int zone = h <= 7 ? ZONE_HAND
+                    : h == BALATRO_ORDER_HAND_HEAD ? ZONE_HAND : ZONE_JOKER;
+                candidate_index = token_start(c->counts, zone) + option;
+                weight_value = to_float(c->keys[
+                    candidate_index * BA_KEY_DIM + d]);
             }
-            atomicAdd(gradient + weight, grad * option_context);
+            d_context += grad * weight_value;
+            if (candidate_index >= 0) {
+                atomicAdd(key_grad + (int64_t)nt * BA_KEY_CAP * AR_EMBED_DIM
+                    + candidate_index * AR_EMBED_DIM + d,
+                    grad * option_context);
+            }
         }
 
-        if (h >= 3 && h <= 7) {
-            #pragma unroll
-            for (int bucket = 0; bucket < 5; ++bucket) {
-                if (d_suit[bucket] != 0.0f) {
-                    atomicAdd(gradient + AR_E_SUIT_OFFSET
-                        + bucket * AR_EMBED_DIM + d, d_suit[bucket]);
-                }
-                if (d_rank[bucket] != 0.0f) {
-                    atomicAdd(gradient + AR_E_RANK_OFFSET
-                        + bucket * AR_EMBED_DIM + d, d_rank[bucket]);
-                }
-                if (d_run[bucket] != 0.0f) {
-                    atomicAdd(gradient + AR_E_RUN_OFFSET
-                        + bucket * AR_EMBED_DIM + d, d_run[bucket]);
-                }
-            }
-        }
     }
 
-    if (lane < AR_EMBED_DIM) context_grads[warp][lane] = d_context;
-    __syncthreads();
-    if (valid && warp == 0 && lane < AR_EMBED_DIM) {
+    if (active && lane < AR_EMBED_DIM) {
         int d = lane;
         float* gradient = grad_condition
             + (nt & (COND_STRIPE_COUNT - 1)) * AR_CONDITION_SIZE;
-        float total_context = 0.0f;
-        float count_context = 0.0f;
-        #pragma unroll
-        for (int head = 0; head < BALATRO_PPO_WARPS; ++head) {
-            total_context += context_grads[head][d];
-            if (head > 0) count_context += context_grads[head][d];
-        }
-        if (count_context != 0.0f)
-            atomicAdd(gradient + AR_E_COUNT_OFFSET
-                + contexts[0].count * AR_EMBED_DIM + d, count_context);
-        if (total_context != 0.0f) {
+        if (d_context != 0.0f) {
             atomicAdd(gradient + AR_E_TYPE_OFFSET
-                + contexts[0].type * AR_EMBED_DIM + d, total_context);
-            atomicAdd(gradient + AR_E_PRIMARY_OFFSET
-                + contexts[0].primary * AR_EMBED_DIM + d, total_context);
+                + c->type * AR_EMBED_DIM + d, d_context);
+            int pzone = primary_zone(c->type);
+            if (pzone >= 0) {
+                int primary_index = token_start(c->counts, pzone) + c->primary;
+                atomicAdd(key_grad + (int64_t)nt * BA_KEY_CAP * AR_EMBED_DIM
+                    + primary_index * AR_EMBED_DIM + d, d_context);
+            } else if (h == 2 && c->keys && c->counts && c->counts[ZONE_HAND] > 0) {
+                int n_hand = c->counts[ZONE_HAND];
+                int h_start = token_start(c->counts, ZONE_HAND);
+                float grad_card = (d_context / (float)n_hand) * 0.25f;
+                for (int i = 0; i < n_hand; ++i) {
+                    atomicAdd(key_grad + (int64_t)nt * BA_KEY_CAP * AR_EMBED_DIM
+                        + (h_start + i) * AR_EMBED_DIM + d, grad_card);
+                }
+            }
         }
-        #pragma unroll
-        for (int pos = 0; pos < MAX_SELECTION; ++pos) {
-            float pos_context = context_grads[pos + 1][d];
-            if (pos_context != 0.0f)
-                atomicAdd(gradient + AR_E_POS_OFFSET
-                    + pos * AR_EMBED_DIM + d, pos_context);
-            float card_context = 0.0f;
-            #pragma unroll
-            for (int head = pos + 2; head < BALATRO_PPO_WARPS; ++head)
-                card_context += context_grads[head][d];
-            if (pos < contexts[6].pos && card_context != 0.0f)
-                atomicAdd(gradient + AR_E_CARD_OFFSET
-                    + contexts[6].selected_cards[pos] * AR_EMBED_DIM + d,
-                    card_context);
+        if (h >= 3 && d_context != 0.0f) {
+            atomicAdd(gradient + AR_E_COUNT_OFFSET
+                + c->count * AR_EMBED_DIM + d, d_context);
         }
+        if (h >= 3 && h <= 7 && d_context != 0.0f) {
+            atomicAdd(gradient + AR_E_POS_OFFSET
+                + (h - 3) * AR_EMBED_DIM + d, d_context);
+        }
+        int hand_start = token_start(c->counts, ZONE_HAND);
+        float gate = 1.0f + to_float(condition[AR_GATE_OFFSET
+            + c->type * AR_EMBED_DIM + d]);
+        float gate_gradient = 0.0f;
+        for (int pos = 0; pos < c->pos; ++pos) {
+            int selected = hand_start + c->selected_cards[pos];
+            float key = to_float(c->keys[selected * BA_KEY_DIM + d]);
+            atomicAdd(key_grad + (int64_t)nt * BA_KEY_CAP * AR_EMBED_DIM
+                + selected * AR_EMBED_DIM + d, gate * d_context);
+            gate_gradient += key * d_context;
+        }
+        if (gate_gradient != 0.0f)
+            atomicAdd(gradient + AR_GATE_OFFSET
+                + c->type * AR_EMBED_DIM + d, gate_gradient);
     }
 }
 #endif
@@ -3056,7 +3023,9 @@ void ppo_loss_fwd_bwd(
         float clip_coef, float vf_clip_coef, float vf_coef, const float* ent_coef,
         PPOBufs& bufs, bool is_continuous,
         Prec condition, Float condition_accum, Prec condition_grad,
-        Float condition_parts, cudaStream_t stream) {
+        Float condition_parts, Prec keys, Int counts,
+        Float key_grad,
+        cudaStream_t stream) {
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
     int A_total = fused_cols - 1;  // last column is value
     int total = N * T;
@@ -3072,6 +3041,10 @@ void ppo_loss_fwd_bwd(
     if (condition_parts.data) {
         cudaMemsetAsync(condition_parts.data, 0,
             numel(condition_parts.shape) * sizeof(float), stream);
+    }
+    if (key_grad.data) {
+        cudaMemsetAsync(key_grad.data, 0,
+            numel(key_grad.shape) * sizeof(float), stream);
     }
 
     PPOGraphArgs graph_args = {
@@ -3093,6 +3066,9 @@ void ppo_loss_fwd_bwd(
         .grad_logstd = is_continuous ? bufs.grad_logstd.data : NULL,
         .action_mask = graph.mb_action_mask.data,
         .condition = condition.data,
+        .keys = keys.data,
+        .counts = counts.data,
+        .key_grad = key_grad.data,
         .grad_condition = condition_parts.data,
         .mask_stride = (int)graph.mb_action_mask.shape[2],
         .num_atns = POLICY_NUM_ATNS,
@@ -3112,7 +3088,8 @@ void ppo_loss_fwd_bwd(
         ar_condition_backward<<<blocks, PPO_THREADS, 0, stream>>>(
             bufs.grad_logits.data, graph.mb_actions.data,
             graph.mb_action_mask.data, condition.data, act_sizes,
-            condition_parts.data, (int)graph.mb_action_mask.shape[2],
+            condition_parts.data, keys.data, counts.data, key_grad.data,
+            (int)graph.mb_action_mask.shape[2],
             A_total, total);
     }
     #else
