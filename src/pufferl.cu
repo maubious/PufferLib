@@ -1313,19 +1313,24 @@ __global__ void sample_logits_balatro(
                     s_order_keys[warp][opt] = __logf(-__logf(curand_uniform(&state)))
                         - (s_order_scores[warp][opt] - max_sc);
                 }
-                for (int position = 0; position < count; ++position) {
-                    float minimum = INFINITY;
-                    int sampled = -1;
-                    for (int opt = 0; opt < count; ++opt) {
-                        if (s_order_keys[warp][opt] <= minimum) {
-                            minimum = s_order_keys[warp][opt];
-                            sampled = opt;
-                        }
+            }
+            __syncwarp();
+            // Rank independent Gumbel keys across the wave. Equal keys retain
+            // the sampler's descending-index tie break.
+            for (int part = 0; part < 2; ++part) {
+                int opt = lane + part * WARP;
+                if (opt < count) {
+                    float key = s_order_keys[warp][opt];
+                    int position = 0;
+                    for (int other = 0; other < count; ++other) {
+                        float other_key = s_order_keys[warp][other];
+                        position += other_key < key || (other_key == key && other > opt);
                     }
-                    assert(sampled >= 0);
-                    actions[action_base + output_offset + position] = from_float((float)sampled);
-                    s_order_keys[warp][sampled] = INFINITY;
+                    actions[action_base + output_offset + position] = from_float((float)opt);
                 }
+            }
+            __syncwarp();
+            if (lane == 0) {
                 float suffix_log = -INFINITY;
                 for (int position = count - 1; position >= 0; --position) {
                     int sampled = (int)to_float(actions[action_base + output_offset + position]);

@@ -9,6 +9,7 @@
 
 #include <assert.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -119,6 +120,10 @@ typedef struct Log {
 	float perf;
 	float wins;
 	float ante;
+	/* Sum over episodes of the episode's peak log10(hand score): the
+	   normalized metric env/max_hand_log10 is the mean upper tail of the
+	   single-hand score distribution (10^v ≈ score digits). */
+	float max_hand_log10;
 	float invalid_actions;
 	float truncations;
 	float n;
@@ -169,6 +174,9 @@ typedef struct Env {
     int tag;
     int boundary_reached;
     float episode_reward;
+    /* Running per-episode max of log10(hand score); folded into
+       log.max_hand_log10 at the episode boundary, reset by puf_reset. */
+    float episode_peak_hand_log10;
     unsigned int rng;
     uint32_t episode_steps;
     uint32_t max_episode_steps;
@@ -276,6 +284,7 @@ static inline void puffer_state_refresh(Env *env) {
     puffer_observe(env);
     env->episode_steps = 0;
     env->episode_reward = 0.0f;
+    env->episode_peak_hand_log10 = 0.0f;
     env->boundary_reached = 0;
 }
 
@@ -284,6 +293,7 @@ void puf_init(Env *env, Dict *kwargs) {
     env->tag = 0;
     env->boundary_reached = 0;
     env->episode_reward = 0.0f;
+    env->episode_peak_hand_log10 = 0.0f;
     env->agents[0].policy = 0;
     default_config(&env->config);
     env->deck_config = 0;
@@ -437,6 +447,7 @@ void puf_reset(Env *env) {
     env->agents[0].terminals[0] = 0.0f;
     env->boundary_reached = 0;
     env->episode_reward = 0.0f;
+    env->episode_peak_hand_log10 = 0.0f;
     env->episode_steps = 0;
     puffer_observe(env);
 }
@@ -476,6 +487,7 @@ static void truncate_episode(Env *env) {
     env->log.score += env->episode_reward;
     env->log.perf += episode_perf(env);
     log_episode_end(env, 0);
+    env->log.max_hand_log10 += env->episode_peak_hand_log10;
     puf_reset(env);
     /* puf_reset clears the reward slot; restore the boundary transition's
        reward after resetting the next episode's state. */
@@ -683,6 +695,16 @@ void puf_step(Env *env) {
     int error = action_is_legal
         ? apply_step(&env->state, &policy, &env->legal_masks, &result)
         : ERR_ACTION;
+    /* Every played hand sets state.last_hand_score; keep the episode's
+       peak log10 for the max_hand_log10 metric. */
+    if (error == OK && policy.type == ACTION_PLAY_HAND) {
+        double hand_score = env->state.last_hand_score;
+        if (isfinite(hand_score) && hand_score > 0.0) {
+            double peak = log10(hand_score);
+            if (peak > env->episode_peak_hand_log10)
+                env->episode_peak_hand_log10 = (float)peak;
+        }
+    }
     if (error == OK && policy.type == ACTION_PLAY_HAND && env->client) {
         score_anim_start(env->client, &env->state);
     }
@@ -719,6 +741,7 @@ void puf_step(Env *env) {
         env->log.ante += result.ante;
         env->log.n += 1.0f;
         log_episode_end(env, result.won);
+        env->log.max_hand_log10 += env->episode_peak_hand_log10;
         puf_reset(env);
         env->agents[0].rewards[0] = result.reward;
         env->agents[0].terminals[0] = 1.0f;
@@ -747,6 +770,7 @@ void puf_log(Log *log, Dict *out) {
     dict_set(out, "perf", log->perf);
     dict_set(out, "wins", log->wins);
     dict_set(out, "ante", log->ante);
+    dict_set(out, "max_hand_log10", log->max_hand_log10);
 	dict_set(out, "invalid_actions", log->invalid_actions);
 	dict_set(out, "truncations", log->truncations);
     dict_set(out, "end_dollars", log->end_dollars);

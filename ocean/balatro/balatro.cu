@@ -619,26 +619,10 @@ __device__ __forceinline__ void ba_token_features(
     }
 }
 
-__global__ void __launch_bounds__(256, 4) ba_encode_kernel(
+__global__ void encode_globals(
         precision_t* __restrict__ pooled,
-        precision_t* __restrict__ keys,
-        int* __restrict__ counts_out,
-        int* __restrict__ relu_mask,
-        int* __restrict__ pool_argmax,
-        const precision_t* __restrict__ token_w,
-        const precision_t* __restrict__ token_b,
-        const precision_t* __restrict__ token_embed,
         const precision_t* __restrict__ state_embed,
-        const unsigned char* __restrict__ obs,
-        int B, int obs_size) {
-    __shared__ float s_pool_sum[BA_POOL_SECTIONS][BA_TOKEN_DIM];
-    __shared__ float s_special_sum[BA_TOKEN_DIM];
-    __shared__ unsigned long long s_pool_max[BA_MAX_POOL_SECTIONS][BA_TOKEN_DIM];
-    __shared__ float s_raw[BLOCK_SIZE / 32][BA_RAW_DIM];
-    __shared__ int s_counts[BA_POOL_SECTIONS];
-    __shared__ int s_total;
-    __shared__ uint8_t s_struct_counts[BA_HAND_STRUCT_FEATURES];
-
+        const unsigned char* __restrict__ obs, int B, int obs_size) {
     int b = blockIdx.x;
     if (b >= B) return;
     int64_t in = (int64_t)b * obs_size;
@@ -898,7 +882,34 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
         }
         pooled[b * BA_TOTAL + BA_OFF_GLOBALS + local] = from_float(value);
     }
+}
 
+// Token work uses two waves per observation; fixed-field decoding has its
+// own wider block so its register lifetime does not constrain token processing.
+template<int Threads>
+__global__ void __launch_bounds__(Threads, 4) encode_tokens(
+        precision_t* __restrict__ pooled,
+        precision_t* __restrict__ keys,
+        int* __restrict__ counts_out,
+        int* __restrict__ relu_mask,
+        int* __restrict__ pool_argmax,
+        const precision_t* __restrict__ token_w,
+        const precision_t* __restrict__ token_b,
+        const precision_t* __restrict__ token_embed,
+        const unsigned char* __restrict__ obs,
+        int B, int obs_size) {
+    static_assert(Threads >= 32 && Threads <= 256 && Threads % 32 == 0);
+    __shared__ float s_pool_sum[BA_POOL_SECTIONS][BA_TOKEN_DIM];
+    __shared__ float s_special_sum[BA_TOKEN_DIM];
+    __shared__ unsigned long long s_pool_max[BA_MAX_POOL_SECTIONS][BA_TOKEN_DIM];
+    __shared__ float s_raw[Threads / 32][BA_RAW_DIM];
+    __shared__ int s_counts[BA_POOL_SECTIONS];
+    __shared__ int s_total;
+    __shared__ uint8_t s_struct_counts[BA_HAND_STRUCT_FEATURES];
+
+    int b = blockIdx.x;
+    if (b >= B) return;
+    int64_t in = (int64_t)b * obs_size;
     // 2. Decode live tokens and apply the shared typed token MLP.
     if (threadIdx.x == 0) {
         ba_live_counts(obs, in, s_counts);
@@ -952,7 +963,7 @@ __global__ void __launch_bounds__(256, 4) ba_encode_kernel(
     __syncthreads();
 
     constexpr int TOKEN_WARP = 32;
-    constexpr int TOKEN_WARPS = BLOCK_SIZE / TOKEN_WARP;
+    constexpr int TOKEN_WARPS = Threads / TOKEN_WARP;
     int lane = threadIdx.x & (TOKEN_WARP - 1);
     int warp = threadIdx.x / TOKEN_WARP;
     for (int slot = warp; slot < total; slot += TOKEN_WARPS) {
@@ -1628,11 +1639,13 @@ static Prec ba_encoder_forward(
     int B = input.shape[0];
     a->obs_data = input.data;
     a->obs_batch = B;
-    ba_encode_kernel<<<B, BLOCK_SIZE, 0, stream>>>(
+    encode_globals<<<B, BLOCK_SIZE, 0, stream>>>(
+        a->pooled.data, ew->state_embed.data, input.data, B, ew->obs_size);
+    encode_tokens<64><<<B, 64, 0, stream>>>(
         a->pooled.data, a->keys.data, a->counts.data,
         a->relu_mask.data, a->pool_argmax.data,
         ew->token_w.data, ew->token_b.data,
-        ew->token_embed.data, ew->state_embed.data,
+        ew->token_embed.data,
         input.data, B, ew->obs_size);
     puf_mm(&a->pooled, &ew->proj_w, &a->out, stream);
     return a->out;
