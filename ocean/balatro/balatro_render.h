@@ -3763,10 +3763,21 @@ static inline void balatro_render(Env *env) {
                          anim->after_levels[first_hand] - anim->before_levels[first_hand]);
             else if (upgraded > 1)
                 snprintf(outcome, sizeof(outcome), "%d HAND TYPES UPGRADED", upgraded);
-            if (anim->after_dollars != anim->before_dollars)
+            /* Buy-and-use / pack purchases move money in the same step as the
+               card effect; the money delta must not clobber the effect line.
+               Money-only effects (Hermit, Temperance) keep the single line. */
+            int money_changed = anim->after_dollars != anim->before_dollars;
+            if (upgraded == 0 && money_changed)
                 snprintf(outcome, sizeof(outcome), "MONEY  $%d -> $%d", anim->before_dollars, anim->after_dollars);
+            int outcome_y = (int)center_y + (upgraded > 0 ? 76 : 88);
             DrawText(outcome, (int)(center_x - MeasureText(outcome, 16) * 0.5f),
-                     (int)(center_y + 88), 16, magic);
+                     outcome_y, 16, magic);
+            if (upgraded > 0 && money_changed) {
+                char money[48];
+                snprintf(money, sizeof(money), "MONEY  $%d -> $%d", anim->before_dollars, anim->after_dollars);
+                DrawText(money, (int)(center_x - MeasureText(money, 13) * 0.5f),
+                         (int)center_y + 102, 13, BALATRO_GOLD);
+            }
         }
     } else {
         switch (env->state.phase) {

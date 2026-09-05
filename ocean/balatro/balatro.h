@@ -32,7 +32,7 @@
 #define ACTION_STORAGE_SIZE BALATRO_ACTION_STORAGE_SIZE
 #define POLICY_NUM_ATNS BALATRO_POLICY_HEADS
 #define NUM_ATNS ACTION_STORAGE_SIZE
-#define ACT_SIZES {23, POLICY_PRIMARY_HEAD_SIZE, 6, 64, 64, 64, 64, 64, 64, 32}
+#define ACT_SIZES {23, POLICY_PRIMARY_COUNT, 6, 64, 64, 64, 64, 64, 64, 32}
 #define BALATRO_POINTER_DECODER
 #define ACTION_MASK_SIZE POLICY_MASK_SIZE
 #define INVALID_ACTION_REWARD (-0.002f)
@@ -248,6 +248,16 @@ static int puffer_observe(Env *env) {
             store_u64(env->agents[0].action_mask + POLICY_PRIMARY_OFFSET +
                 type * POLICY_PRIMARY_BYTES, primaries);
         }
+        int choices = 0;
+        for (int type = 0; type < ACTION_TYPE_COUNT; ++type) choices += env->agents[0].action_mask[type];
+        if (!choices) {
+            fprintf(stderr, "Empty engine mask: phase=%u hand=%u deck=%u discard=%u jokers=%u consumables=%u terminal=%u\n",
+                env->state.phase, env->state.hand_count, env->state.deck_count, env->state.discard_count,
+                env->state.joker_count, env->state.consumable_count, env->state.terminal);
+            FILE* file = fopen("/tmp/balatro-empty-state.bin", "wb");
+            assert(file); fwrite(&env->state, sizeof(State), 1, file); fclose(file);
+        }
+        assert(choices);
         store_selection(env->agents[0].action_mask,
             policy_selection_entry(ACTION_PLAY_HAND, 0),
             &env->legal_masks.play);

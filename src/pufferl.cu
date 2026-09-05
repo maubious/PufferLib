@@ -419,7 +419,7 @@ struct RolloutBuf {
     Prec initial_states;
     Prec actions;       // (horizon, agents, num_atns)
     Prec values;        // (horizon, agents)
-    Prec logprobs;      // ...
+    Float logprobs;     // Joint AR log-probabilities must retain FP32 precision.
     Prec rewards;
     Prec rnn_resets;    // reset before processing observations[t]
     Prec transition_dones; // done after executing actions[t]
@@ -441,8 +441,9 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
     bufs->transition_dones = {.shape = {T, B}};
     bufs->action_mask  = {.shape = {T, B, mask_size}};
     alloc_register(alloc, &bufs->observations);
+    alloc_register(alloc, &bufs->logprobs);
     Prec* fields[] = {
-        &bufs->actions, &bufs->values, &bufs->logprobs,
+        &bufs->actions, &bufs->values,
         &bufs->rewards, &bufs->rnn_resets, &bufs->transition_dones,
         &bufs->action_mask,
     };
@@ -453,7 +454,7 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
 
 // Rank-2 or rank-3 time-major tensor. F==0 means rank-2 (zero-terminated shape);
 // stride still multiplies by max(F, 1).
-Prec puf_time_view(Prec p, int start_t, int T) {
+template<class Tensor> Tensor puf_time_view(Tensor p, int start_t, int T) {
     long B = p.shape[1];
     long F = p.shape[2];
     long stride_f = F > 1 ? F : 1;
@@ -677,12 +678,13 @@ __global__ void rng_init(curandStatePhilox4_32_10_t* states, uint64_t seed, int 
 // Discrete: core heads use cached logsumexp + inverse-CDF; Balatro order
 // heads use an exact Plackett-Luce exponential race. Mask always present.
 // Continuous: ignores mask.
+#ifndef BALATRO_POINTER_DECODER
 __global__ void sample_logits(
         Prec dec_out,              // (B, logits_dim + 1)
         Prec logstd,           // (1, od) continuous only; .data null if discrete
         int* act_sizes,            // (POLICY_NUM_ATNS,)
         precision_t* actions,                 // (B, num_atns)
-        precision_t* logprobs,                // (B,)
+        float* logprobs,                // (B,)
         precision_t* value_out,               // (B,)
         curandStatePhilox4_32_10_t* rng_states,
         precision_t* action_mask,             // (B, A_total); always allocated
@@ -724,631 +726,64 @@ __global__ void sample_logits(
         int logits_offset = 0;
         int mask_base = idx * mask_stride;
         int action_base = idx * ACTION_STORAGE_SIZE;
-#ifdef POLICY_MASK_SIZE
-        // AR sampling: heads 0-2 (type/primary/count) populate the context
-        // incrementally, then card heads 3-7 sample against the hoisted prefix.
-        // Equivalent to the generic loop below, but each option's legality and
-        // condition index is O(1) instead of re-deriving the whole prefix.
-        {
-            int A0 = act_sizes[0];
-            float cache0[PPO_MAX_HEAD_A];
-            float max_l = -INFINITY, sum = 0.0f;
-            actions[action_base] = from_float(0.0f);
-            for (int a = 0; a < A0; ++a) {
-                float l = mask_byte(action_mask, mask_base, a) != 0
-                    ? to_float(logits[logits_base + logits_offset + a]) : -1e4f;
-                cache0[a] = l;
-                if (l > max_l) { sum *= __expf(max_l - l); max_l = l; }
-                sum += __expf(l - max_l);
-            }
-            float logsumexp = max_l + __logf(sum);
-            float rand_val = curand_uniform(&state);
-            float cumsum = 0.0f;
-            int sampled = -1;
-            for (int a = 0; a < A0; ++a) {
-                if (mask_byte(action_mask, mask_base, a) == 0) continue;
-                cumsum += expf(cache0[a] - logsumexp);
-                if (rand_val < cumsum) { sampled = a; break; }
-            }
-            if (sampled < 0) {
-                for (int a = 0; a < A0; ++a) {
-                    if (mask_byte(action_mask, mask_base, a) != 0) {
-                        sampled = a;
-                        break;
-                    }
-                }
-            }
-            if (sampled < 0) sampled = 0;
-            actions[action_base] = from_float((float)sampled);
-            total_log_prob += cache0[sampled] - logsumexp;
-            logits_offset += A0;
-        }
-
-        ARContext ar = ar_ctx_init(action_mask, mask_base, actions, action_base);
-        {
-            int A1 = act_sizes[1];
-            actions[action_base + 1] = from_float(0.0f);
-            if (ar_head_active(&ar, 1)) {
-                #ifdef BALATRO_POINTER_DECODER
-                constexpr int A1_LOCAL = POLICY_PRIMARY_COUNT;
-                float cache1[A1_LOCAL];
-                int primary_slice = policy_primary_head_offset(ar.type);
-                assert(primary_slice >= 0);
-                int primary_offset = primary_slice * POLICY_PRIMARY_COUNT;
-                #else
-                float cache1[PPO_MAX_HEAD_A];
-                int primary_offset = 0;
-                int A1_LOCAL = A1;
-                #endif
-                float max_l = -INFINITY, sum = 0.0f;
-                for (int a = 0; a < A1_LOCAL; ++a) {
-                    int physical = primary_offset + a;
-                    float l = ar_option_legal(&ar, action_mask, mask_base, 1, a)
-                        ? to_float(logits[logits_base + logits_offset + physical]) +
-                            #ifdef BALATRO_POINTER_DECODER
-                            0.0f
-                            #else
-                            ar_cond_bias(&ar, condition, 1, a)
-                            #endif
-                        : -1e4f;
-                    cache1[a] = l;
-                    if (l > max_l) { sum *= __expf(max_l - l); max_l = l; }
-                    sum += __expf(l - max_l);
-                }
-                float logsumexp = max_l + __logf(sum);
-                float rand_val = curand_uniform(&state);
-                float cumsum = 0.0f;
-                int sampled = -1;
-                for (int a = 0; a < A1_LOCAL; ++a) {
-                    if (!ar_option_legal(&ar, action_mask, mask_base, 1, a)) continue;
-                    cumsum += expf(cache1[a] - logsumexp);
-                    if (rand_val < cumsum) { sampled = a; break; }
-                }
-                if (sampled < 0) {
-                    for (int a = 0; a < A1_LOCAL; ++a) {
-                        if (ar_option_legal(&ar, action_mask, mask_base, 1, a)) {
-                            sampled = a;
-                            break;
-                        }
-                    }
-                }
-                if (sampled < 0) sampled = 0;
-                actions[action_base + 1] = from_float((float)sampled);
-                total_log_prob += cache1[sampled] - logsumexp;
-            }
-            logits_offset += A1;
-        }
-
-        ar = ar_ctx_init(action_mask, mask_base, actions, action_base);
-        {
-            int A2 = act_sizes[2];
-            actions[action_base + 2] = from_float(0.0f);
-            if (ar_head_active(&ar, 2)) {
-                float cache2[PPO_MAX_HEAD_A];
-                float max_l = -INFINITY, sum = 0.0f;
-                for (int a = 0; a < A2; ++a) {
-                    float l = ar_option_legal(&ar, action_mask, mask_base, 2, a)
-                        ? to_float(logits[logits_base + logits_offset + a]) +
-                            ar_cond_bias(&ar, condition, 2, a)
-                        : -1e4f;
-                    cache2[a] = l;
-                    if (l > max_l) { sum *= __expf(max_l - l); max_l = l; }
-                    sum += __expf(l - max_l);
-                }
-                float logsumexp = max_l + __logf(sum);
-                float rand_val = curand_uniform(&state);
-                float cumsum = 0.0f;
-                int sampled = -1;
-                for (int a = 0; a < A2; ++a) {
-                    if (!ar_option_legal(&ar, action_mask, mask_base, 2, a)) continue;
-                    cumsum += expf(cache2[a] - logsumexp);
-                    if (rand_val < cumsum) { sampled = a; break; }
-                }
-                if (sampled < 0) {
-                    for (int a = 0; a < A2; ++a) {
-                        if (ar_option_legal(&ar, action_mask, mask_base, 2, a)) {
-                            sampled = a;
-                            break;
-                        }
-                    }
-                }
-                if (sampled < 0) sampled = 0;
-                actions[action_base + 2] = from_float((float)sampled);
-                total_log_prob += cache2[sampled] - logsumexp;
-            }
-            logits_offset += A2;
-        }
-        ar_ctx_set_count(&ar, actions, action_base);
-
-#ifdef PUFFER_BALATRO
-        for (int h = 3; h < BALATRO_BASE_ACTION_HEADS; h++) {
-#else
-        for (int h = 3; h < num_atns; h++) {
-#endif
-            int A = act_sizes[h];
-            actions[action_base + h] = from_float(0.0f);
-            if (!ar_head_active(&ar, h)) {
-                logits_offset += A;
-                continue;
-            }
-            float cache[PPO_MAX_HEAD_A];
-            float max_l = -INFINITY, sum = 0.0f;
-            for (int a = 0; a < A; ++a) {
-                float l = ar_option_legal(&ar, action_mask, mask_base, h, a)
-                    ? to_float(logits[logits_base + logits_offset + a]) +
-                        ar_cond_bias(&ar, condition, h, a)
-                    : -1e4f;
-                cache[a] = l;
-                if (l > max_l) { sum *= __expf(max_l - l); max_l = l; }
-                sum += __expf(l - max_l);
-            }
-            float logsumexp = max_l + __logf(sum);
-            float rand_val = curand_uniform(&state);
-            float cumsum = 0.0f;
-            int sampled = -1;
-            for (int a = 0; a < A; ++a) {
-                if (!ar_option_legal(&ar, action_mask, mask_base, h, a)) continue;
-                cumsum += expf(cache[a] - logsumexp);
-                if (rand_val < cumsum) { sampled = a; break; }
-            }
-            if (sampled < 0) {
-                for (int a = 0; a < A; ++a) {
-                    if (ar_option_legal(&ar, action_mask, mask_base, h, a)) {
-                        sampled = a;
-                        break;
-                    }
-                }
-            }
-            if (sampled < 0) sampled = 0;
-            actions[action_base + h] = from_float((float)sampled);
-            total_log_prob += cache[sampled] - logsumexp;
-            logits_offset += A;
-            ar_ctx_advance(&ar, actions, action_base, condition);
-        }
-#ifdef PUFFER_BALATRO
-        for (int h = BALATRO_ORDER_HAND_HEAD;
-             h <= BALATRO_ORDER_JOKER_HEAD; ++h) {
-            int A = act_sizes[h];
-            int count = order_count(&ar, h);
-            int output_offset = order_offset(h);
-            int score_offset = logits_offset;
-            for (int i = 0; i < (h == BALATRO_ORDER_HAND_HEAD
-                    ? OBS_MAX_HAND : OBS_MAX_JOKERS); ++i)
-                actions[action_base + output_offset + i] = from_float(0.0f);
-            if (!ar_head_active(&ar, h)) {
-                logits_offset += A;
-                continue;
-            }
-            float score[POLICY_PRIMARY_COUNT];
-            for (int option = 0; option < count; ++option)
-                score[option] = to_float(logits[
-                    logits_base + score_offset + option])
-                    + order_bias(&ar, condition, h, option);
-            float maximum = -INFINITY;
-            for (int option = 0; option < count; ++option)
-                maximum = fmaxf(maximum, score[option]);
-            float sample_key[POLICY_PRIMARY_COUNT];
-            for (int option = 0; option < count; ++option) {
-                /* Exponential races are an exact Plackett-Luce sample. */
-                sample_key[option] = __logf(-__logf(curand_uniform(&state)))
-                    - (score[option] - maximum);
-            }
-            for (int position = 0; position < count; ++position) {
-                float minimum = INFINITY;
-                int sampled = -1;
-                for (int option = 0; option < count; ++option) {
-                    if (sample_key[option] <= minimum) {
-                        minimum = sample_key[option];
-                        sampled = option;
-                    }
-                }
-                assert(sampled >= 0);
-                actions[action_base + output_offset + position] =
-                    from_float((float)sampled);
-                sample_key[sampled] = INFINITY;
-            }
-            float suffix_log = -INFINITY;
-            for (int position = count - 1; position >= 0; --position) {
-                int sampled = (int)to_float(
-                    actions[action_base + output_offset + position]);
-                float item_log = score[sampled] - maximum;
-                float high = fmaxf(item_log, suffix_log);
-                float lower = fminf(item_log, suffix_log);
-                suffix_log = high + __logf(1.0f + __expf(lower - high));
-                total_log_prob += score[sampled] - maximum - suffix_log;
-            }
-            logits_offset += A;
-        }
-#else
-        for (int h = 0; h < num_atns; h++) {
-            int A = act_sizes[h];
-            float cache[PPO_MAX_HEAD_A];
-            float logsumexp = ppo_discrete_logsumexp(
-                logits, logits_base, logits_offset, A, action_mask, mask_base, cache);
-
-            float rand_val = curand_uniform(&state);
-            float cumsum = 0.0f;
-            int sampled = A - 1;
-            for (int a = 0; a < A; a++) {
-                cumsum += expf(cache[a] - logsumexp);
-                if (rand_val < cumsum) {
-                    sampled = a;
-                    break;
-                }
-            }
-            actions[action_base + h] = from_float((float)sampled);
-            // consumed-head gating: only heads the sampled verb uses count
-            int verb = (int)to_float(actions[action_base]);
-            int used = (head_consume == NULL || h == 0)
-                ? 1 : (int)head_consume[verb * hc_stride + h];
-            if (used) {
-                total_log_prob += cache[sampled] - logsumexp;
-            }
-            logits_offset += A;
-        }
-#endif
-#endif
     }
 
-    logprobs[idx] = from_float(total_log_prob);
+    logprobs[idx] = total_log_prob;
     value_out[idx] = logits[logits_base + fused_cols - 1];
     rng_states[idx] = state;
 }
 
+#endif
+
 #ifdef BALATRO_POINTER_DECODER
-#ifndef PUF_WARP_MASK
-#ifdef USE_ROCM
-#define PUF_WARP_MASK 0xffffffffffffffffULL
-#else
-#define PUF_WARP_MASK 0xffffffffU
-#endif
-#endif
-
-// Wave-per-row Balatro AR sampler: 1 wave32 per observation row.
-// Eliminates per-thread stack spilling by holding contexts, candidate scores,
-// and Plackett-Luce sample keys in per-warp shared memory.
 __global__ void sample_logits_balatro(
-        Prec dec_out,                          // (B, fused_cols)
-        Prec logstd,                           // unused for discrete
-        int* act_sizes,                        // (POLICY_NUM_ATNS,)
-        precision_t* actions,                  // (B, num_atns)
-        precision_t* logprobs,                 // (B,)
-        precision_t* value_out,                // (B,)
-        curandStatePhilox4_32_10_t* rng_states,
-        precision_t* action_mask,              // (B, A_total)
-        int mask_stride,
-        const precision_t* condition,
-        const precision_t* keys,
-        const int* counts) {
-    constexpr int WARP = 32;
-    constexpr int WARPS = BLOCK_SIZE / WARP;
-    int lane = threadIdx.x & (WARP - 1);
-    int warp = threadIdx.x / WARP;
-    int idx = blockIdx.x * WARPS + warp;
-    int B = dec_out.shape[0];
-    bool valid = idx < B;
-    int fused_cols = dec_out.shape[1];
-    int logits_base = idx * fused_cols;
-    int mask_base = idx * mask_stride;
-    int action_base = idx * ACTION_STORAGE_SIZE;
-
-    __shared__ ARContext s_ar[WARPS];
-    __shared__ float s_cache[WARPS][POLICY_PRIMARY_COUNT];
-    __shared__ float s_order_scores[WARPS][POLICY_PRIMARY_COUNT];
-    __shared__ float s_order_keys[WARPS][POLICY_PRIMARY_COUNT];
-
-    float total_log_prob = 0.0f;
-    curandStatePhilox4_32_10_t state;
-
-    if (valid && lane == 0) {
-        state = rng_states[idx];
-        if (value_out) {
-            value_out[idx] = dec_out.data[logits_base + fused_cols - 1];
-        }
-    }
+        Prec state, precision_t* actions, float* logprobs,
+        precision_t* values, curandStatePhilox4_32_10_t* rng_states,
+        const precision_t* mask, const precision_t* parameters,
+        const precision_t* entities, const int* counts) {
+    constexpr int waves = BLOCK_SIZE / 32;
+    __shared__ Decision decisions[waves];
+    int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    int row = blockIdx.x * waves + warp;
+    if (row >= state.shape[0]) return;
+    precision_t* action = actions + row * ACTION_STORAGE_SIZE;
+    for (int step = lane; step < DECODER_STEPS; step += 32) action[step] = from_float(0.0f);
     __syncwarp();
-
-    if (valid) {
-        int logits_offset = 0;
-
-        // Head 0 (Action Type)
-        int A0 = act_sizes[0];
-        if (lane == 0) actions[action_base] = from_float(0.0f);
-        float l0 = (lane < A0 && mask_byte(action_mask, mask_base, lane) != 0)
-            ? to_float(dec_out.data[logits_base + logits_offset + lane]) : -1e4f;
-        s_cache[warp][lane] = l0;
-        float max_l0 = (lane < A0 && mask_byte(action_mask, mask_base, lane) != 0) ? l0 : -INFINITY;
-        #pragma unroll
-        for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-            max_l0 = fmaxf(max_l0, __shfl_down_sync(PUF_WARP_MASK, max_l0, offset, WARP));
-        }
-        max_l0 = __shfl_sync(PUF_WARP_MASK, max_l0, 0, WARP);
-
-        float sum_val0 = (lane < A0 && mask_byte(action_mask, mask_base, lane) != 0)
-            ? __expf(l0 - max_l0) : 0.0f;
-        #pragma unroll
-        for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-            sum_val0 += __shfl_down_sync(PUF_WARP_MASK, sum_val0, offset, WARP);
-        }
-        sum_val0 = __shfl_sync(PUF_WARP_MASK, sum_val0, 0, WARP);
-        float logsumexp0 = max_l0 + __logf(sum_val0);
-
-        if (lane == 0) {
-            float rand_val = curand_uniform(&state);
-            float cumsum = 0.0f;
-            int sampled = -1;
-            for (int a = 0; a < A0; ++a) {
-                if (mask_byte(action_mask, mask_base, a) == 0) continue;
-                cumsum += __expf(s_cache[warp][a] - logsumexp0);
-                if (rand_val < cumsum) { sampled = a; break; }
-            }
-            if (sampled < 0) {
-                for (int a = 0; a < A0; ++a) {
-                    if (mask_byte(action_mask, mask_base, a) != 0) { sampled = a; break; }
+    curandStatePhilox4_32_10_t rng;
+    if (lane == 0) rng = rng_states[row];
+    float logp = 0.0f;
+    Decision* s = decisions + warp;
+    int hand_count = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_HAND_COUNT_OFFSET);
+    int joker_count = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_JOKER_COUNT_OFFSET);
+    bool ordering = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_ENABLED_OFFSET);
+    for (int step = 0; step < DECODER_STEPS; ++step) {
+        if (step == 8 && !ordering) break;
+        if (step >= 8 && step < 72 && step >= 8 + hand_count) step = 72;
+        if (step >= 72 + joker_count) break;
+        decision_forward(s, state.data + row * DECODER_COLUMNS,
+            entities + (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH, parameters,
+            action, mask + row * POLICY_MASK_SIZE, counts + row * BA_POOL_SECTIONS, step);
+        if (lane == 0 && s->active) {
+            int selected = __ffsll((unsigned long long)s->legal) - 1;
+            if (__popcll(s->legal) > 1) {
+                float threshold = curand_uniform(&rng);
+                float cumulative = 0.0f;
+                for (int option = 0; option < s->options; ++option) {
+                    if (!(s->legal & (UINT64_C(1) << option))) continue;
+                    selected = option;
+                    cumulative += __expf(s->scores[option] - s->logsum);
+                    if (threshold <= cumulative) break;
                 }
+                logp += s->scores[selected] - s->logsum;
             }
-            if (sampled < 0) sampled = 0;
-            actions[action_base] = from_float((float)sampled);
-            total_log_prob += s_cache[warp][sampled] - logsumexp0;
-            s_ar[warp] = ar_ctx_init(action_mask, mask_base, actions,
-                action_base, keys + (int64_t)idx * BA_KEY_CAP * BA_KEY_DIM,
-                counts + idx * BA_POOL_SECTIONS);
+            action[step] = from_float((float)selected);
         }
         __syncwarp();
-        logits_offset += A0;
-
-        // Head 1 (Primary Head, up to 64 options)
-        int A1 = act_sizes[1];
-        if (lane == 0) actions[action_base + 1] = from_float(0.0f);
-        bool h1_active = ar_head_active(&s_ar[warp], 1);
-        if (h1_active) {
-            int primary_slice = policy_primary_head_offset(s_ar[warp].type);
-            assert(primary_slice >= 0);
-            int primary_offset = primary_slice * POLICY_PRIMARY_COUNT;
-
-            float max_l1 = -INFINITY;
-            #pragma unroll
-            for (int part = 0; part < 2; ++part) {
-                int a = lane + part * WARP;
-                bool legal = ar_option_legal(&s_ar[warp], action_mask, mask_base, 1, a);
-                float l = legal ? to_float(dec_out.data[logits_base + logits_offset + primary_offset + a]) : -1e4f;
-                s_cache[warp][a] = l;
-                if (legal) max_l1 = fmaxf(max_l1, l);
-            }
-            #pragma unroll
-            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-                max_l1 = fmaxf(max_l1, __shfl_down_sync(PUF_WARP_MASK, max_l1, offset, WARP));
-            }
-            max_l1 = __shfl_sync(PUF_WARP_MASK, max_l1, 0, WARP);
-
-            float sum_val1 = 0.0f;
-            #pragma unroll
-            for (int part = 0; part < 2; ++part) {
-                int a = lane + part * WARP;
-                bool legal = ar_option_legal(&s_ar[warp], action_mask, mask_base, 1, a);
-                if (legal) sum_val1 += __expf(s_cache[warp][a] - max_l1);
-            }
-            #pragma unroll
-            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-                sum_val1 += __shfl_down_sync(PUF_WARP_MASK, sum_val1, offset, WARP);
-            }
-            sum_val1 = __shfl_sync(PUF_WARP_MASK, sum_val1, 0, WARP);
-            float logsumexp1 = max_l1 + __logf(sum_val1);
-
-            if (lane == 0) {
-                float rand_val = curand_uniform(&state);
-                float cumsum = 0.0f;
-                int sampled = -1;
-                for (int a = 0; a < POLICY_PRIMARY_COUNT; ++a) {
-                    if (!ar_option_legal(&s_ar[warp], action_mask, mask_base, 1, a)) continue;
-                    cumsum += __expf(s_cache[warp][a] - logsumexp1);
-                    if (rand_val < cumsum) { sampled = a; break; }
-                }
-                if (sampled < 0) {
-                    for (int a = 0; a < POLICY_PRIMARY_COUNT; ++a) {
-                        if (ar_option_legal(&s_ar[warp], action_mask, mask_base, 1, a)) { sampled = a; break; }
-                    }
-                }
-                if (sampled < 0) sampled = 0;
-                actions[action_base + 1] = from_float((float)sampled);
-                total_log_prob += s_cache[warp][sampled] - logsumexp1;
-                s_ar[warp] = ar_ctx_init(action_mask, mask_base, actions,
-                    action_base, keys + (int64_t)idx * BA_KEY_CAP * BA_KEY_DIM,
-                    counts + idx * BA_POOL_SECTIONS);
-            }
-            __syncwarp();
-        }
-        logits_offset += A1;
-
-        // Head 2 (Count Head, 6 options)
-        int A2 = act_sizes[2];
-        if (lane == 0) actions[action_base + 2] = from_float(0.0f);
-        bool h2_active = ar_head_active(&s_ar[warp], 2);
-        if (h2_active) {
-            bool legal2 = lane < A2 && ar_option_legal(&s_ar[warp], action_mask, mask_base, 2, lane);
-            float l2 = legal2 ? to_float(dec_out.data[logits_base + logits_offset + lane])
-                + ar_cond_bias(&s_ar[warp], condition, 2, lane) : -1e4f;
-            if (lane < A2) s_cache[warp][lane] = l2;
-            float max_l2 = legal2 ? l2 : -INFINITY;
-            #pragma unroll
-            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-                max_l2 = fmaxf(max_l2, __shfl_down_sync(PUF_WARP_MASK, max_l2, offset, WARP));
-            }
-            max_l2 = __shfl_sync(PUF_WARP_MASK, max_l2, 0, WARP);
-
-            float sum_val2 = legal2 ? __expf(l2 - max_l2) : 0.0f;
-            #pragma unroll
-            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-                sum_val2 += __shfl_down_sync(PUF_WARP_MASK, sum_val2, offset, WARP);
-            }
-            sum_val2 = __shfl_sync(PUF_WARP_MASK, sum_val2, 0, WARP);
-            float logsumexp2 = max_l2 + __logf(sum_val2);
-
-            if (lane == 0) {
-                float rand_val = curand_uniform(&state);
-                float cumsum = 0.0f;
-                int sampled = -1;
-                for (int a = 0; a < A2; ++a) {
-                    if (!ar_option_legal(&s_ar[warp], action_mask, mask_base, 2, a)) continue;
-                    cumsum += __expf(s_cache[warp][a] - logsumexp2);
-                    if (rand_val < cumsum) { sampled = a; break; }
-                }
-                if (sampled < 0) {
-                    for (int a = 0; a < A2; ++a) {
-                        if (ar_option_legal(&s_ar[warp], action_mask, mask_base, 2, a)) { sampled = a; break; }
-                    }
-                }
-                if (sampled < 0) sampled = 0;
-                actions[action_base + 2] = from_float((float)sampled);
-                total_log_prob += s_cache[warp][sampled] - logsumexp2;
-                ar_ctx_set_count(&s_ar[warp], actions, action_base);
-            }
-            __syncwarp();
-        } else {
-            if (lane == 0) ar_ctx_set_count(&s_ar[warp], actions, action_base);
-            __syncwarp();
-        }
-        logits_offset += A2;
-
-        // Card Heads 3..7
-        for (int h = 3; h < BALATRO_BASE_ACTION_HEADS; ++h) {
-            int A = act_sizes[h];
-            if (lane == 0) actions[action_base + h] = from_float(0.0f);
-            bool active = ar_head_active(&s_ar[warp], h);
-            if (!active) {
-                logits_offset += A;
-                continue;
-            }
-            float max_lh = -INFINITY;
-            #pragma unroll
-            for (int part = 0; part < 2; ++part) {
-                int a = lane + part * WARP;
-                if (a < A) {
-                    bool legal = ar_option_legal(&s_ar[warp], action_mask, mask_base, h, a);
-                    float l = legal ? to_float(dec_out.data[logits_base + logits_offset + a])
-                        + ar_cond_bias(&s_ar[warp], condition, h, a) : -1e4f;
-                    s_cache[warp][a] = l;
-                    if (legal) max_lh = fmaxf(max_lh, l);
-                }
-            }
-            #pragma unroll
-            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-                max_lh = fmaxf(max_lh, __shfl_down_sync(PUF_WARP_MASK, max_lh, offset, WARP));
-            }
-            max_lh = __shfl_sync(PUF_WARP_MASK, max_lh, 0, WARP);
-
-            float sum_valh = 0.0f;
-            #pragma unroll
-            for (int part = 0; part < 2; ++part) {
-                int a = lane + part * WARP;
-                if (a < A) {
-                    bool legal = ar_option_legal(&s_ar[warp], action_mask, mask_base, h, a);
-                    if (legal) sum_valh += __expf(s_cache[warp][a] - max_lh);
-                }
-            }
-            #pragma unroll
-            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-                sum_valh += __shfl_down_sync(PUF_WARP_MASK, sum_valh, offset, WARP);
-            }
-            sum_valh = __shfl_sync(PUF_WARP_MASK, sum_valh, 0, WARP);
-            float logsumexph = max_lh + __logf(sum_valh);
-
-            if (lane == 0) {
-                float rand_val = curand_uniform(&state);
-                float cumsum = 0.0f;
-                int sampled = -1;
-                for (int a = 0; a < A; ++a) {
-                    if (!ar_option_legal(&s_ar[warp], action_mask, mask_base, h, a)) continue;
-                    cumsum += __expf(s_cache[warp][a] - logsumexph);
-                    if (rand_val < cumsum) { sampled = a; break; }
-                }
-                if (sampled < 0) {
-                    for (int a = 0; a < A; ++a) {
-                        if (ar_option_legal(&s_ar[warp], action_mask, mask_base, h, a)) { sampled = a; break; }
-                    }
-                }
-                if (sampled < 0) sampled = 0;
-                actions[action_base + h] = from_float((float)sampled);
-                total_log_prob += s_cache[warp][sampled] - logsumexph;
-                ar_ctx_advance(&s_ar[warp], actions, action_base, condition);
-            }
-            __syncwarp();
-            logits_offset += A;
-        }
-
-        // Order Heads 8 & 9 (Hand & Joker Order)
-        for (int h = BALATRO_ORDER_HAND_HEAD; h <= BALATRO_ORDER_JOKER_HEAD; ++h) {
-            int A = act_sizes[h];
-            int count = order_count(&s_ar[warp], h);
-            int output_offset = order_offset(h);
-            int max_slots = (h == BALATRO_ORDER_HAND_HEAD ? OBS_MAX_HAND : OBS_MAX_JOKERS);
-            for (int i = lane; i < max_slots; i += WARP) {
-                actions[action_base + output_offset + i] = from_float(0.0f);
-            }
-            bool active = ar_head_active(&s_ar[warp], h);
-            if (!active) {
-                logits_offset += A;
-                continue;
-            }
-
-            float max_sc = -INFINITY;
-            #pragma unroll
-            for (int part = 0; part < 2; ++part) {
-                int opt = lane + part * WARP;
-                if (opt < count) {
-                    float sc = to_float(dec_out.data[logits_base + logits_offset + opt])
-                        + order_bias(&s_ar[warp], condition, h, opt);
-                    s_order_scores[warp][opt] = sc;
-                    max_sc = fmaxf(max_sc, sc);
-                }
-            }
-            #pragma unroll
-            for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-                max_sc = fmaxf(max_sc, __shfl_down_sync(PUF_WARP_MASK, max_sc, offset, WARP));
-            }
-            max_sc = __shfl_sync(PUF_WARP_MASK, max_sc, 0, WARP);
-
-            if (lane == 0) {
-                for (int opt = 0; opt < count; ++opt) {
-                    s_order_keys[warp][opt] = __logf(-__logf(curand_uniform(&state)))
-                        - (s_order_scores[warp][opt] - max_sc);
-                }
-            }
-            __syncwarp();
-            // Rank independent Gumbel keys across the wave. Equal keys retain
-            // the sampler's descending-index tie break.
-            for (int part = 0; part < 2; ++part) {
-                int opt = lane + part * WARP;
-                if (opt < count) {
-                    float key = s_order_keys[warp][opt];
-                    int position = 0;
-                    for (int other = 0; other < count; ++other) {
-                        float other_key = s_order_keys[warp][other];
-                        position += other_key < key || (other_key == key && other > opt);
-                    }
-                    actions[action_base + output_offset + position] = from_float((float)opt);
-                }
-            }
-            __syncwarp();
-            if (lane == 0) {
-                float suffix_log = -INFINITY;
-                for (int position = count - 1; position >= 0; --position) {
-                    int sampled = (int)to_float(actions[action_base + output_offset + position]);
-                    float item_log = s_order_scores[warp][sampled] - max_sc;
-                    float high = fmaxf(item_log, suffix_log);
-                    float lower = fminf(item_log, suffix_log);
-                    suffix_log = high + __logf(1.0f + __expf(lower - high));
-                    total_log_prob += s_order_scores[warp][sampled] - max_sc - suffix_log;
-                }
-            }
-            __syncwarp();
-            logits_offset += A;
-        }
-
-        if (lane == 0) {
-            logprobs[idx] = from_float(total_log_prob);
-            rng_states[idx] = state;
-        }
+    }
+    if (lane == 0) {
+        logprobs[row] = logp;
+        values[row] = state.data[row * DECODER_COLUMNS + DECODER_STATE];
+        rng_states[row] = rng;
     }
 }
 #endif
@@ -1411,7 +846,7 @@ __global__ void zero_term_state(Prec state, Float terminals,
 
 // Select time t, then agents [start, start+count). Rank-2 has F==0 (zero-term shape);
 // stride uses max(F, 1). Out shape {count, F} keeps ndim 1 when F==0.
-Prec puf_slice(Prec p, int t, int start, int count) {
+template<class Tensor> Tensor puf_slice(Tensor p, int t, int start, int count) {
     long B = p.shape[1];
     long F = p.shape[2];
     long stride_f = F > 1 ? F : 1;
@@ -1526,7 +961,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         int sub = start + off;
         PolicyObs obs_b = puf_obs_slice(rollouts.observations, t, sub, n);
         Prec act_b  = puf_slice(rollouts.actions,      t, sub, n);
-        Prec lp_b   = puf_slice(rollouts.logprobs,     t, sub, n);
+        Float lp_b  = puf_slice(rollouts.logprobs,     t, sub, n);
         Prec val_b  = puf_slice(rollouts.values,       t, sub, n);
         Prec mask_b = puf_slice(rollouts.action_mask,  t, sub, n);
 
@@ -1559,11 +994,9 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         constexpr int sample_warps = BLOCK_SIZE / 32;
         int sample_blocks = (n + sample_warps - 1) / sample_warps;
         sample_logits_balatro<<<sample_blocks, BLOCK_SIZE, 0, stream>>>(
-            dec, p_logstd, pufferl->act_sizes,
-            act_b.data, lp_b.data, val_b.data,
-            pufferl->rng_states[buf] + off,
-            mask_b.data, mask_stride,
-            dw->condition.data, decoder->enc->keys.data,
+            dec, act_b.data, lp_b.data, val_b.data,
+            pufferl->rng_states[buf] + off, mask_b.data,
+            dw->condition.data, decoder->entities.data,
             decoder->enc->counts.data);
 #else
         sample_logits<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
@@ -1990,7 +1423,15 @@ static void* vec_thread_main(void* arg) {
             // the whole device. On ROCm a stream sync can serialize against
             // unrelated queues (the other buffer's rollout, the train stream),
             // which turns every per-t wait into a full pipeline drain.
-            cudaEventSynchronize(ev[COPY_END]);
+            cudaError_t status = cudaEventSynchronize(ev[COPY_END]);
+            if (status != cudaSuccess) fprintf(stderr, "Rollout action copy failed: %s\n", cudaGetErrorString(status));
+            if (status != cudaSuccess) {
+                for (int i = 0; i < 16; ++i) fprintf(stderr, "%d ", failure[i]);
+                fprintf(stderr, "\nCPU mask: ");
+                for (int i = 0; i < ACTION_TYPE_COUNT; ++i) fprintf(stderr, "%d ", vec->action_mask[failure[15] * POLICY_MASK_SIZE + i]);
+                fprintf(stderr, "\n");
+            }
+            assert(status == cudaSuccess);
             cudaEventElapsedTime(&ms, ev[MODEL_START], ev[MODEL_END]);
             my_accum[PROF_MODEL] += ms;
             cudaEventElapsedTime(&ms, ev[MODEL_END], ev[COPY_END]);
@@ -2268,7 +1709,7 @@ __global__ void transpose_102(precision_t* dst, const precision_t* src,
 }
 
 __global__ void transpose_scalars_fused(
-        precision_t* dst_lp, const precision_t* src_lp,
+        float* dst_lp, const float* src_lp,
         precision_t* dst_rew, const precision_t* src_rew,
         precision_t* dst_rst, const precision_t* src_rst,
         precision_t* dst_don, const precision_t* src_don,
@@ -2416,8 +1857,10 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         if (dw_train->continuous) {
             p_logstd = dw_train->logstd;
         }
+#ifndef BALATRO_POINTER_DECODER
         cudaMemsetAsync(pufferl->ppo_bufs.grad_logits.data, 0,
             numel(pufferl->ppo_bufs.grad_logits.shape) * sizeof(float), stream);
+#endif
         Prec dec = arch_forward_train(&primary->arch, primary->weights,
             pufferl->train_activs, graph.mb_obs, graph.mb_state,
             graph.mb_rnn_resets, dest_off, graph, p_logstd,
@@ -2442,10 +1885,11 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             dw_train->condition, da_train->condition_accum,
             da_train->condition_scratch, da_train->cond_accum_parts,
 #ifdef BALATRO_POINTER_DECODER
-            decoder_train->enc->keys, decoder_train->enc->counts,
-            decoder_train->enc->key_grad,
+            decoder_train->entities, decoder_train->enc->counts,
+            decoder_train->entity_gradient, decoder_train->decisions, decoder_train->coefficients,
+            decoder_train->evaluations,
 #else
-            Prec(), Int(), Float(),
+            Prec(), Int(), Float(), Float(), Float(), Float(),
 #endif
             stream);
 
@@ -2663,8 +2107,9 @@ void puf_load_weights_into(Float dst, Prec params,
     assert(fp && "failed to open weights for reading");
     char* buf = (char*)malloc(nbytes);
     size_t nread = fread(buf, 1, nbytes, fp);
+    assert((int64_t)nread == nbytes && fgetc(fp) == EOF
+        && "checkpoint size does not match the policy architecture");
     fclose(fp);
-    assert((int64_t)nread == nbytes && "failed to read weights");
     cudaMemcpy(dst.data, buf, nbytes, cudaMemcpyHostToDevice);
     free(buf);
     if (USE_BF16) {
@@ -4151,7 +3596,13 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         mkdir_p(log_dir);
     }
 
+    cudaHostAlloc((void**)&failure, 16*sizeof(int), cudaHostAllocMapped);
+    memset(failure, 0, 16*sizeof(int));
+    cudaMemcpyToSymbol(decoder_failure, &failure, sizeof(failure));
     PuffeRL* pufferl = create_pufferl(ini, ctx);
+    char model_path[4096];
+    const char* model = puf_checkpoint_path_key(ini, "load_model_path", model_path, sizeof(model_path));
+    if (model) pufferl_load_policy(pufferl, 0, model);
     Selfplay selfplay = {0};
     if (use_selfplay) {
         char initial_checkpoint[4096];

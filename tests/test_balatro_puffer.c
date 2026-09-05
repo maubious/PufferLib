@@ -89,6 +89,46 @@ static float completion_reward(uint8_t blind_on_deck, uint8_t skipped) {
 }
 
 int main(void) {
+    // Destroying the entire hand must draw again or resolve the round;
+    // exposing a nonterminal empty hand leaves the policy no legal action.
+    for (int scenario = 0; scenario < 3; ++scenario) {
+        Config config;
+        default_config(&config);
+        State state;
+        assert(init(&state, &config, 42) == OK);
+        state.phase = PHASE_SELECTING_HAND;
+        state.hand_count = 2;
+        state.hand[0] = state.deck[10];
+        state.hand[1] = state.deck[11];
+        state.deck_count = scenario == 1 ? 3 : 0;
+        state.discard_count = 0;
+        state.joker_count = scenario == 2 ? 1 : 0;
+        state.jokers[0] = (Card){.center_id = CENTER_J_MR_BONES};
+        state.consumable_count = 1;
+        state.consumables[0] = (Card){.center_id = CENTER_C_HANGED_MAN};
+        state.hands_left = 4;
+        state.blind_chips = 100;
+        state.chips = 25;
+        Action action = {.type = ACTION_USE_CONSUMABLE, .selection_count = 2, .selection = {0, 1}};
+        StepResult result;
+        assert(apply_step(&state, &action, NULL, &result) == OK);
+        if (scenario == 0) {
+            assert(result.terminal && !result.won && state.phase == PHASE_GAME_OVER);
+        } else {
+            Observation observation;
+            LegalMasks legal;
+            assert(!result.terminal);
+            assert(observe(&state, &observation, &legal) == OK);
+            if (scenario == 1) {
+                assert(state.hand_count == 3 && state.deck_count == 0);
+                assert(legal.primary[ACTION_PLAY_HAND]);
+            } else {
+                assert(state.joker_count == 0 && state.phase == PHASE_ROUND_EVAL);
+                assert(legal.primary[ACTION_CASH_OUT]);
+            }
+        }
+    }
+
     State credit_state = {0};
     credit_state.jokers[0] = (Card){.center_id = CENTER_J_CREDIT_CARD};
     credit_state.joker_count = 1;

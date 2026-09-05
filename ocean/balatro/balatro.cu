@@ -130,30 +130,13 @@ static constexpr int BA_OFF_HAND_STRUCT = BA_OFF_SPECIAL + BA_SPECIAL_FEATURES;
 static constexpr int BA_HAND_SUM_FEATURES = BA_TOKEN_DIM;
 static constexpr int BA_OFF_HAND_SUM = BA_OFF_HAND_STRUCT + BA_HAND_STRUCT_FEATURES;
 static constexpr int BA_TOTAL = BA_OFF_HAND_SUM + BA_HAND_SUM_FEATURES;
-static constexpr int BA_PRIMARY_QUERY_COUNT = POLICY_PRIMARY_HEADS;
-static constexpr int BA_CARD_QUERY_COUNT = 5;
-static constexpr int BA_ORDER_QUERY_HAND = BA_PRIMARY_QUERY_COUNT + BA_CARD_QUERY_COUNT;
-static constexpr int BA_ORDER_QUERY_JOKER = BA_ORDER_QUERY_HAND + 1;
-static constexpr int BA_ORDER_QUERY_COUNT = 2;
-static constexpr int BA_QUERY_COUNT = BA_PRIMARY_QUERY_COUNT + BA_CARD_QUERY_COUNT
-    + BA_ORDER_QUERY_COUNT;
-static constexpr int BA_QUERY_DIM = BA_QUERY_COUNT * BA_KEY_DIM;
-static constexpr int BA_ORDER_HAND_OFFSET = 23 + POLICY_PRIMARY_HEAD_SIZE + 6 + 5 * 64;
-static constexpr int BA_ORDER_JOKER_OFFSET = BA_ORDER_HAND_OFFSET + 64;
-static constexpr int BA_VALUE_OFFSET = BA_ORDER_JOKER_OFFSET + 32;
-static constexpr int BA_DEC_ROWS = BA_VALUE_OFFSET + 1;
-static constexpr int BA_PRIMARY_OFFSET = 23;
-static constexpr int BA_COUNT_OFFSET = BA_PRIMARY_OFFSET + POLICY_PRIMARY_HEAD_SIZE;
-static constexpr int BA_CARD_OFFSET = BA_COUNT_OFFSET + 6;
-static constexpr int BA_LINEAR_ROWS = 30;
-static constexpr int BA_LINEAR_PAD = 32;
-static constexpr int BA_FUSED_ROWS = BA_LINEAR_PAD + BA_QUERY_DIM;
-static constexpr float BA_QUERY_SCALE = 0.25f;
-static_assert(BA_LINEAR_ROWS <= BA_LINEAR_PAD, "linear decoder rows exceed padding");
-
+static constexpr int ENTITY_COUNT = BA_KEY_CAP + DECODER_CATEGORIES;
+static constexpr int ENTITY_WIDTH = AR_EMBED_DIM;
+static constexpr int DECODER_COLUMNS = DECODER_STATE + 1;
+static_assert(DECODER_STEPS == ACTION_STORAGE_SIZE);
 static_assert(sizeof(Observation) == 4296,
     "Balatro encoder must be updated for the Observation layout");
-static_assert(BA_KEY_DIM == 16, "Balatro pointer layout requires 16 channels");
+static_assert(BA_KEY_DIM == 32, "Balatro pointer layout requires 32 channels");
 static_assert(BA_FIXED == 643 && BA_TOTAL == 1130,
     "Balatro encoder feature layout mismatch");
 
@@ -404,8 +387,6 @@ struct BalatroEncoderActivations {
     Prec token_wgrad, token_bgrad, token_embed_grad, state_embed_grad;
     Prec proj_wgrad;
     const unsigned char* obs_data;
-    const float* decoder_grad_logits;
-    const precision_t* decoder_fused;
     int obs_batch;
 };
 
@@ -1170,8 +1151,6 @@ __global__ void ba_fxp_to_precision_kernel(
 
 __global__ void ba_token_backward_kernel(
         const precision_t* __restrict__ d_pooled,
-        const float* __restrict__ grad_logits,
-        const precision_t* __restrict__ fused,
         const float* __restrict__ key_grad,
         const int* __restrict__ counts_data,
         const int* __restrict__ relu_mask,
@@ -1219,8 +1198,6 @@ __global__ void ba_token_backward_kernel(
     int total = s_total;
     int64_t in = (int64_t)b * obs_size;
     int base = offsetof(Observation, globals);
-    int64_t b_grad = (int64_t)b * BA_VALUE_OFFSET;
-    const precision_t* query = fused + (int64_t)b * BA_FUSED_ROWS + BA_LINEAR_PAD;
 
     if (warp == 0) {
         int base = offsetof(Observation, globals);
@@ -1387,66 +1364,6 @@ __global__ void ba_token_backward_kernel(
         int local;
         int sec = ba_slot_section(s_counts, slot, &local);
         float g = 0.0f;
-        if (d < BA_KEY_DIM && sec == ZONE_SHOP_MAIN) {
-            static constexpr int queries[2] = {0, 11};
-            #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                int q = queries[i];
-                float scalar = grad_logits[b_grad + BA_PRIMARY_OFFSET
-                    + q * POLICY_PRIMARY_COUNT + local];
-                g += scalar * to_float(query[q * BA_KEY_DIM + d]);
-            }
-        } else if (d < BA_KEY_DIM && sec == ZONE_JOKER) {
-            static constexpr int queries[3] = {1, 7, 8};
-            #pragma unroll
-            for (int i = 0; i < 3; ++i) {
-                int q = queries[i];
-                float scalar = grad_logits[b_grad + BA_PRIMARY_OFFSET
-                    + q * POLICY_PRIMARY_COUNT + local];
-                g += scalar * to_float(query[q * BA_KEY_DIM + d]);
-            }
-            if (local < OBS_MAX_JOKERS) {
-                g += grad_logits[b_grad + BA_ORDER_JOKER_OFFSET + local]
-                    * to_float(query[BA_ORDER_QUERY_JOKER * BA_KEY_DIM + d]);
-            }
-        } else if (d < BA_KEY_DIM && sec == ZONE_CONSUMABLE) {
-            static constexpr int queries[2] = {2, 3};
-            #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                int q = queries[i];
-                float scalar = grad_logits[b_grad + BA_PRIMARY_OFFSET
-                    + q * POLICY_PRIMARY_COUNT + local];
-                g += scalar * to_float(query[q * BA_KEY_DIM + d]);
-            }
-        } else if (d < BA_KEY_DIM && (sec == ZONE_SHOP_VOUCHER || sec == ZONE_SHOP_BOOSTER
-                || sec == ZONE_PACK_CARD)) {
-            int q = sec == ZONE_SHOP_VOUCHER ? 4
-                : sec == ZONE_SHOP_BOOSTER ? 5 : 6;
-            float scalar = grad_logits[b_grad + BA_PRIMARY_OFFSET
-                + q * POLICY_PRIMARY_COUNT + local];
-            g += scalar * to_float(query[q * BA_KEY_DIM + d]);
-        } else if (d < BA_KEY_DIM && sec == ZONE_HAND && local < POLICY_PRIMARY_COUNT) {
-            static constexpr int queries[2] = {9, 10};
-            #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                int q = queries[i];
-                float scalar = grad_logits[b_grad + BA_PRIMARY_OFFSET
-                    + q * POLICY_PRIMARY_COUNT + local];
-                g += scalar * to_float(query[q * BA_KEY_DIM + d]);
-            }
-            #pragma unroll
-            for (int card = 0; card < 5; ++card) {
-                int q = BA_PRIMARY_QUERY_COUNT + card;
-                g += grad_logits[b_grad + BA_CARD_OFFSET
-                    + card * POLICY_PRIMARY_COUNT + local]
-                    * to_float(query[q * BA_KEY_DIM + d]);
-            }
-            if (local < OBS_MAX_HAND) {
-                g += grad_logits[b_grad + BA_ORDER_HAND_OFFSET + local]
-                    * to_float(query[BA_ORDER_QUERY_HAND * BA_KEY_DIM + d]);
-            }
-        }
-        g *= BA_QUERY_SCALE;
         int count = s_counts[sec];
         g += to_float(d_pooled[(int64_t)b * BA_TOTAL + BA_OFF_POOLED
             + sec * BA_TOKEN_DIM + d]) / (float)count;
@@ -1656,7 +1573,6 @@ static void ba_encoder_backward(
     BalatroEncoderWeights* ew = (BalatroEncoderWeights*)w;
     BalatroEncoderActivations* a = (BalatroEncoderActivations*)activations;
     int B = a->obs_batch;
-    assert(a->decoder_grad_logits && a->decoder_fused);
     puf_mm_tn(&grad, &a->pooled, &a->proj_wgrad, stream);
     // Static count/signature columns have no encoder parameters, so only the
     // embedding and token slices require projection gradients.
@@ -1669,7 +1585,6 @@ static void ba_encoder_backward(
     cudaMemsetAsync(a->token_w_acc.data, 0, ACC_TOTAL_ELEMS * sizeof(long), stream);
     ba_token_backward_kernel<<<B, BLOCK_SIZE, 0, stream>>>(
         a->d_pooled.data,
-        a->decoder_grad_logits, a->decoder_fused,
         a->key_grad.data, a->counts.data,
         a->relu_mask.data, a->pool_argmax.data,
         a->token_embed_acc.data, a->state_embed_acc.data,
@@ -1783,317 +1698,8 @@ static void create_balatro_encoder(Encoder* enc) {
     };
 }
 
-static constexpr int BA_PRIMARY_ZONES[POLICY_PRIMARY_HEADS] = {
-    ZONE_SHOP_MAIN, ZONE_JOKER, ZONE_CONSUMABLE, ZONE_CONSUMABLE,
-    ZONE_SHOP_VOUCHER, ZONE_SHOP_BOOSTER, ZONE_PACK_CARD, ZONE_JOKER,
-    ZONE_JOKER, ZONE_HAND, ZONE_HAND, ZONE_SHOP_MAIN};
-
-__device__ __forceinline__ int ba_key_index(
-        const int* counts, int query, int option) {
-    if (query < BA_PRIMARY_QUERY_COUNT) {
-        int zone = BA_PRIMARY_ZONES[query];
-        if (option >= counts[zone]) return -1;
-        int start = 0;
-        for (int s = 0; s < zone; ++s) start += counts[s];
-        return start + option;
-    }
-    int zone = query == BA_ORDER_QUERY_JOKER ? ZONE_JOKER : ZONE_HAND;
-    if (option >= counts[zone]) return -1;
-    int start = 0;
-    for (int s = 0; s < zone; ++s) start += counts[s];
-    return start + option;
-}
-
-__global__ void ba_decoder_linear_kernel(
-        precision_t* __restrict__ out,
-        const precision_t* __restrict__ fused, int B) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * BA_LINEAR_ROWS) return;
-    int b = idx / BA_LINEAR_ROWS;
-    int c = idx % BA_LINEAR_ROWS;
-    int out_col = c < 23 ? c
-        : c < 29 ? BA_COUNT_OFFSET + c - 23 : BA_VALUE_OFFSET;
-    out[(int64_t)b * BA_DEC_ROWS + out_col] =
-        fused[(int64_t)b * BA_FUSED_ROWS + c];
-}
-
-__global__ void ba_decoder_pointer_kernel(
-        precision_t* __restrict__ out,
-        const precision_t* __restrict__ fused,
-        const precision_t* __restrict__ keys,
-        const int* __restrict__ counts_data, int B) {
-    constexpr int WARP = 32;
-    constexpr int WARPS = BLOCK_SIZE / WARP;
-    int lane = threadIdx.x & (WARP - 1);
-    int warp = threadIdx.x / WARP;
-    int idx = blockIdx.x * WARPS + warp;
-    bool active = idx < B * BA_QUERY_COUNT;
-    int b = active ? idx / BA_QUERY_COUNT : 0;
-    int query_id = active ? idx % BA_QUERY_COUNT : 0;
-    int counts[BA_POOL_SECTIONS];
-    for (int s = 0; s < BA_POOL_SECTIONS; ++s) {
-        counts[s] = active ? counts_data[b * BA_POOL_SECTIONS + s] : 0;
-    }
-    int zone = query_id < BA_PRIMARY_QUERY_COUNT
-        ? BA_PRIMARY_ZONES[query_id]
-        : query_id == BA_ORDER_QUERY_JOKER ? ZONE_JOKER : ZONE_HAND;
-    int candidates = active ? counts[zone] : 0;
-    int head_size = query_id == BA_ORDER_QUERY_JOKER
-        ? OBS_MAX_JOKERS : POLICY_PRIMARY_COUNT;
-    int out_col = query_id < BA_PRIMARY_QUERY_COUNT
-        ? BA_PRIMARY_OFFSET + query_id * POLICY_PRIMARY_COUNT
-        : query_id < BA_ORDER_QUERY_HAND
-            ? BA_CARD_OFFSET
-                + (query_id - BA_PRIMARY_QUERY_COUNT) * POLICY_PRIMARY_COUNT
-            : query_id == BA_ORDER_QUERY_HAND
-                ? BA_ORDER_HAND_OFFSET : BA_ORDER_JOKER_OFFSET;
-    precision_t* output = out + (int64_t)b * BA_DEC_ROWS + out_col;
-    const precision_t* q = fused + (int64_t)b * BA_FUSED_ROWS
-        + BA_LINEAR_PAD + query_id * BA_KEY_DIM;
-    __shared__ float s_q[WARPS][BA_KEY_DIM];
-    if (lane < BA_KEY_DIM)
-        s_q[warp][lane] = active ? to_float(q[lane]) : 0.0f;
-    __syncwarp();
-    float score[2] = {-INFINITY, -INFINITY};
-    #pragma unroll
-    for (int part = 0; part < 2; ++part) {
-        int option = lane + part * WARP;
-        if (active && option < candidates) {
-            int key = ba_key_index(counts, query_id, option);
-            const precision_t* k = keys
-                + ((int64_t)b * BA_KEY_CAP + key) * BA_KEY_DIM;
-            float dot = 0.0f;
-            #pragma unroll
-            for (int d = 0; d < BA_KEY_DIM; ++d) {
-                dot += s_q[warp][d] * to_float(k[d]);
-            }
-            score[part] = dot * BA_QUERY_SCALE;
-        }
-    }
-    if (query_id < BA_PRIMARY_QUERY_COUNT) {
-        #pragma unroll
-        for (int part = 0; part < 2; ++part) {
-            int option = lane + part * WARP;
-            if (active) {
-                bool valid = option < candidates;
-                output[option] = from_float(valid ? score[part] : 0.0f);
-            }
-        }
-    } else {
-        #pragma unroll
-        for (int part = 0; part < 2; ++part) {
-            int option = lane + part * WARP;
-            if (active && option < head_size)
-                output[option] = from_float(
-                    option < candidates ? score[part] : 0.0f);
-        }
-    }
-}
-
-
-__global__ void ba_decoder_prepare_grad_kernel(
-        precision_t* __restrict__ dall,
-        const float* __restrict__ grad_logits,
-        const float* __restrict__ grad_value, int B) {
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)B * BA_LINEAR_PAD) return;
-    int b = idx / BA_LINEAR_PAD;
-    int c = idx % BA_LINEAR_PAD;
-    int64_t out_idx = (int64_t)b * BA_FUSED_ROWS + c;
-    int64_t grad_base = (int64_t)b * BA_VALUE_OFFSET;
-    float value = c < 23 ? grad_logits[grad_base + c]
-        : c < 29 ? grad_logits[grad_base + BA_COUNT_OFFSET + c - 23]
-        : c == 29 ? grad_value[b] : 0.0f;
-    dall[out_idx] = from_float(value);
-}
-
-__global__ void ba_decoder_query_backward_kernel(
-        precision_t* __restrict__ dall,
-        const float* __restrict__ grad_logits,
-        const precision_t* __restrict__ keys,
-        const int* __restrict__ counts_data, int B) {
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t)B * BA_QUERY_COUNT * BA_KEY_DIM) return;
-    int d = idx % BA_KEY_DIM;
-    int query_id = (idx / BA_KEY_DIM) % BA_QUERY_COUNT;
-    int b = idx / ((int64_t)BA_QUERY_COUNT * BA_KEY_DIM);
-    int counts[BA_POOL_SECTIONS];
-    #pragma unroll
-    for (int s = 0; s < BA_POOL_SECTIONS; ++s)
-        counts[s] = counts_data[b * BA_POOL_SECTIONS + s];
-
-    int zone = query_id < BA_PRIMARY_QUERY_COUNT
-        ? BA_PRIMARY_ZONES[query_id]
-        : query_id == BA_ORDER_QUERY_JOKER ? ZONE_JOKER : ZONE_HAND;
-    int candidates = counts[zone];
-    if (candidates > POLICY_PRIMARY_COUNT) candidates = POLICY_PRIMARY_COUNT;
-    int64_t out_idx = (int64_t)b * BA_FUSED_ROWS
-        + BA_LINEAR_PAD + query_id * BA_KEY_DIM + d;
-    if (candidates == 0) {
-        dall[out_idx] = from_float(0.0f);
-        return;
-    }
-    int start = 0;
-    for (int s = 0; s < zone; ++s) start += counts[s];
-
-    float sum = 0.0f;
-    int64_t b_grad = (int64_t)b * BA_VALUE_OFFSET;
-    int64_t b_keys = (int64_t)b * BA_KEY_CAP * BA_KEY_DIM;
-    int out_col_base;
-    if (query_id < BA_PRIMARY_QUERY_COUNT)
-        out_col_base = BA_PRIMARY_OFFSET + query_id * POLICY_PRIMARY_COUNT;
-    else if (query_id < BA_ORDER_QUERY_HAND)
-        out_col_base = BA_CARD_OFFSET
-            + (query_id - BA_PRIMARY_QUERY_COUNT) * POLICY_PRIMARY_COUNT;
-    else if (query_id == BA_ORDER_QUERY_HAND)
-        out_col_base = BA_ORDER_HAND_OFFSET;
-    else
-        out_col_base = BA_ORDER_JOKER_OFFSET;
-    for (int option = 0; option < candidates; ++option) {
-        int key = start + option;
-        float scalar = grad_logits[b_grad + out_col_base + option];
-        sum += scalar * to_float(keys[b_keys + key * BA_KEY_DIM + d]);
-    }
-    dall[out_idx] = from_float(sum * BA_QUERY_SCALE);
-}
-
-struct BalatroDecoderWeights {
-    Prec weight, logstd, condition;
-    int hidden_dim, output_dim;
-    bool continuous, ar;
-};
-
-struct BalatroDecoderActivations {
-    /* Keep the framework-visible DecoderActivations prefix byte-identical:
-       train_epoch_gpu accesses the condition-gradient staging tensors through
-       that type even when the decoder itself is custom. */
-    Prec out, grad_out, saved_input, grad_input, wgrad_scratch, logstd_scratch,
-        condition_scratch;
-    Float condition_accum, cond_accum_parts;
-    BalatroEncoderActivations* enc;
-    Prec fused;
-    Prec dall;
-    Prec weight_grad;
-};
-
-static Prec ba_decoder_forward(
-        void* w, void* activations, Prec input, cudaStream_t stream) {
-    BalatroDecoderWeights* dw = (BalatroDecoderWeights*)w;
-    BalatroDecoderActivations* a = (BalatroDecoderActivations*)activations;
-    int B = input.shape[0];
-    if (a->saved_input.data) puf_copy(&a->saved_input, &input, stream);
-    puf_mm(&input, &dw->weight, &a->fused, stream);
-    ba_decoder_linear_kernel<<<grid_size(B * BA_LINEAR_ROWS), BLOCK_SIZE, 0, stream>>>(
-        a->out.data, a->fused.data, B);
-    constexpr int pointer_warps = BLOCK_SIZE / 32;
-    int pointer_blocks = (B * BA_QUERY_COUNT + pointer_warps - 1)
-        / pointer_warps;
-    ba_decoder_pointer_kernel<<<pointer_blocks, BLOCK_SIZE, 0, stream>>>(
-        a->out.data, a->fused.data,
-        a->enc->keys.data, a->enc->counts.data, B);
-    return a->out;
-}
-
-static Prec ba_decoder_backward(void* w, void* activations,
-        Float grad_logits, Float grad_logstd, Float grad_value,
-        cudaStream_t stream) {
-    (void)grad_logstd;
-    BalatroDecoderWeights* dw = (BalatroDecoderWeights*)w;
-    BalatroDecoderActivations* a = (BalatroDecoderActivations*)activations;
-    int B = a->saved_input.shape[0];
-    a->enc->decoder_grad_logits = grad_logits.data;
-    a->enc->decoder_fused = a->fused.data;
-    ba_decoder_prepare_grad_kernel<<<grid_size(B * BA_LINEAR_PAD), BLOCK_SIZE, 0, stream>>>(
-        a->dall.data, grad_logits.data, grad_value.data, B);
-    ba_decoder_query_backward_kernel<<<grid_size((int64_t)B * BA_QUERY_DIM), BLOCK_SIZE, 0, stream>>>(
-        a->dall.data, grad_logits.data, a->enc->keys.data,
-        a->enc->counts.data, B);
-    puf_mm_tn(&a->dall, &a->saved_input, &a->weight_grad, stream);
-    puf_mm_nn(&a->dall, &dw->weight, &a->grad_input, stream);
-    return a->grad_input;
-}
-
-static void ba_decoder_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
-    BalatroDecoderWeights* dw = (BalatroDecoderWeights*)w;
-    puf_kaiming_init(&dw->weight, 1.0f, (*seed)++, stream);
-    Prec condition = {
-        .data = dw->condition.data,
-        .shape = {AR_CONDITION_SIZE / AR_EMBED_DIM, AR_EMBED_DIM},
-    };
-    puf_kaiming_init(&condition, 1.0f, (*seed)++, stream);
-    cudaMemsetAsync(dw->condition.data + AR_GATE_OFFSET, 0,
-        AR_GATE_SIZE * sizeof(precision_t), stream);
-}
-
-static void ba_decoder_reg_params(void* w, Allocator* alloc) {
-    BalatroDecoderWeights* dw = (BalatroDecoderWeights*)w;
-    dw->weight = {.shape = {BA_FUSED_ROWS, dw->hidden_dim}};
-    dw->condition = {.shape = {AR_CONDITION_SIZE}};
-    alloc_register(alloc, &dw->weight);
-    alloc_register(alloc, &dw->condition);
-}
-
-static void ba_decoder_reg_train(void* w, void* activations,
-        Allocator* acts, Allocator* grads, int B_TT) {
-    BalatroDecoderWeights* dw = (BalatroDecoderWeights*)w;
-    BalatroDecoderActivations* a = (BalatroDecoderActivations*)activations;
-    *a = {};
-    a->enc = ba_enc_last;
-    a->out = {.shape = {B_TT, BA_DEC_ROWS}};
-    a->saved_input = {.shape = {B_TT, dw->hidden_dim}};
-    a->grad_input = {.shape = {B_TT, dw->hidden_dim}};
-    a->condition_scratch = {.shape = {AR_CONDITION_SIZE}};
-    a->condition_accum = {.shape = {AR_CONDITION_SIZE}};
-    a->cond_accum_parts = {.shape = {COND_STRIPE_COUNT, AR_CONDITION_SIZE}};
-    a->weight_grad = {.shape = {BA_FUSED_ROWS, dw->hidden_dim}};
-    a->fused = {.shape = {B_TT, BA_FUSED_ROWS}};
-    a->dall = {.shape = {B_TT, BA_FUSED_ROWS}};
-    alloc_register(acts, &a->out);
-    alloc_register(acts, &a->saved_input);
-    alloc_register(acts, &a->grad_input);
-    alloc_register(acts, &a->condition_accum);
-    alloc_register(acts, &a->cond_accum_parts);
-    alloc_register(acts, &a->fused);
-    alloc_register(acts, &a->dall);
-    alloc_register(grads, &a->weight_grad);
-    alloc_register(grads, &a->condition_scratch);
-}
-
-static void ba_decoder_reg_rollout(void* w, void* activations,
-        Allocator* alloc, int B) {
-    BalatroDecoderActivations* a = (BalatroDecoderActivations*)activations;
-    a->enc = ba_enc_last;
-    a->out = {.shape = {B, BA_DEC_ROWS}};
-    a->fused = {.shape = {B, BA_FUSED_ROWS}};
-    alloc_register(alloc, &a->out);
-    alloc_register(alloc, &a->fused);
-}
-
-static void* ba_decoder_create_weights(void* self) {
-    Decoder* d = (Decoder*)self;
-    assert(d->output_dim == BA_DEC_ROWS - 1);
-    BalatroDecoderWeights* dw =
-        (BalatroDecoderWeights*)calloc(1, sizeof(BalatroDecoderWeights));
-    dw->hidden_dim = d->hidden_dim;
-    dw->output_dim = d->output_dim;
-    dw->continuous = false;
-    dw->ar = true;
-    return dw;
-}
-
-static void create_balatro_decoder(Decoder* dec) {
-    *dec = Decoder{
-        .forward = ba_decoder_forward,
-        .backward = ba_decoder_backward,
-        .init_weights = ba_decoder_init_weights,
-        .reg_params = ba_decoder_reg_params,
-        .reg_train = ba_decoder_reg_train,
-        .reg_rollout = ba_decoder_reg_rollout,
-        .create_weights = ba_decoder_create_weights,
-        .hidden_dim = dec->hidden_dim,
-        .output_dim = dec->output_dim,
-        .continuous = false,
-        .ar = true,
-        .activation_size = sizeof(BalatroDecoderActivations),
-    };
-}
+#ifdef USE_ROCM
+#include "decoder.hip"
+#else
+#include "decoder.cu"
+#endif
