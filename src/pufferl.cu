@@ -756,27 +756,53 @@ __global__ void sample_logits_balatro(
     int hand_count = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_HAND_COUNT_OFFSET);
     int joker_count = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_JOKER_COUNT_OFFSET);
     bool ordering = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_ENABLED_OFFSET);
+    float sum = 0.0f, last = 0.0f;
+    int length = 0;
+    float global = to_float(state.data[row * DECODER_COLUMNS + lane]);
+    float gate = 2.0f / (1.0f + __expf(-2.0f * to_float(state.data[row * DECODER_COLUMNS + 32 + lane])));
     for (int step = 0; step < DECODER_STEPS; ++step) {
         if (step == 8 && !ordering) break;
         if (step >= 8 && step < 72 && step >= 8 + hand_count) step = 72;
         if (step >= 72 + joker_count) break;
-        decision_forward(s, state.data + row * DECODER_COLUMNS,
-            entities + (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH, parameters,
-            action, mask + row * POLICY_MASK_SIZE, counts + row * BA_POOL_SECTIONS, step);
-        if (lane == 0 && s->active) {
+        float role = to_float(parameters[ROLE_OFFSET + step * 32 + lane]);
+        float u = global + role + last + (length ? sum * rsqrtf((float)length) : 0.0f);
+        s->query[lane] = u / (1.0f + __expf(-u)) * gate;
+        s->preactivation[lane] = u;
+        __syncwarp();
+        decision_forward(s, entities + (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH,
+            action, mask + row * POLICY_MASK_SIZE, counts + row * BA_POOL_SECTIONS, step, s->query);
+        if (s->active) {
             int selected = __ffsll((unsigned long long)s->legal) - 1;
             if (__popcll(s->legal) > 1) {
-                float threshold = curand_uniform(&rng);
-                float cumulative = 0.0f;
-                for (int option = 0; option < s->options; ++option) {
-                    if (!(s->legal & (UINT64_C(1) << option))) continue;
-                    selected = option;
-                    cumulative += __expf(s->scores[option] - s->logsum);
-                    if (threshold <= cumulative) break;
+                float threshold = lane == 0 ? curand_uniform(&rng) : 0.0f;
+                threshold = __shfl_sync(PUF_WARP_MASK, threshold, 0, 32);
+                bool first_legal = lane < s->options && (s->legal & (UINT64_C(1) << lane));
+                bool second_legal = lane + 32 < s->options && (s->legal & (UINT64_C(1) << (lane + 32)));
+                float first = first_legal ? __expf(s->scores[lane] - s->logsum) : 0.0f;
+                float second = second_legal ? __expf(s->scores[lane + 32] - s->logsum) : 0.0f;
+                #pragma unroll
+                for (int offset = 1; offset < 32; offset <<= 1) {
+                    float a = __shfl_up_sync(PUF_WARP_MASK, first, offset, 32);
+                    float b = __shfl_up_sync(PUF_WARP_MASK, second, offset, 32);
+                    if (lane >= offset) { first += a; second += b; }
                 }
-                logp += s->scores[selected] - s->logsum;
+                second += __shfl_sync(PUF_WARP_MASK, first, 31, 32);
+                uint32_t first_hits = (uint32_t)__ballot_sync(PUF_WARP_MASK, first_legal && threshold <= first);
+                uint32_t second_hits = (uint32_t)__ballot_sync(PUF_WARP_MASK, second_legal && threshold <= second);
+                selected = first_hits ? __ffs(first_hits) - 1 : second_hits ? 31 + __ffs(second_hits)
+                    : 63 - __clzll((unsigned long long)s->legal);
+                if (lane == 0) logp += s->scores[selected] - s->logsum;
             }
-            action[step] = from_float((float)selected);
+            if (lane == 0) action[step] = from_float((float)selected);
+        }
+        __syncwarp();
+        if (s->active || step >= 8) {
+            int start = step >= 8 ? token_start(counts + row * BA_POOL_SECTIONS,
+                step < 72 ? ZONE_HAND : ZONE_JOKER) : s->start;
+            int entity = start + (int)to_float(action[step]);
+            last = to_float(entities[((int64_t)row * ENTITY_COUNT + entity) * ENTITY_WIDTH + lane]);
+            sum += role * last;
+            ++length;
         }
         __syncwarp();
     }
@@ -1425,12 +1451,6 @@ static void* vec_thread_main(void* arg) {
             // which turns every per-t wait into a full pipeline drain.
             cudaError_t status = cudaEventSynchronize(ev[COPY_END]);
             if (status != cudaSuccess) fprintf(stderr, "Rollout action copy failed: %s\n", cudaGetErrorString(status));
-            if (status != cudaSuccess) {
-                for (int i = 0; i < 16; ++i) fprintf(stderr, "%d ", failure[i]);
-                fprintf(stderr, "\nCPU mask: ");
-                for (int i = 0; i < ACTION_TYPE_COUNT; ++i) fprintf(stderr, "%d ", vec->action_mask[failure[15] * POLICY_MASK_SIZE + i]);
-                fprintf(stderr, "\n");
-            }
             assert(status == cudaSuccess);
             cudaEventElapsedTime(&ms, ev[MODEL_START], ev[MODEL_END]);
             my_accum[PROF_MODEL] += ms;
@@ -3596,9 +3616,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         mkdir_p(log_dir);
     }
 
-    cudaHostAlloc((void**)&failure, 16*sizeof(int), cudaHostAllocMapped);
-    memset(failure, 0, 16*sizeof(int));
-    cudaMemcpyToSymbol(decoder_failure, &failure, sizeof(failure));
     PuffeRL* pufferl = create_pufferl(ini, ctx);
     char model_path[4096];
     const char* model = puf_checkpoint_path_key(ini, "load_model_path", model_path, sizeof(model_path));

@@ -1142,13 +1142,29 @@ __device__ __forceinline__ void ba_fxp_atomic_add(long* addr, float value) {
         (unsigned long long)(long long)__float2ll_rn(value * BA_FXP_SCALE));
 }
 
+static constexpr int ENCODER_STRIPES = 4;
+
+template<int stripes>
 __global__ void ba_fxp_to_precision_kernel(
         precision_t* __restrict__ dst, const long* __restrict__ src, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    dst[i] = from_float((float)((double)src[i] * (1.0 / 16777216.0)));
+    constexpr int sizes[] = {BA_TOKEN_DIM * BA_RAW_DIM, BA_TOKEN_DIM,
+        BA_TOKEN_EMBED_ROWS * BA_TOKEN_DIM, BA_STATE_EMBED_ROWS * BA_STATE_EMBED_DIM};
+    int offset = 0;
+    for (int size : sizes) {
+        if (i < offset + size) {
+            long sum = 0;
+            for (int stripe = 0; stripe < stripes; ++stripe)
+                sum += src[offset * stripes + stripe * size + i - offset];
+            dst[i] = from_float((float)((double)sum * (1.0 / 16777216.0)));
+            return;
+        }
+        offset += size;
+    }
 }
 
+template<int stripes>
 __global__ void ba_token_backward_kernel(
         const precision_t* __restrict__ d_pooled,
         const float* __restrict__ key_grad,
@@ -1165,6 +1181,11 @@ __global__ void ba_token_backward_kernel(
         const unsigned char* __restrict__ obs,
         int obs_size,
         int B) {
+    int stripe = blockIdx.x % stripes;
+    token_embed_acc += stripe * BA_TOKEN_EMBED_ROWS * BA_TOKEN_DIM;
+    state_embed_acc += stripe * BA_STATE_EMBED_ROWS * BA_STATE_EMBED_DIM;
+    token_w_acc += stripe * BA_TOKEN_DIM * BA_RAW_DIM;
+    token_b_acc += stripe * BA_TOKEN_DIM;
     constexpr int TOKEN_WARPS = BLOCK_SIZE / 32;
     __shared__ float raw[TOKEN_WARPS][BA_RAW_DIM];
     __shared__ int s_counts[BA_POOL_SECTIONS];
@@ -1582,8 +1603,8 @@ static void ba_encoder_backward(
             + BA_SPECIAL_FEATURES + BA_HAND_STRUCT_FEATURES + BA_HAND_SUM_FEATURES, stream);
     constexpr int ACC_TOTAL_ELEMS = BA_TOKEN_DIM * BA_RAW_DIM + BA_TOKEN_DIM
         + BA_TOKEN_EMBED_ROWS * BA_TOKEN_DIM + BA_STATE_EMBED_ROWS * BA_STATE_EMBED_DIM;
-    cudaMemsetAsync(a->token_w_acc.data, 0, ACC_TOTAL_ELEMS * sizeof(long), stream);
-    ba_token_backward_kernel<<<B, BLOCK_SIZE, 0, stream>>>(
+    cudaMemsetAsync(a->token_w_acc.data, 0, ENCODER_STRIPES * ACC_TOTAL_ELEMS * sizeof(long), stream);
+    ba_token_backward_kernel<ENCODER_STRIPES><<<B, BLOCK_SIZE, 0, stream>>>(
         a->d_pooled.data,
         a->key_grad.data, a->counts.data,
         a->relu_mask.data, a->pool_argmax.data,
@@ -1591,7 +1612,7 @@ static void ba_encoder_backward(
         a->token_w_acc.data, a->token_b_acc.data,
         ew->token_w.data, ew->token_b.data, ew->token_embed.data,
         a->obs_data, ew->obs_size, B);
-    ba_fxp_to_precision_kernel<<<grid_size(ACC_TOTAL_ELEMS), BLOCK_SIZE, 0, stream>>>(
+    ba_fxp_to_precision_kernel<ENCODER_STRIPES><<<grid_size(ACC_TOTAL_ELEMS), BLOCK_SIZE, 0, stream>>>(
         a->token_wgrad.data, a->token_w_acc.data, ACC_TOTAL_ELEMS);
 }
 
@@ -1633,10 +1654,10 @@ static void ba_encoder_reg_train(
     a->counts = {.shape = {B_TT, BA_POOL_SECTIONS}};
     a->relu_mask = {.shape = {B_TT, BA_KEY_CAP}};
     a->pool_argmax = {.shape = {B_TT, BA_MAX_POOL_SECTIONS, BA_TOKEN_DIM}};
-    a->token_embed_acc = {.shape = {BA_TOKEN_EMBED_ROWS, BA_TOKEN_DIM}};
-    a->state_embed_acc = {.shape = {BA_STATE_EMBED_ROWS, BA_STATE_EMBED_DIM}};
-    a->token_w_acc = {.shape = {BA_TOKEN_DIM, BA_RAW_DIM}};
-    a->token_b_acc = {.shape = {BA_TOKEN_DIM}};
+    a->token_embed_acc = {.shape = {ENCODER_STRIPES, BA_TOKEN_EMBED_ROWS, BA_TOKEN_DIM}};
+    a->state_embed_acc = {.shape = {ENCODER_STRIPES, BA_STATE_EMBED_ROWS, BA_STATE_EMBED_DIM}};
+    a->token_w_acc = {.shape = {ENCODER_STRIPES, BA_TOKEN_DIM, BA_RAW_DIM}};
+    a->token_b_acc = {.shape = {ENCODER_STRIPES, BA_TOKEN_DIM}};
     a->token_wgrad = {.shape = {BA_TOKEN_DIM, BA_RAW_DIM}};
     a->token_bgrad = {.shape = {BA_TOKEN_DIM}};
     a->token_embed_grad = {.shape = {BA_TOKEN_EMBED_ROWS, BA_TOKEN_DIM}};

@@ -254,8 +254,6 @@ static int puffer_observe(Env *env) {
             fprintf(stderr, "Empty engine mask: phase=%u hand=%u deck=%u discard=%u jokers=%u consumables=%u terminal=%u\n",
                 env->state.phase, env->state.hand_count, env->state.deck_count, env->state.discard_count,
                 env->state.joker_count, env->state.consumable_count, env->state.terminal);
-            FILE* file = fopen("/tmp/balatro-empty-state.bin", "wb");
-            assert(file); fwrite(&env->state, sizeof(State), 1, file); fclose(file);
         }
         assert(choices);
         store_selection(env->agents[0].action_mask,

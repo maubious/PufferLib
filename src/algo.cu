@@ -1608,15 +1608,9 @@ __device__ __forceinline__ uint64_t mask_u64(
 }
 
 // Actions are exact integer indices, including when stored in BF16.
-__device__ int* decoder_failure;
-static int* failure;
 __device__ __forceinline__ int ar_action_value(
         const precision_t* act, int ab, int rel, int limit) {
     int value = (int)to_float(act[ab + rel]);
-    if (!(value >= 0 && value < limit)) {
-        decoder_failure[0] = 1; decoder_failure[1] = rel; decoder_failure[2] = value;
-        __threadfence_system();
-    }
     assert(value >= 0 && value < limit);
     return value;
 }
@@ -1794,8 +1788,13 @@ Prec arch_forward_train(Arch* p, Weights& w,
     #ifdef BALATRO_POINTER_DECODER
     BalatroDecoderActivations* decoder =
         (BalatroDecoderActivations*)activations.decoder;
+    decoder->actions = g.mb_actions.data;
+    decoder->mask = g.mb_action_mask.data;
+    cache_queries<<<(B * TT + 3) / 4, 128, 0, stream>>>(dec.data, decoder->entities.data,
+        condition.data, g.mb_actions.data, g.mb_action_mask.data, decoder->enc->counts.data,
+        decoder->evaluations.data, B * TT);
     cache_decisions<<<B * TT, 64, 0, stream>>>(
-        dec.data, decoder->entities.data, condition.data, g.mb_actions.data,
+        decoder->entities.data, g.mb_actions.data,
         g.mb_action_mask.data, decoder->enc->counts.data, decoder->decisions.data, decoder->evaluations.data, B * TT);
     finish_likelihood<<<grid_size(B * TT), BLOCK_SIZE, 0, stream>>>(
         dec.data, decoder->decisions.data, g.mb_logprobs.data,
@@ -2054,9 +2053,6 @@ void ppo_loss_fwd_bwd(
         dec_out.data, keys.data, condition.data, graph.mb_actions.data,
         graph.mb_action_mask.data, counts.data, coefficients.data,
         bufs.grad_logits.data, key_grad.data, condition_parts.data, evaluations.data, total);
-    accumulate_prefix<<<(total + 3) / 4, 128, 0, stream>>>(keys.data, condition.data,
-        graph.mb_actions.data, graph.mb_action_mask.data, counts.data, evaluations.data,
-        key_grad.data, condition_parts.data, total);
     #else
     ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(
         bufs.ppo_partials.data, args, graph_args);
