@@ -1,6 +1,6 @@
 #include "balatro_core.h"
-#include "joker_signatures.h"
 #include "consumable_signatures.h"
+#include "joker_signatures.h"
 #include <assert.h>
 #include <math.h>
 #include <stddef.h>
@@ -38,12 +38,6 @@ static const uint16_t joker_2[] = {200, 128, 160, 100, 156, 149, 118, 124, 199, 
 static const uint16_t joker_3[] = {113, 217, 82, 164, 83, 78, 95, 87, 220, 141, 117, 213, 123, 168, 211, 202, 145, 89, 114, 92};
 static const uint16_t joker_4[] = {94, 212, 223, 103, 170};
 
-static const uint16_t planet_centers[HAND_COUNT] = {
-    CENTER_C_ERIS,  CENTER_C_CERES,  CENTER_C_PLANET_X, CENTER_C_NEPTUNE,
-    CENTER_C_MARS,  CENTER_C_EARTH,  CENTER_C_JUPITER,  CENTER_C_SATURN,
-    CENTER_C_VENUS, CENTER_C_URANUS, CENTER_C_MERCURY,  CENTER_C_PLUTO,
-};
-
 typedef enum VoucherEffect {
     VOUCHER_NONE,
     VOUCHER_SHOP_SIZE,
@@ -63,30 +57,11 @@ typedef enum VoucherEffect {
     VOUCHER_ANTE_DISCARDS
 } VoucherEffect;
 
-typedef struct CenterDefinition {
-    uint16_t id;
-    uint8_t set;
-    uint8_t rarity;
-    int16_t cost;
-    float weight;
-    uint8_t base_available;
-    uint8_t kind;
-    uint8_t pack_extra;
-    uint8_t pack_choose;
-    uint16_t requires;
-    float extra;
-    uint8_t target_effect;
-    uint8_t target_value;
-    uint8_t target_max;
-    uint8_t target_min;
-    uint8_t voucher_effect;
-} CenterDefinition;
-
 typedef struct ScoreResult {
     uint8_t hand_type;
     uint8_t scoring_mask;
     uint8_t destroyed_mask;
-    uint8_t reserved;
+    uint8_t hand_debuffed;
     double chips;
     double mult;
     double total;
@@ -149,21 +124,11 @@ typedef struct ScoreContext {
     int mime_count;
 } ScoreContext;
 
-enum { PUBLIC_CARD_PLAYED_THIS_ANTE = 1u << 5 };
-
 static const float small_integer_log2p1[] = {
     0.0f, 1.0f, 1.5849625f, 2.0f, 2.3219280f, 2.5849625f,
     2.8073549f, 3.0f, 3.1699250f, 3.3219280f, 3.4594316f,
     3.5849626f, 3.7004397f, 3.8073549f, 3.9068906f, 4.0f,
     4.0874629f,
-};
-
-enum PackKind {
-    PACK_STANDARD = 0,
-    PACK_TAROT = 1,
-    PACK_PLANET = 2,
-    PACK_SPECTRAL = 3,
-    PACK_JOKER = 5
 };
 
 // ----------------------------------------------
@@ -505,9 +470,20 @@ const uint16_t *joker_pool(uint8_t rarity, size_t *count) {
 }
 
 HandType planet_hand(uint16_t center_id) {
-    for (uint8_t hand = 0; hand < HAND_COUNT; ++hand)
-        if (planet_centers[hand] == center_id) return (HandType)hand;
+    assert(center_id < CENTER_COUNT);
+    const ConsumableSignature *signature = &consumable_signatures[center_id];
+    if (signature->kind == CONS_PLANET) return (HandType)signature->planet_hand;
     return HAND_COUNT;
+}
+
+static uint16_t planet_center(HandType hand) {
+    assert(hand < HAND_COUNT);
+    for (uint16_t center_id = 0; center_id < CENTER_COUNT; ++center_id) {
+        const ConsumableSignature *signature = &consumable_signatures[center_id];
+        if (signature->kind == CONS_PLANET && signature->planet_hand == hand) return center_id;
+    }
+    assert(!"missing planet center");
+    return CENTER_C_MERCURY;
 }
 
 void mark_center_used(State *state, uint16_t id) {
@@ -627,9 +603,45 @@ static uint8_t random_sorted_hand_index(State *state, const char *stream) {
     return order[index];
 }
 
+static double adjust_probability(const State *state, double base);
+
+/* Mirrors the real game's Blind:stay_flipped: per-card rule when a card
+   enters the hand. after_play = this draw follows a played hand. */
+static int draw_stays_facedown(State *state, const Card *card, int after_play) {
+    if (state->blind_disabled) return 0;
+    switch (state->blind_id) {
+    case BLIND_BL_HOUSE:
+        return state->hands_played == 0 && state->discards_used == 0;
+    case BLIND_BL_WHEEL:
+        return pseudorandom(state, "wheel") < adjust_probability(state, 1.0 / 7.0);
+    case BLIND_BL_FISH:
+        return after_play;
+    case BLIND_BL_MARK:
+        return is_face(card, joker_active(state, CENTER_J_PAREIDOLIA));
+    default:
+        return 0;
+    }
+}
+
+static void mark_drawn_card(State *state, Card *card, int after_play) {
+    card->flags &= (uint8_t)~CARD_FACEDOWN;
+    if (draw_stays_facedown(state, card, after_play))
+        card->flags |= CARD_FACEDOWN;
+}
+
 static void draw_to_hand(State *state) {
-    while (state->hand_count < state->hand_size && state->deck_count > 0 && state->hand_count < MAX_HAND)
+    /* The Serpent: after any play/discard, draw exactly 3 (hand may exceed
+       its size). The round-start draw keeps the normal hand size because
+       neither counter has been used yet. Mirrors the real game's
+       draw_from_deck_to_hand serpent branch. */
+    uint8_t target = state->hand_size;
+    if (!state->blind_disabled && state->blind_id == BLIND_BL_SERPENT &&
+        (state->hands_played > 0 || state->discards_used > 0))
+        target = state->hand_count + 3;
+    while (state->hand_count < target && state->deck_count > 0 && state->hand_count < MAX_HAND) {
         state->hand[state->hand_count++] = state->deck[--state->deck_count];
+        mark_drawn_card(state, &state->hand[state->hand_count - 1], 0);
+    }
     sort_hand(state, state->hand_sort_suit != 0);
 }
 
@@ -690,8 +702,13 @@ static double blind_amount(uint8_t ante, uint8_t scaling) {
     double c = (double)ante - 8.0;
     double d = 1.0 + 0.2 * c;
     double raw = floor(amounts[scaling - 1][7] * pow(1.6 + pow(0.75 * c, d), c));
+    /* Unrepresentable requirements saturate to +Inf (never NaN): an infinite
+       blind is beaten only by an infinite score, decided by direct
+       comparison at the beat check. See finish_blind. */
+    if (!isfinite(raw)) return INFINITY;
     double rounding = pow(10.0, floor(log10(raw) - 1.0));
-    return raw - fmod(raw, rounding);
+    double out = raw - fmod(raw, rounding);
+    return isfinite(out) ? out : INFINITY;
 }
 
 static int32_t calculate_round_earnings(const State *state) {
@@ -738,35 +755,30 @@ static int32_t calculate_round_earnings(const State *state) {
     return state->blind_reward + hand_bonus + discard_bonus + interest + bonus;
 }
 
-static int consumable_no_target_legal(const State *state, uint16_t center_id) {
-    const ConsumableSignature *sig = &CONSUMABLE_SIGNATURES[center_id];
-    switch (sig->kind) {
-    case CONS_SPECTRAL_SPAWN:
-    case CONS_IMMOLATE:
-    case CONS_SIGIL:
-    case CONS_OUIJA:
+static int can_use_consumable(const State *state, const ConsumableSignature *signature) {
+    switch (signature->use_rule) {
+    case CONSUMABLE_USE_ALWAYS:
+        return 1;
+    case CONSUMABLE_USE_HAND_GT_ONE:
         return state->hand_count > 1;
-    case CONS_ANKH:
-        return state->joker_count > 0 && state->joker_count < state->joker_slots;
-    case CONS_WRAITH:
-    case CONS_SOUL:
-    case CONS_JUDGEMENT:
+    case CONSUMABLE_USE_JOKER_ROOM:
         return state->joker_count < state->joker_slots;
-    case CONS_ECTOPLASM:
-    case CONS_HEX:
+    case CONSUMABLE_USE_JOKER_PRESENT_AND_ROOM:
+        return state->joker_count > 0 && state->joker_count < state->joker_slots;
+    case CONSUMABLE_USE_EDITIONLESS_JOKER:
         for (uint8_t i = 0; i < state->joker_count; ++i)
             if (state->jokers[i].edition == EDITION_NONE) return 1;
         return 0;
-    case CONS_WHEEL:
+    case CONSUMABLE_USE_ACTIVE_EDITIONLESS_JOKER:
         for (uint8_t i = 0; i < state->joker_count; ++i)
             if (!(state->jokers[i].flags & CARD_DEBUFFED) &&
                 state->jokers[i].edition == EDITION_NONE) return 1;
         return 0;
-    case CONS_FOOL:
+    case CONSUMABLE_USE_LAST_TAROT:
         return state->last_tarot_planet != 0 && state->last_tarot_planet != CENTER_C_FOOL;
-    default:
-        return 1;
     }
+    assert(!"invalid consumable use rule");
+    return 0;
 }
 
 static void joker_on_joker_effects(const State *state, uint8_t target_index, double *mult) {
@@ -788,17 +800,21 @@ static int matador_debuff_bonus(const State *state) {
 }
 
 static int remove_selected(State *state, const Action *action, Card played[MAX_SELECTION]) {
-    uint64_t mask = 0;
-    for (uint8_t j = 0; j < action->selection_count; ++j)
-        if (action->selection[j] < state->hand_count) mask |= (1ull << action->selection[j]);
     uint8_t out_count = 0, keep_count = 0;
+    Card keep[MAX_HAND];
     for (uint8_t i = 0; i < state->hand_count; ++i) {
-        if (mask & (1ull << i)) {
-            if (out_count < MAX_SELECTION) played[out_count++] = state->hand[i];
-        } else {
-            state->hand[keep_count++] = state->hand[i];
-        }
+        int selected = 0;
+        for (uint8_t j = 0; j < action->selection_count; ++j)
+            if (action->selection[j] == i) {
+                selected = 1;
+                break;
+            }
+        if (selected)
+            played[out_count++] = state->hand[i];
+        else
+            keep[keep_count++] = state->hand[i];
     }
+    memcpy(state->hand, keep, sizeof(Card) * keep_count);
     state->hand_count = keep_count;
     return out_count;
 }
@@ -813,13 +829,31 @@ void reset_round_rerolls(State *state) {
     state->reroll_cost = chaos ? 0 : (state->tag_d_six_active ? 0 : state->reroll_base);
 }
 
-static double shaped_transition_reward(const State *state,
+static double shaped_transition_reward(State *state,
                                        const Action *action,
                                        double previous_chips,
                                        double previous_blind_chips,
-                                       uint8_t previous_ante,
-                                       uint8_t previous_phase) {
+                                       uint8_t previous_phase,
+                                       uint8_t previous_blind_on_deck,
+                                       uint8_t previous_blind_skipped_mask,
+                                       int32_t previous_dollars) {
     double reward = 0.0;
+    /* Legacy economy shaping: scale with the dollar change of the step. */
+    if (state->config.money_reward > 0.0f)
+        reward += (double)state->config.money_reward * (double)(state->dollars - previous_dollars);
+
+    /* 1. Step-Level High-Pass Log-Power Potential (Only rewards scores > 10,000) */
+    if (action->type == ACTION_PLAY_HAND &&
+        state->config.power_reward > 0.0f &&
+        isfinite(state->last_hand_score) && state->last_hand_score > 10000.0) {
+        double cur_log = log10(state->last_hand_score) - 4.0;
+        if (cur_log > state->peak_hand_log) {
+            reward += (double)state->config.power_reward * (cur_log - state->peak_hand_log);
+            state->peak_hand_log = cur_log;
+        }
+    }
+
+    /* 2. Intra-round step-level progress (potential-based, normalized to blind) */
     if (action->type == ACTION_PLAY_HAND &&
         isfinite(previous_chips) && previous_chips >= 0.0 &&
         isfinite(previous_blind_chips) && previous_blind_chips > 0.0 &&
@@ -844,26 +878,73 @@ static double shaped_transition_reward(const State *state,
             }
         }
     }
+
+    /* 3. Blind clearance outcomes */
     if (action->type == ACTION_PLAY_HAND &&
         previous_phase == PHASE_SELECTING_HAND &&
-        state->phase == PHASE_ROUND_EVAL)
-        reward += state->config.blind_bonus;
-    if (state->ante > previous_ante)
-        reward += (double)(state->ante - previous_ante) * state->config.ante_bonus;
+        state->phase == PHASE_ROUND_EVAL) {
+        double blind_reward = state->config.ante_bonus * state->config.blind_bonus;
+        if (previous_blind_on_deck < 2) {
+            reward += blind_reward;
+        } else {
+            uint8_t skipped = previous_blind_skipped_mask & 3u;
+            int completed = 2 - __builtin_popcount((unsigned)skipped);
+            double base_ante_reward = state->config.ante_bonus - blind_reward * completed;
+            if (state->config.ante_escalation > 0.0f) {
+                uint8_t completed_ante = state->ante > 1 ? state->ante - 1 : 1;
+                if (completed_ante >= 8) {
+                    /* Geometric escalation for Ante 8, 9, 10, 11... */
+                    double exp_term = pow(2.0, (double)(completed_ante - 8));
+                    base_ante_reward *= (1.0 + (double)state->config.ante_escalation * 4.0 * exp_term);
+                } else {
+                    base_ante_reward *= (1.0 + (double)state->config.ante_escalation * (double)(completed_ante - 1));
+                }
+            }
+            reward += base_ante_reward;
+        }
+
+        /* Hand efficiency: bonus for hands remaining (disabled when eff_reward == 0) */
+        if (state->config.eff_reward > 0.0f) {
+            uint8_t total_hands = state->hands_left + state->hands_played;
+            if (total_hands > 0) {
+                reward += (double)state->config.eff_reward * ((double)state->hands_left / (double)total_hands);
+            }
+        }
+
+        /* Legacy log-margin scoring headroom (disabled when headroom_reward == 0) */
+        if (state->config.headroom_reward > 0.0f && previous_blind_chips > 0.0 && state->last_hand_score > previous_blind_chips) {
+            double margin = log10(state->last_hand_score / previous_blind_chips);
+            if (margin > 2.5) margin = 2.5;
+            reward += (double)state->config.headroom_reward * margin;
+        }
+    }
+
+    /* 4. Round Cashout Economy Health: interest banking bonus without purchase penalty */
+    if (action->type == ACTION_CASH_OUT && state->phase == PHASE_SHOP) {
+        if (state->config.interest_reward > 0.0f) {
+            int16_t cap = state->interest_cap > 0 ? state->interest_cap : 25;
+            double bankroll = (double)state->dollars;
+            for (uint8_t i = 0; i < state->joker_count; ++i)
+                bankroll += (double)state->jokers[i].sell_cost;
+            for (uint8_t i = 0; i < state->consumable_count; ++i)
+                bankroll += (double)state->consumables[i].sell_cost;
+            if (bankroll > (double)cap) bankroll = (double)cap;
+            if (bankroll > 0.0) {
+                reward += (double)state->config.interest_reward * (bankroll / (double)cap);
+            }
+        }
+    }
+
     if (state->terminal)
         reward += state->won
             ? state->config.win_bonus : -state->config.loss_penalty;
     return reward;
 }
 
-static inline void swap_cards(Card *a, Card *b) {
-    Card tmp = *a;
-    *a = *b;
-    *b = tmp;
-}
-
 void swap_jokers(State *state, uint8_t left, uint8_t right) {
-    swap_cards(&state->jokers[left], &state->jokers[right]);
+    Card card = state->jokers[left];
+    state->jokers[left] = state->jokers[right];
+    state->jokers[right] = card;
 }
 
 HandType classify_hand(const Card *cards, size_t count, uint8_t *scoring_mask,
@@ -970,6 +1051,17 @@ HandType classify_hand(const Card *cards, size_t count, uint8_t *scoring_mask,
     while (high && !rank_masks[high]) high--;
     if (high) *scoring_mask = rank_masks[high] & (uint8_t)(-(int8_t)rank_masks[high]);
     return HIGH_CARD;
+}
+
+void hand_base_stats(HandType hand, int level, int *out_chips, int *out_mult) {
+    if (hand < 0 || hand >= HAND_COUNT) {
+        if (out_chips) *out_chips = 0;
+        if (out_mult) *out_mult = 0;
+        return;
+    }
+    uint8_t lvl = level > 0 ? (uint8_t)level : 1;
+    if (out_chips) *out_chips = base_chips[hand] + level_chips[hand] * (lvl - 1);
+    if (out_mult) *out_mult = base_mult[hand] + level_mult[hand] * (lvl - 1);
 }
 
 static int joker_cache_bit(uint16_t center_id) {
@@ -1343,12 +1435,6 @@ static void joker_removed(State *state, const Card *joker) {
     }
 }
 
-static void trigger_campfire(State *state, uint8_t skip_index) {
-    for (uint8_t j = 0; j < state->joker_count; ++j)
-        if (j != skip_index && !(state->jokers[j].flags & CARD_DEBUFFED) && state->jokers[j].center_id == CENTER_J_CAMPFIRE)
-            state->jokers[j].state[0] = (state->jokers[j].state[0] > 100 ? state->jokers[j].state[0] : 100) + 25;
-}
-
 int sell_joker(State *state, uint8_t index) {
     if (!state || index >= state->joker_count || (state->jokers[index].flags & CARD_ETERNAL)) return ERR_ACTION;
     Card card = state->jokers[index];
@@ -1376,8 +1462,16 @@ int sell_joker(State *state, uint8_t index) {
     if (!state->blind_disabled && (luchador_disables || state->blind_id == BLIND_BL_FINAL_LEAF)) {
         state->blind_disabled = 1;
         clear_card_debuffs(state);
+        for (uint16_t i = 0; i < state->deck_count; ++i)
+            state->deck[i].flags &= (uint8_t)~CARD_FACEDOWN;
+        for (uint8_t i = 0; i < state->hand_count; ++i)
+            state->hand[i].flags &= (uint8_t)~CARD_FACEDOWN;
+        for (uint16_t i = 0; i < state->discard_count; ++i)
+            state->discard[i].flags &= (uint8_t)~CARD_FACEDOWN;
     }
-    trigger_campfire(state, index);
+    for (uint8_t j = 0; j < state->joker_count; ++j)
+        if (j != index && !(state->jokers[j].flags & CARD_DEBUFFED) && state->jokers[j].center_id == CENTER_J_CAMPFIRE)
+            state->jokers[j].state[0] = (state->jokers[j].state[0] > 100 ? state->jokers[j].state[0] : 100) + 25;
     ZONE_REMOVE(state->jokers, state->joker_count, index);
     refresh_joker_cache(state);
     return OK;
@@ -1434,13 +1528,11 @@ static void roll_standard_edition(State *state, const char *prefix, Card *card) 
 }
 
 static void roll_standard_seal(State *state, const char *prefix, Card *card) {
-    char stream[32];
-    key_with_u64(stream, sizeof(stream), prefix, state->ante);
-    double seal = pseudorandom(state, stream);
+    double seal = pseudorandom(state, prefix);
     card->seal = seal > 0.75 ? SEAL_RED
                : seal > 0.50 ? SEAL_BLUE
                : seal > 0.25 ? SEAL_GOLD
-               : SEAL_PURPLE;
+                             : SEAL_PURPLE;
 }
 
 static void roll_joker_edition(State *state, const char *append, Card *card) {
@@ -1682,36 +1774,55 @@ static void consumable_removed(State *state, const Card *card) {
 }
 
 void apply_consumable(State *state, const Action *action, Card card) {
+    assert(card.center_id < CENTER_COUNT);
+    const ConsumableSignature *signature = &consumable_signatures[card.center_id];
+    assert(signature->kind != CONS_NONE);
     uint8_t set = card_set(&card);
-    const ConsumableSignature *sig = &CONSUMABLE_SIGNATURES[card.center_id];
-    switch (sig->kind) {
-    case CONS_PLANET:
-        state->planet_usage_mask |= (uint16_t)(1u << sig->planet_hand);
-        if (state->hand_levels[sig->planet_hand] < 255) state->hand_levels[sig->planet_hand]++;
+    switch (signature->kind) {
+    case CONS_PLANET: {
+        uint8_t hand = signature->planet_hand;
+        state->planet_usage_mask |= (uint16_t)(1u << hand);
+        if (state->hand_levels[hand] < UINT8_MAX) state->hand_levels[hand]++;
         for (uint8_t j = 0; j < state->joker_count; ++j)
             if (state->jokers[j].center_id == CENTER_J_CONSTELLATION)
                 state->jokers[j].state[0] = (state->jokers[j].state[0] > 100 ? state->jokers[j].state[0] : 100) + 10;
         break;
+    }
     case CONS_BLACK_HOLE:
         for (uint8_t i = 0; i < HAND_COUNT; ++i)
-            if (state->hand_levels[i] < 255) state->hand_levels[i]++;
+            if (state->hand_levels[i] < UINT8_MAX) state->hand_levels[i]++;
         break;
     case CONS_TARGET:
         for (uint8_t i = 0; i < action->selection_count; ++i) {
-            Card *target = &state->hand[action->selection[i]];
-            if (sig->target_effect == TARGET_ENHANCEMENT) target->enhancement = sig->target_val;
-            else if (sig->target_effect == TARGET_SUIT) target->suit = sig->target_val;
-            else if (sig->target_effect == TARGET_SEAL) target->seal = sig->target_val;
-            else if (sig->target_effect == TARGET_RANK_UP) target->rank = target->rank == 14 ? 2 : target->rank < 14 ? target->rank + 1 : target->rank;
+            uint8_t index = action->selection[i];
+            assert(index < state->hand_count);
+            Card *target = &state->hand[index];
+            switch (signature->target_effect) {
+            case TARGET_ENHANCEMENT:
+                target->enhancement = signature->target_value;
+                break;
+            case TARGET_SUIT:
+                target->suit = signature->target_value;
+                break;
+            case TARGET_SEAL:
+                target->seal = signature->target_value;
+                break;
+            case TARGET_RANK_UP:
+                target->rank = target->rank == 14 ? 2 : target->rank < 14 ? target->rank + 1 : target->rank;
+                break;
+            default:
+                assert(!"invalid target effect");
+            }
             refresh_card_debuff(state, target);
         }
         break;
     case CONS_SPAWN_POOL: {
         uint8_t saved_slots = state->consumable_slots;
         if (action->type == ACTION_USE_CONSUMABLE && state->consumable_slots < UINT8_MAX) state->consumable_slots++;
-        uint8_t room = state->consumable_slots > state->consumable_count ? state->consumable_slots - state->consumable_count : 0;
-        for (uint8_t i = 0; i < sig->spawn_count && i < room; ++i)
-            (void)add_pooled_consumable(state, sig->spawn_set, sig->stream, 0);
+        uint8_t room = state->consumable_slots > state->consumable_count ?
+            (uint8_t)(state->consumable_slots - state->consumable_count) : 0;
+        for (uint8_t i = 0; i < signature->spawn_count && i < room; ++i)
+            (void)add_pooled_consumable(state, signature->spawn_set, signature->stream, 0);
         state->consumable_slots = saved_slots;
         break;
     }
@@ -1723,106 +1834,105 @@ void apply_consumable(State *state, const Action *action, Card card) {
             state->consumable_slots = saved_slots;
         }
         break;
-    case CONS_HERMIT:
-        state->dollars += state->dollars > 0 ? (state->dollars < 20 ? state->dollars : 20) : 0;
+    case CONS_HERMIT: {
+        int gain = state->dollars > 0 ? (state->dollars < 20 ? state->dollars : 20) : 0;
+        state->dollars += gain;
         break;
+    }
     case CONS_TEMPERANCE: {
         int total = 0;
         for (uint8_t i = 0; i < state->joker_count; ++i) total += state->jokers[i].sell_cost;
         state->dollars += total > 50 ? 50 : total;
         break;
     }
-    case CONS_WHEEL:
-    case CONS_ECTOPLASM:
-    case CONS_HEX: {
+    case CONS_JOKER_EDITION: {
         uint8_t eligible[MAX_JOKERS];
         uint8_t count = sorted_editionless_jokers(state, eligible);
-        if (count) {
-            if (sig->kind == CONS_WHEEL) {
-                if (pseudorandom(state, "wheel_of_fortune") < adjust_probability(state, 0.25)) {
-                    size_t pick = (size_t)floor(pseudorandom(state, "wheel_of_fortune") * count);
-                    state->jokers[eligible[pick]].edition = roll_aura_edition(pseudorandom(state, "wheel_of_fortune"));
-                    price_card(state, &state->jokers[eligible[pick]]);
-                }
-            } else if (sig->kind == CONS_ECTOPLASM) {
-                size_t pick = (size_t)floor(pseudorandom(state, "ectoplasm") * count);
-                state->jokers[eligible[pick]].edition = EDITION_NEGATIVE;
-                price_card(state, &state->jokers[eligible[pick]]);
-                if (state->joker_slots < UINT8_MAX) state->joker_slots++;
-                uint8_t penalty = state->ecto_penalty ? state->ecto_penalty : 1;
-                state->hand_size = state->hand_size > penalty ? state->hand_size - penalty : 1;
-                state->base_hand_size = state->base_hand_size > penalty ? state->base_hand_size - penalty : 1;
-                state->ecto_penalty = penalty < UINT8_MAX ? (uint8_t)(penalty + 1) : UINT8_MAX;
-            } else {
-                size_t pick = (size_t)floor(pseudorandom(state, "hex") * count);
-                uint8_t target = eligible[pick];
-                state->jokers[target].edition = EDITION_POLYCHROME;
-                price_card(state, &state->jokers[target]);
-                for (uint8_t i = state->joker_count; i-- > 0;)
-                    if (i != target && !(state->jokers[i].flags & CARD_ETERNAL)) remove_joker_at(state, i);
-            }
+        if (!count) break;
+        if (signature->joker_effect == JOKER_ROLL_EDITION &&
+            pseudorandom(state, signature->stream) >= adjust_probability(state, signature->chance_percent / 100.0)) break;
+        size_t pick = (size_t)floor(pseudorandom(state, signature->stream) * count);
+        uint8_t target = eligible[pick];
+        if (signature->joker_effect == JOKER_ROLL_EDITION) {
+            state->jokers[target].edition = roll_aura_edition(pseudorandom(state, signature->stream));
+            price_card(state, &state->jokers[target]);
+        } else if (signature->joker_effect == JOKER_NEGATIVE_SHRINK_HAND) {
+            state->jokers[target].edition = EDITION_NEGATIVE;
+            price_card(state, &state->jokers[target]);
+            if (state->joker_slots < UINT8_MAX) state->joker_slots++;
+            uint8_t penalty = state->ecto_penalty ? state->ecto_penalty : 1;
+            state->hand_size = state->hand_size > penalty ? state->hand_size - penalty : 1;
+            state->base_hand_size = state->base_hand_size > penalty ? state->base_hand_size - penalty : 1;
+            state->ecto_penalty = penalty < UINT8_MAX ? (uint8_t)(penalty + 1) : UINT8_MAX;
+        } else {
+            assert(signature->joker_effect == JOKER_POLYCHROME_DESTROY);
+            state->jokers[target].edition = EDITION_POLYCHROME;
+            price_card(state, &state->jokers[target]);
+            for (uint8_t i = state->joker_count; i-- > 0;)
+                if (i != target && !(state->jokers[i].flags & CARD_ETERNAL)) remove_joker_at(state, i);
         }
         break;
     }
     case CONS_AURA:
-        if (action->selection_count)
-            state->hand[action->selection[0]].edition = roll_aura_edition(pseudorandom(state, "aura"));
+        assert(action->selection_count == 1);
+        assert(action->selection[0] < state->hand_count);
+        assert(state->hand[action->selection[0]].edition == EDITION_NONE);
+        state->hand[action->selection[0]].edition = roll_aura_edition(pseudorandom(state, signature->stream));
         break;
-    case CONS_HANGED_MAN:
-        if (action->selection_count) {
-            uint8_t glass = 0;
-            for (uint8_t i = 0; i < action->selection_count; ++i)
-                if (action->selection[i] < state->hand_count && state->hand[action->selection[i]].enhancement == ENHANCEMENT_GLASS) glass++;
-            if (glass)
-                for (uint8_t j = 0; j < state->joker_count; ++j)
-                    if (!(state->jokers[j].flags & CARD_DEBUFFED) && state->jokers[j].center_id == CENTER_J_GLASS)
-                        state->jokers[j].state[0] = (state->jokers[j].state[0] > 100 ? state->jokers[j].state[0] : 100) + glass * 75;
-            for (uint8_t i = action->selection_count; i-- > 0;)
-                if (action->selection[i] < state->hand_count) remove_hand_index(state, action->selection[i]);
+    case CONS_HANGED_MAN: {
+        uint8_t glass = 0;
+        for (uint8_t i = 0; i < action->selection_count; ++i) {
+            assert(action->selection[i] < state->hand_count);
+            if (state->hand[action->selection[i]].enhancement == ENHANCEMENT_GLASS) glass++;
+        }
+        if (glass)
+            for (uint8_t j = 0; j < state->joker_count; ++j)
+                if (!(state->jokers[j].flags & CARD_DEBUFFED) && state->jokers[j].center_id == CENTER_J_GLASS)
+                    state->jokers[j].state[0] = (state->jokers[j].state[0] > 100 ? state->jokers[j].state[0] : 100) + glass * 75;
+        for (uint8_t i = action->selection_count; i-- > 0;) {
+            assert(action->selection[i] < state->hand_count);
+            remove_hand_index(state, action->selection[i]);
         }
         break;
-    case CONS_DEATH:
-        if (action->selection_count >= 2) {
-            uint8_t left = action->selection[0], right = action->selection[1];
-            if (left < state->hand_count && right < state->hand_count && left != right) {
-                Card source = state->hand[right];
-                Card *target = &state->hand[left];
-                target->center_id = source.center_id;
-                target->suit = source.suit;
-                target->rank = source.rank;
-                target->enhancement = source.enhancement;
-                target->edition = source.edition;
-                target->seal = source.seal;
-                target->perma_bonus = source.perma_bonus;
-                refresh_card_debuff(state, target);
-                target->cost = source.cost;
-                target->sell_cost = source.sell_cost;
-            }
-        }
+    }
+    case CONS_DEATH: {
+        assert(action->selection_count == 2);
+        uint8_t left = action->selection[0], right = action->selection[1];
+        assert(left < state->hand_count && right < state->hand_count && left != right);
+        Card source = state->hand[right];
+        Card *target = &state->hand[left];
+        target->center_id = source.center_id;
+        target->suit = source.suit;
+        target->rank = source.rank;
+        target->enhancement = source.enhancement;
+        target->edition = source.edition;
+        target->seal = source.seal;
+        target->perma_bonus = source.perma_bonus;
+        refresh_card_debuff(state, target);
+        target->cost = source.cost;
+        target->sell_cost = source.sell_cost;
         break;
+    }
     case CONS_JUDGEMENT:
         if (state->joker_count < state->joker_slots && state->joker_count < MAX_JOKERS) {
-            Card joker = create_pooled_card(state, SET_JOKER, "jud", 0);
+            Card joker = create_pooled_card(state, SET_JOKER, signature->stream, 0);
             state->jokers[state->joker_count++] = joker;
             joker_added(state, &state->jokers[state->joker_count - 1]);
             mark_center_used(state, joker.center_id);
         }
         break;
-    case CONS_WRAITH:
-    case CONS_SOUL: {
-        int rarity = sig->kind == CONS_WRAITH ? 3 : 4;
-        (void)add_joker_rarity(state, (uint8_t)rarity, sig->stream, rarity == 4);
-        if (sig->kind == CONS_WRAITH) state->dollars = 0;
+    case CONS_JOKER_RARITY:
+        (void)add_joker_rarity(state, signature->rarity, signature->stream, signature->legendary);
+        if (signature->reset_dollars) state->dollars = 0;
         break;
-    }
     case CONS_SIGIL: {
         static const uint8_t suits[] = {SPADES, HEARTS, DIAMONDS, CLUBS};
-        uint8_t suit = suits[(size_t)floor(pseudorandom(state, "sigil") * 4.0) % 4];
+        uint8_t suit = suits[(size_t)floor(pseudorandom(state, signature->stream) * 4.0) % 4];
         for (uint8_t i = 0; i < state->hand_count; ++i) state->hand[i].suit = suit;
         break;
     }
     case CONS_OUIJA: {
-        uint8_t rank = (uint8_t)(2 + floor(pseudorandom(state, "ouija") * 13.0));
+        uint8_t rank = (uint8_t)(2 + floor(pseudorandom(state, signature->stream) * 13.0));
         for (uint8_t i = 0; i < state->hand_count; ++i) state->hand[i].rank = rank;
         if (state->hand_size > 1) state->hand_size--;
         if (state->base_hand_size > 1) state->base_hand_size--;
@@ -1831,63 +1941,85 @@ void apply_consumable(State *state, const Action *action, Card card) {
     case CONS_IMMOLATE: {
         Card shuffled[MAX_HAND];
         memcpy(shuffled, state->hand, (size_t)state->hand_count * sizeof(Card));
-        shuffle(state, shuffled, state->hand_count, "immolate");
+        shuffle(state, shuffled, state->hand_count, signature->stream);
         uint8_t remove = state->hand_count < 5 ? state->hand_count : 5;
         uint16_t destroyed_ids[5];
         for (uint8_t i = 0; i < remove; ++i) destroyed_ids[i] = shuffled[i].sort_id;
         for (uint8_t i = remove; i-- > 0;)
             for (uint8_t h = 0; h < state->hand_count; ++h)
-                if (state->hand[h].sort_id == destroyed_ids[i]) { remove_hand_index(state, h); break; }
+                if (state->hand[h].sort_id == destroyed_ids[i]) {
+                    remove_hand_index(state, h);
+                    break;
+                }
         state->dollars += 20;
         break;
     }
-    case CONS_ANKH:
-        if (state->joker_count) {
-            uint8_t order[MAX_JOKERS];
-            for (uint8_t i = 0; i < state->joker_count; ++i) order[i] = i;
-            sort_indices(state->jokers, order, state->joker_count);
-            size_t pick = (size_t)floor(pseudorandom(state, "ankh_choice") * state->joker_count);
-            Card copy = state->jokers[order[pick]];
-            for (uint8_t i = state->joker_count; i-- > 0;)
-                if (i != order[pick] && !(state->jokers[i].flags & CARD_ETERNAL)) remove_joker_at(state, i);
-            if (state->joker_count < state->joker_slots && state->joker_count < MAX_JOKERS) {
-                copy.sort_id = ++state->next_sort_id;
-                if (copy.edition == EDITION_NEGATIVE) copy.edition = EDITION_NONE;
-                price_card(state, &copy);
-                state->jokers[state->joker_count++] = copy;
-                joker_added(state, &state->jokers[state->joker_count - 1]);
-            }
-        }
-        break;
     case CONS_SPECTRAL_SPAWN: {
-        if (state->hand_count) remove_hand_index(state, random_sorted_hand_index(state, "random_destroy"));
         static const uint8_t face_ranks[] = {11, 12, 13};
         static const uint8_t ace_ranks[] = {14};
         static const uint8_t number_ranks[] = {2, 3, 4, 5, 6, 7, 8, 9, 10};
-        const uint8_t *ranks = sig->spectral_ranks == 1 ? face_ranks : sig->spectral_ranks == 2 ? ace_ranks : number_ranks;
-        size_t rank_count = sig->spectral_ranks == 1 ? 3 : sig->spectral_ranks == 2 ? 1 : 9;
-        add_spectral_cards(state, ranks, rank_count, sig->spawn_count, sig->stream);
+        const uint8_t *ranks;
+        size_t rank_count;
+        switch (signature->spectral_ranks) {
+        case 1:
+            ranks = face_ranks;
+            rank_count = sizeof(face_ranks) / sizeof(*face_ranks);
+            break;
+        case 2:
+            ranks = ace_ranks;
+            rank_count = sizeof(ace_ranks) / sizeof(*ace_ranks);
+            break;
+        case 3:
+            ranks = number_ranks;
+            rank_count = sizeof(number_ranks) / sizeof(*number_ranks);
+            break;
+        default:
+            assert(!"invalid spectral rank set");
+        }
+        assert(state->hand_count);
+        remove_hand_index(state, random_sorted_hand_index(state, "random_destroy"));
+        add_spectral_cards(state, ranks, rank_count, signature->spawn_count, signature->stream);
         break;
     }
-    case CONS_CRYPTID:
-        if (action->selection_count) {
-            Card source = state->hand[action->selection[0]];
-            for (uint8_t i = 0; i < 2; ++i) {
-                if (!can_add_playing_cards(state, 1)) break;
-                Card copy = source;
-                copy.sort_id = ++state->next_sort_id;
-                int added = 0;
-                if ((state->phase == PHASE_SELECTING_HAND || state->phase == PHASE_PACK_OPENING) && state->hand_count < MAX_HAND)
-                    state->hand[state->hand_count++] = copy, added = 1;
-                else if (state->deck_count < MAX_DECK)
-                    state->deck[state->deck_count++] = copy, added = 1;
-                if (added) playing_card_added(state, 1);
-            }
-            if (state->phase == PHASE_SELECTING_HAND) sort_hand(state, state->hand_sort_suit != 0);
+    case CONS_CRYPTID: {
+        assert(action->selection_count == 1);
+        assert(action->selection[0] < state->hand_count);
+        Card source = state->hand[action->selection[0]];
+        for (uint8_t i = 0; i < 2; ++i) {
+            if (!can_add_playing_cards(state, 1)) break;
+            Card copy = source;
+            copy.sort_id = ++state->next_sort_id;
+            int added = 0;
+            if ((state->phase == PHASE_SELECTING_HAND || state->phase == PHASE_PACK_OPENING) &&
+                state->hand_count < MAX_HAND)
+                state->hand[state->hand_count++] = copy, added = 1;
+            else if (state->deck_count < MAX_DECK)
+                state->deck[state->deck_count++] = copy, added = 1;
+            if (added) playing_card_added(state, 1);
+        }
+        if (state->phase == PHASE_SELECTING_HAND) sort_hand(state, state->hand_sort_suit != 0);
+        break;
+    }
+    case CONS_ANKH: {
+        assert(state->joker_count);
+        uint8_t order[MAX_JOKERS];
+        for (uint8_t i = 0; i < state->joker_count; ++i) order[i] = i;
+        sort_indices(state->jokers, order, state->joker_count);
+        size_t pick = (size_t)floor(pseudorandom(state, signature->stream) * state->joker_count);
+        Card copy = state->jokers[order[pick]];
+        for (uint8_t i = state->joker_count; i-- > 0;)
+            if (i != order[pick] && !(state->jokers[i].flags & CARD_ETERNAL)) remove_joker_at(state, i);
+        if (state->joker_count < state->joker_slots && state->joker_count < MAX_JOKERS) {
+            copy.sort_id = ++state->next_sort_id;
+            if (copy.edition == EDITION_NEGATIVE) copy.edition = EDITION_NONE;
+            price_card(state, &copy);
+            state->jokers[state->joker_count++] = copy;
+            joker_added(state, &state->jokers[state->joker_count - 1]);
         }
         break;
+    }
     default:
-        break;
+        assert(!"invalid consumable kind");
     }
     if (set == SET_TAROT) {
         state->tarots_used++;
@@ -1907,7 +2039,9 @@ void sell_consumable(State *state, uint8_t index) {
     Card card = state->consumables[index];
     state->dollars += card.sell_cost;
     consumable_removed(state, &card);
-    trigger_campfire(state, UINT8_MAX);
+    for (uint8_t j = 0; j < state->joker_count; ++j)
+        if (!(state->jokers[j].flags & CARD_DEBUFFED) && state->jokers[j].center_id == CENTER_J_CAMPFIRE)
+            state->jokers[j].state[0] = (state->jokers[j].state[0] > 100 ? state->jokers[j].state[0] : 100) + 25;
     ZONE_REMOVE(state->consumables, state->consumable_count, index);
 }
 
@@ -1981,7 +2115,7 @@ static int open_pack_center(State *state, uint16_t center_id) {
         uint16_t telescope = 0;
         if (kind == PACK_PLANET && i == 0 && center_used(state, CENTER_V_TELESCOPE)) {
             uint8_t hand = most_played_hand(state);
-            if (state->hand_plays[hand]) telescope = planet_centers[hand];
+            if (state->hand_plays[hand]) telescope = planet_center((HandType)hand);
         }
         uint8_t card_set = set;
         const char *card_append = append;
@@ -2610,7 +2744,7 @@ static int joker_repetitions(const State *state, const ScoreContext *context, co
     for (size_t j = 0; j < context->source_count; ++j) {
         const Card *joker = &state->jokers[context->sources[j]];
         const JokerSignature *sig = &JOKER_SIGNATURES[joker->center_id];
-        if (sig->retriggers) {
+        if (sig->trigger == SIG_TRIG_SCORED_CARD && sig->retriggers) {
             if (joker->center_id == CENTER_J_HANGING_CHAD) {
                 size_t first = 0;
                 while (first < 5 && !(scoring_mask & (1u << first))) first++;
@@ -2637,7 +2771,8 @@ static void individual_jokers(State *state, const ScoreContext *context, const C
         Card *joker = &state->jokers[context->sources[source_index]];
         int copied = context->copied[source_index];
         const JokerSignature *sig = &JOKER_SIGNATURES[joker->center_id];
-        if (sig->trigger == SIG_TRIG_SCORED_CARD) {
+        if (sig->trigger == SIG_TRIG_SCORED_CARD && sig->growth == 0 &&
+            !sig->nondeterministic && joker->center_id != CENTER_J_HIKER) {
             int trigger = 0;
             switch (sig->condition) {
             case SIG_COND_NONE: trigger = 1; break;
@@ -2812,7 +2947,8 @@ static void main_jokers(State *state, const ScoreContext *context, HandType hand
         else if (physical->edition == EDITION_HOLO)
             *mult += 10;
         const JokerSignature *sig = &JOKER_SIGNATURES[joker->center_id];
-        if (sig->trigger == SIG_TRIG_HAND_PLAYED) {
+        if (sig->trigger == SIG_TRIG_HAND_PLAYED && sig->growth == 0 &&
+            sig->scale != SIG_SCALE_SELL_TOTAL && sig->scale != SIG_SCALE_FREE_SLOTS) {
             int trigger = 0;
             double units = 1.0;
             switch (sig->condition) {
@@ -2960,14 +3096,17 @@ static void main_jokers(State *state, const ScoreContext *context, HandType hand
             *mult += sell_total;
             break;
         }
+        case CENTER_J_WEE:
+            *chips += joker->state[0];
+            break;
+        case CENTER_J_POPCORN: {
+            int current = joker->state[0] > 0 ? joker->state[0] : 20;
+            *mult += current;
+            break;
+        }
         case CENTER_J_FLASH:
         case CENTER_J_RED_CARD:
-        case CENTER_J_CEREMONIAL:
             *mult += joker->state[0];
-            break;
-        case CENTER_J_WEE:
-        case CENTER_J_CASTLE:
-            *chips += joker->state[0];
             break;
         case CENTER_J_RAMEN: {
             if (joker->state[1]) break;
@@ -2987,6 +3126,12 @@ static void main_jokers(State *state, const ScoreContext *context, HandType hand
                 joker->state[0] = current - 5;
             break;
         }
+        case CENTER_J_CASTLE:
+            *chips += joker->state[0];
+            break;
+        case CENTER_J_CEREMONIAL:
+            *mult += joker->state[0];
+            break;
         case CENTER_J_TODO_LIST:
             if (joker->state[1] == (int32_t)hand) *dollars += 4;
             break;
@@ -3037,6 +3182,24 @@ static int score_hand(State *state, const Card *played, size_t played_count, con
     HandType hand = classify_hand(played, played_count, &scoring, four_fingers, shortcut, smeared);
     state->hand_plays[hand]++;
     state->hand_plays_round[hand]++;
+    if (!state->blind_disabled) {
+        int hand_debuffed = state->blind_id == BLIND_BL_PSYCHIC && played_count < 5;
+        hand_debuffed |= state->blind_id == BLIND_BL_EYE &&
+            (state->blind_hands_mask & (1u << hand));
+        if (state->blind_id == BLIND_BL_MOUTH) {
+            if (state->blind_only_hand == UINT8_MAX)
+                state->blind_only_hand = (uint8_t)hand;
+            else
+                hand_debuffed |= state->blind_only_hand != (uint8_t)hand;
+        }
+        if (hand_debuffed) {
+            out->hand_type = hand;
+            out->scoring_mask = scoring;
+            out->hand_debuffed = 1;
+            out->dollars = matador_debuff_bonus(state);
+            return OK;
+        }
+    }
     int pareidolia = joker_active(state, CENTER_J_PAREIDOLIA);
     if (joker_active(state, CENTER_J_SPLASH))
         scoring = (uint8_t)((1u << played_count) - 1u);
@@ -3118,28 +3281,6 @@ static int score_hand(State *state, const Card *played, size_t played_count, con
             pseudorandom(state, "space") < adjust_probability(state, 0.25) && state->hand_levels[hand] < 255)
             state->hand_levels[hand]++;
     if (!state->blind_disabled) {
-        if (state->blind_id == BLIND_BL_PSYCHIC && played_count < 5) {
-            out->hand_type = hand;
-            out->scoring_mask = scoring;
-            out->dollars = matador_debuff_bonus(state);
-            return OK;
-        }
-        if (state->blind_id == BLIND_BL_EYE && (state->blind_hands_mask & (1u << hand))) {
-            out->hand_type = hand;
-            out->scoring_mask = scoring;
-            out->dollars = matador_debuff_bonus(state);
-            return OK;
-        }
-        if (state->blind_id == BLIND_BL_MOUTH) {
-            if (state->blind_only_hand == UINT8_MAX)
-                state->blind_only_hand = (uint8_t)hand;
-            else if (state->blind_only_hand != (uint8_t)hand) {
-                out->hand_type = hand;
-                out->scoring_mask = scoring;
-                out->dollars = matador_debuff_bonus(state);
-                return OK;
-            }
-        }
         state->blind_hands_mask |= (uint16_t)(1u << hand);
         if (state->blind_id == BLIND_BL_ARM && state->hand_levels[hand] > 1) state->hand_levels[hand]--;
     }
@@ -3218,16 +3359,17 @@ static int score_hand(State *state, const Card *played, size_t played_count, con
 // ------ legal + obs ---
 
 
-static uint64_t consumable_allowed_mask(const State *state, uint16_t center_id) {
+static uint64_t consumable_allowed_mask(const State *state, const ConsumableSignature *signature) {
     uint64_t allowed = state->hand_count == 64 ? UINT64_MAX : (UINT64_C(1) << state->hand_count) - 1;
-    if (center_id == CENTER_C_AURA)
+    if (signature->target_filter == CONSUMABLE_TARGET_EDITIONLESS)
         for (uint8_t i = 0; i < state->hand_count; ++i)
             if (state->hand[i].edition != EDITION_NONE) allowed &= ~(UINT64_C(1) << i);
     return allowed;
 }
 
 static void masks_add_discrete(LegalMasks *masks, Action action) {
-    int primary = action.type >= ACTION_BUY_CARD && action.type <= ACTION_SWAP_HAND_RIGHT ? action.primary : 0;
+    int primary = ((action.type >= ACTION_BUY_CARD && action.type <= ACTION_SWAP_HAND_RIGHT) ||
+                   action.type == ACTION_BUY_AND_USE) ? action.primary : 0;
     assert(action.type < ACTION_TYPE_COUNT && primary < 64);
     masks->primary[action.type] |= UINT64_C(1) << primary;
 }
@@ -3238,7 +3380,8 @@ static void legal_add_selection(LegalMasks *masks, uint8_t type, uint8_t primary
     if (maximum > allowed_count) maximum = allowed_count;
     if (minimum > maximum || __builtin_popcountll(required) > maximum || (required & allowed) != required)
         return;
-    int slot = type >= ACTION_BUY_CARD && type <= ACTION_SWAP_HAND_RIGHT ? primary : 0;
+    int slot = ((type >= ACTION_BUY_CARD && type <= ACTION_SWAP_HAND_RIGHT) ||
+                type == ACTION_BUY_AND_USE) ? primary : 0;
     assert(type < ACTION_TYPE_COUNT && slot < 64);
     masks->primary[type] |= UINT64_C(1) << slot;
     SelectionContract *selection =
@@ -3255,11 +3398,13 @@ static void legal_add_selection(LegalMasks *masks, uint8_t type, uint8_t primary
 
 static void legal_add_consumable(LegalMasks *masks, const State *state, uint8_t type,
                                  uint8_t primary, const Card *card) {
-    const ConsumableSignature *sig = &CONSUMABLE_SIGNATURES[card->center_id];
-    if (sig->max_select)
-        legal_add_selection(masks, type, primary, sig->min_select,
-            sig->max_select, consumable_allowed_mask(state, card->center_id), 0);
-    else if (consumable_no_target_legal(state, card->center_id))
+    assert(card->center_id < CENTER_COUNT);
+    const ConsumableSignature *signature = &consumable_signatures[card->center_id];
+    assert(signature->kind != CONS_NONE);
+    if (signature->target_max)
+        legal_add_selection(masks, type, primary, signature->target_min,
+            signature->target_max, consumable_allowed_mask(state, signature), 0);
+    else if (can_use_consumable(state, signature))
         masks_add_discrete(masks, (Action){.type = type, .primary = primary});
 }
 
@@ -3353,43 +3498,6 @@ int action_is_legal(const State *state, const Action *action) {
     return legal_masks(state, &masks) == OK && action_is_legal_masks(&masks, action);
 }
 
-static uint8_t public_playing_flags(const Card *card) {
-    uint8_t flags = card->flags & (CARD_DEBUFFED | CARD_ETERNAL | CARD_PERISHABLE | CARD_RENTAL |
-                                   CARD_FORCED);
-    if (card->state[3]) flags |= PUBLIC_CARD_PLAYED_THIS_ANTE;
-    return flags;
-}
-
-static void observation_poker_hand(const State *state, uint8_t hand, PokerHandStat *out) {
-    static const float base_chips_log[HAND_COUNT] = {7.33091688f, 7.13955116f, 6.9188633f, 6.65821171f,
-                                                     5.9307375f, 5.35755205f, 5.16992521f, 4.95419645f,
-                                                     4.95419645f, 4.3923173f, 3.45943165f, 2.58496261f};
-    static const float base_mult_log[HAND_COUNT] = {4.0874629f, 3.90689063f, 3.70043969f, 3.16992497f,
-                                                    3.0f, 2.32192802f, 2.32192802f, 2.32192802f,
-                                                    2.0f, 1.58496249f, 1.58496249f, 1.0f};
-    uint32_t level = state->hand_levels[hand] ? state->hand_levels[hand] : 1;
-    float chips = level == 1 ? base_chips_log[hand] : observation_signed_log2(base_chips[hand] + (double)level_chips[hand] * (level - 1));
-    float mult = level == 1 ? base_mult_log[hand] : observation_signed_log2(base_mult[hand] + (double)level_mult[hand] * (level - 1));
-    *out = (PokerHandStat){
-        .visible = (uint8_t)(hand >= STRAIGHT_FLUSH || state->hand_plays[hand] != 0),
-        .level = level > 255 ? 255 : (uint8_t)level,
-        .total_plays = state->hand_plays[hand],
-        .round_plays = state->hand_plays_round[hand],
-        .chips_log2 = chips,
-        .mult_log2 = mult,
-    };
-}
-
-static inline void write_card_token(CardToken *dst, const Card *card, uint8_t zone, int is_playing) {
-    dst->id = is_playing ? ((uint16_t)card->rank << 8 | (uint16_t)card->suit) : card->center_id;
-    dst->zone = zone;
-    dst->enhancement = card->enhancement;
-    dst->edition = card->edition;
-    dst->seal = card->seal;
-    dst->flags = is_playing ? public_playing_flags(card) : card->flags;
-    dst->dynamic_val = (int8_t)(card->sell_cost > 127 ? 127 : card->sell_cost < -128 ? -128 : card->sell_cost);
-}
-
 int state_layout_valid(const State *state) {
     return state && state->rng_count <= MAX_RNG_STREAMS && state->deck_count <= MAX_DECK &&
            state->hand_count <= MAX_HAND && state->discard_count <= MAX_DECK && state->joker_count <= MAX_JOKERS &&
@@ -3403,8 +3511,8 @@ int state_layout_valid(const State *state) {
 }
 
 int observe(const State *state, Observation *out, LegalMasks *legal) {
-    if (!state || !out || !legal) return ERR_ARGUMENT;
-    if (!state_layout_valid(state)) return ERR_INVARIANT;
+    assert(state && out && legal);
+    assert(state_layout_valid(state));
     *out = (Observation){0};
 
     uint16_t next_voucher_id = 0;
@@ -3427,16 +3535,38 @@ int observe(const State *state, Observation *out, LegalMasks *legal) {
     }
 
     out->globals = (ObservationGlobals){
-        .deck_id = state->config.deck,
         .blind_id = state->blind_id,
         .next_boss_id = state->next_boss_id,
         .next_voucher_id = next_voucher_id,
+        .pending_free_pack_id = state->pending_free_pack_id,
         .last_tarot_planet = state->last_tarot_planet,
+        .redeemed_vouchers_mask = redeemed_vouchers_mask,
+        .joker_rate = state->joker_rate,
+        .tarot_rate = state->tarot_rate,
+        .planet_rate = state->planet_rate,
+        .spectral_rate = state->spectral_rate,
+        .playing_card_rate = state->playing_card_rate,
+        .edition_rate = state->edition_rate,
+        .dollars = state->dollars,
+        .reroll_cost = state->reroll_cost,
+        .round_earnings = state->round_earnings,
+        .run_hands_played = state->run_hands_played,
+        .unused_discards = state->unused_discards,
+        .tarots_used = state->tarots_used,
+        .planet_usage_mask = state->planet_usage_mask,
+        .blind_hands_mask = state->blind_hands_mask,
+        .interest_cap = state->interest_cap,
+        .interest_amount = state->interest_amount,
+        .rental_rate = state->rental_rate,
+        .blind_reward = state->blind_reward,
+        .deck_id = state->config.deck,
         .stake = state->config.stake,
+        .win_ante = state->config.win_ante,
+        .stake_scaling = state->stake_scaling,
         .phase = state->phase,
+        .blind_on_deck = state->blind_on_deck,
         .ante = state->ante,
         .round = state->round,
-        .blind_on_deck = state->blind_on_deck,
         .blind_disabled = state->blind_disabled,
         .blind_only_hand = state->blind_only_hand,
         .blind_skipped_mask = state->blind_skipped_mask,
@@ -3449,9 +3579,27 @@ int observe(const State *state, Observation *out, LegalMasks *legal) {
         .hands_per_round = state->hands_per_round,
         .discards_per_round = state->discards_per_round,
         .base_hand_size = state->base_hand_size,
+        .hand_size = state->hand_size,
+        .joker_slots = state->joker_slots,
+        .consumable_slots = state->consumable_slots,
+        .skips = state->skips,
+        .pack_choices = state->pack_choices,
         .pack_kind = state->pack_kind,
+        .shop_return_phase = state->shop_return_phase,
+        .first_shop_buffoon = state->first_shop_buffoon,
+        .shop_joker_max = state->shop_joker_max,
+        .ancient_suit = state->ancient_suit,
+        .idol_rank = state->idol_rank,
+        .idol_suit = state->idol_suit,
+        .mail_rank = state->mail_rank,
+        .castle_suit = state->castle_suit,
+        .most_played_hand = state->most_played_hand,
+        .last_hand_type = state->last_hand_type,
         .double_tag = state->double_tag,
         .active_tag = state->active_tag,
+        .blind_tags = {state->blind_tags[0], state->blind_tags[1]},
+        .orbital_hands = {state->orbital_hands[0], state->orbital_hands[1],
+            state->orbital_hands[2]},
         .tag_hand_bonus = state->tag_hand_bonus,
         .tag_force_rarity = state->tag_force_rarity,
         .tag_force_rarity_count = state->tag_force_rarity_count,
@@ -3460,141 +3608,187 @@ int observe(const State *state, Observation *out, LegalMasks *legal) {
         .tag_voucher_pending = state->tag_voucher_pending,
         .tag_coupon_pending = state->tag_coupon_pending,
         .tag_coupon_active = state->tag_coupon_active,
+        .tag_saved_discount = state->tag_saved_discount,
         .tag_investment_pending = state->tag_investment_pending,
         .tag_d_six_pending = state->tag_d_six_pending,
         .tag_d_six_active = state->tag_d_six_active,
         .ecto_penalty = state->ecto_penalty,
         .gros_michel_extinct = state->gros_michel_extinct,
-        .hand_size = state->hand_size,
-        .joker_slots = state->joker_slots,
-        .consumable_slots = state->consumable_slots,
-        .skips = state->skips,
-        .pack_choices = state->pack_choices,
-        .unused_discards = state->unused_discards,
-        .most_played_hand = state->most_played_hand,
-        .last_hand_type = state->last_hand_type,
-        .blind_tags = {state->blind_tags[0], state->blind_tags[1]},
-        .orbital_hands = {state->orbital_hands[0], state->orbital_hands[1]},
         .hands_left = state->hands_left,
         .discards_left = state->discards_left,
         .hands_played = state->hands_played,
         .discards_used = state->discards_used,
-        .blind_hands_mask = state->blind_hands_mask,
-        .tarots_used = state->tarots_used,
-        .planet_usage_mask = state->planet_usage_mask,
-        .run_hands_played = state->run_hands_played,
-        .dollars = state->dollars,
-        .reroll_cost = state->reroll_cost,
-        .round_earnings = state->round_earnings,
-        .chips_log2 = observation_signed_log2(state->chips),
-        .blind_chips_log2 = observation_signed_log2(state->blind_chips),
-        .last_hand_score_log2 = observation_signed_log2(state->last_hand_score),
-        .chips_over_blind_log2 = observation_signed_log2(chips_over_blind),
-        .interest_cap = (uint16_t)(state->interest_cap < 0 ? 0 : state->interest_cap),
-        .interest_amount = (uint16_t)(state->interest_amount < 0 ? 0 : state->interest_amount),
-        .blind_reward = (uint16_t)(state->blind_reward < 0 ? 0 : state->blind_reward),
-        .joker_rate = (uint8_t)(state->joker_rate * 100.0f + 0.5f),
-        .tarot_rate = (uint8_t)(state->tarot_rate * 100.0f + 0.5f),
-        .planet_rate = (uint8_t)(state->planet_rate * 100.0f + 0.5f),
-        .spectral_rate = (uint8_t)(state->spectral_rate * 100.0f + 0.5f),
-        .playing_card_rate = (uint8_t)(state->playing_card_rate * 100.0f + 0.5f),
-        .edition_rate = (uint8_t)(state->edition_rate * 100.0f + 0.5f),
-        .redeemed_vouchers_mask = redeemed_vouchers_mask,
+        .score_features = {
+            observation_signed_log2(state->chips),
+            observation_signed_log2(state->blind_chips),
+            observation_signed_log2(state->last_hand_score),
+            observation_signed_log2(state->last_hand_chips),
+            observation_signed_log2(state->last_hand_mult),
+            observation_signed_log2(chips_over_blind),
+        },
     };
 
-    // DeckMatrix population
-    for (uint16_t i = 0; i < state->deck_count; ++i) {
-        const Card *c = &state->deck[i];
-        if (c->enhancement == ENHANCEMENT_STONE) {
-            out->deck_matrix.draw_enhancements[ENHANCEMENT_STONE]++;
-        } else if (c->rank >= 2 && c->rank <= 14 && c->suit < 4) {
-            DeckSlot *s = &out->deck_matrix.grid[c->rank - 2][c->suit];
-            s->draw_count++;
-            s->enhancement_mask |= (1u << c->enhancement);
-            s->modifiers_mask |= (1u << c->edition);
-            s->modifiers_mask |= (1u << (5 + c->seal));
-            if (c->flags & CARD_DEBUFFED) s->modifiers_mask |= (1u << 10);
+    out->counts = (ObservationCounts){
+        .deck_count = state->deck_count,
+        .discard_count = state->discard_count,
+        .total_playing_cards = state->deck_count + state->hand_count + state->discard_count,
+        .hand_count = state->hand_count,
+        .joker_count = state->joker_count,
+        .consumable_count = state->consumable_count,
+    };
+
+    const Card *deck_zones[3] = {state->deck, state->discard, state->hand};
+    uint16_t deck_counts[3] = {state->deck_count, state->discard_count, state->hand_count};
+    for (int zone = 0; zone < 3; ++zone) {
+        for (uint16_t i = 0; i < deck_counts[zone]; ++i) {
+            const Card *card = &deck_zones[zone][i];
+            int hidden = (card->flags & CARD_FACEDOWN) != 0;
+            if (zone == 2 && !hidden) continue;
+            uint8_t flags = card->flags & (CARD_DEBUFFED | CARD_ETERNAL | CARD_PERISHABLE |
+                CARD_RENTAL | CARD_FORCED | CARD_FACEDOWN);
+            if (hidden) flags &= (uint8_t)~CARD_FACEDOWN;
+            if (card->state[3]) flags |= PUBLIC_CARD_PLAYED_THIS_ANTE;
+            int plain = card->rank >= 2 && card->rank <= 14 && card->suit < 4 &&
+                card->enhancement == ENHANCEMENT_NONE && card->edition == EDITION_NONE &&
+                card->seal == SEAL_NONE &&
+                (flags & (uint8_t)~PUBLIC_CARD_PLAYED_THIS_ANTE) == 0 &&
+                card->perma_bonus == 0;
+            int location = zone == 1 && !hidden ? 1 : 0;
+            if (plain) {
+                PlainDeckView *entry = &out->plain_deck[card->rank - 2][card->suit];
+                if (flags & PUBLIC_CARD_PLAYED_THIS_ANTE) {
+                    if (location) entry->played_discard++;
+                    else entry->played_unseen++;
+                } else if (location) entry->discard++;
+                else entry->unseen++;
+                continue;
+            }
+            assert(out->counts.special_count < OBS_MAX_PLAYING_CARDS);
+            DeckCardView *entry = &out->specials[out->counts.special_count++];
+            entry->card.attributes = (uint16_t)(card->rank | (card->suit << 4) |
+                (card->enhancement << 6) | (card->edition << 10) | (card->seal << 13));
+            entry->card.flags = flags;
+            entry->card.perma_bonus = card->perma_bonus;
+            entry->location = (uint8_t)location;
         }
-        if (c->enhancement != ENHANCEMENT_NONE && c->enhancement < 9)
-            out->deck_matrix.draw_enhancements[c->enhancement]++;
     }
+    for (uint16_t i = 1; i < out->counts.special_count; ++i) {
+        DeckCardView value = out->specials[i];
+        uint64_t value_key = (uint64_t)value.card.attributes |
+            ((uint64_t)value.card.flags << 16) |
+            ((uint64_t)(uint16_t)value.card.perma_bonus << 24) |
+            ((uint64_t)value.location << 40);
+        uint16_t j = i;
+        while (j > 0) {
+            DeckCardView previous = out->specials[j - 1];
+            uint64_t previous_key = (uint64_t)previous.card.attributes |
+                ((uint64_t)previous.card.flags << 16) |
+                ((uint64_t)(uint16_t)previous.card.perma_bonus << 24) |
+                ((uint64_t)previous.location << 40);
+            if (previous_key <= value_key) break;
+            out->specials[j] = previous;
+            --j;
+        }
+        out->specials[j] = value;
+    }
+
+    static const float base_chips_log[HAND_COUNT] = {7.33091688f, 7.13955116f, 6.9188633f, 6.65821171f,
+        5.9307375f, 5.35755205f, 5.16992521f, 4.95419645f, 4.95419645f, 4.3923173f, 3.45943165f, 2.58496261f};
+    static const float base_mult_log[HAND_COUNT] = {4.0874629f, 3.90689063f, 3.70043969f, 3.16992497f,
+        3.0f, 2.32192802f, 2.32192802f, 2.32192802f, 2.0f, 1.58496249f, 1.58496249f, 1.0f};
+    for (uint8_t hand = 0; hand < HAND_COUNT; ++hand) {
+        uint32_t level = state->hand_levels[hand] ? state->hand_levels[hand] : 1;
+        out->poker_hands[hand] = (PokerHandStat){
+            .level = state->hand_levels[hand],
+            .visible = (uint8_t)(hand >= STRAIGHT_FLUSH || state->hand_plays[hand] != 0),
+            .total_plays = state->hand_plays[hand],
+            .round_plays = state->hand_plays_round[hand],
+            .chips_log2 = level == 1 ? base_chips_log[hand] : observation_signed_log2(
+                base_chips[hand] + (double)level_chips[hand] * (level - 1)),
+            .mult_log2 = level == 1 ? base_mult_log[hand] : observation_signed_log2(
+                base_mult[hand] + (double)level_mult[hand] * (level - 1)),
+        };
+    }
+
+    for (uint8_t i = 0; i < state->joker_count; ++i) {
+        const Card *card = &state->jokers[i];
+        out->jokers[i] = (JokerView){
+            .center_id = card->center_id,
+            .edition = card->edition,
+            .flags = card->flags,
+            .cost = card->cost,
+            .sell_cost = card->sell_cost,
+            .state = {card->state[0], card->state[1], card->state[2], card->state[3]},
+        };
+    }
+    for (uint8_t i = 0; i < state->consumable_count; ++i) {
+        const Card *card = &state->consumables[i];
+        out->consumables[i] = (ConsumableView){
+            .center_id = card->center_id,
+            .edition = card->edition,
+            .flags = card->flags,
+            .cost = card->cost,
+            .sell_cost = card->sell_cost,
+        };
+    }
+
     for (uint8_t i = 0; i < state->hand_count; ++i) {
-        const Card *c = &state->hand[i];
-        if (c->rank >= 2 && c->rank <= 14 && c->suit < 4) {
-            DeckSlot *s = &out->deck_matrix.grid[c->rank - 2][c->suit];
-            s->hand_count++;
-            s->enhancement_mask |= (1u << c->enhancement);
-            s->modifiers_mask |= (1u << c->edition);
-            s->modifiers_mask |= (1u << (5 + c->seal));
-            if (c->flags & CARD_DEBUFFED) s->modifiers_mask |= (1u << 10);
+        const Card *card = &state->hand[i];
+        uint8_t flags = card->flags & (CARD_DEBUFFED | CARD_ETERNAL | CARD_PERISHABLE |
+            CARD_RENTAL | CARD_FORCED | CARD_FACEDOWN);
+        if (card->state[3]) flags |= PUBLIC_CARD_PLAYED_THIS_ANTE;
+        PlayingCardView *entry = &out->hand[i];
+        entry->flags = flags;
+        if (!(card->flags & CARD_FACEDOWN)) {
+            entry->attributes = (uint16_t)(card->rank | (card->suit << 4) |
+                (card->enhancement << 6) | (card->edition << 10) | (card->seal << 13));
+            entry->perma_bonus = card->perma_bonus;
+        } else {
+            entry->flags &= (uint8_t)~PUBLIC_CARD_PLAYED_THIS_ANTE;
         }
     }
-    for (uint16_t i = 0; i < state->discard_count; ++i) {
-        const Card *c = &state->discard[i];
-        if (c->enhancement == ENHANCEMENT_STONE) {
-            out->deck_matrix.discard_enhancements[ENHANCEMENT_STONE]++;
-        } else if (c->rank >= 2 && c->rank <= 14 && c->suit < 4) {
-            DeckSlot *s = &out->deck_matrix.grid[c->rank - 2][c->suit];
-            s->discard_count++;
-            s->enhancement_mask |= (1u << c->enhancement);
-            s->modifiers_mask |= (1u << c->edition);
-            s->modifiers_mask |= (1u << (5 + c->seal));
-            if (c->flags & CARD_DEBUFFED) s->modifiers_mask |= (1u << 10);
+
+    int market = state->phase == PHASE_SHOP || state->phase == PHASE_PACK_OPENING;
+    if (market) {
+        out->counts.shop_count = state->shop_main_count;
+        out->counts.voucher_count = state->shop_voucher_count;
+        out->counts.booster_count = state->shop_booster_count;
+        out->counts.pack_count = state->pack_count;
+        const Card *offer_zones[2] = {state->shop_main, state->pack_cards};
+        uint8_t offer_counts[2] = {state->shop_main_count, state->pack_count};
+        OfferView *offer_outputs[2] = {out->market.shop, out->market.pack};
+        for (int zone = 0; zone < 2; ++zone) {
+            for (uint8_t i = 0; i < offer_counts[zone]; ++i) {
+                const Card *card = &offer_zones[zone][i];
+                offer_outputs[zone][i] = (OfferView){
+                    .center_id = card->center_id,
+                    .rank = card->rank,
+                    .suit = card->suit,
+                    .enhancement = card->enhancement,
+                    .edition = card->edition,
+                    .seal = card->seal,
+                    .flags = card->flags,
+                    .perma_bonus = card->perma_bonus,
+                    .cost = card->cost,
+                    .sell_cost = card->sell_cost,
+                    .state = {card->state[0], card->state[1], card->state[2], card->state[3]},
+                };
+            }
         }
-        if (c->enhancement != ENHANCEMENT_NONE && c->enhancement < 9)
-            out->deck_matrix.discard_enhancements[c->enhancement]++;
+        const Card *market_zones[2] = {state->shop_vouchers, state->shop_boosters};
+        uint8_t market_counts[2] = {state->shop_voucher_count, state->shop_booster_count};
+        MarketCardView *market_outputs[2] = {out->market.vouchers, out->market.boosters};
+        for (int zone = 0; zone < 2; ++zone) {
+            for (uint8_t i = 0; i < market_counts[zone]; ++i) {
+                const Card *card = &market_zones[zone][i];
+                market_outputs[zone][i] = (MarketCardView){
+                    .center_id = card->center_id,
+                    .cost = card->cost,
+                    .sell_cost = card->sell_cost,
+                };
+            }
+        }
     }
-    out->deck_matrix.total_deck_size = state->deck_count + state->hand_count + state->discard_count;
-
-    // Poker hands
-    for (uint8_t hand = 0; hand < HAND_COUNT; ++hand)
-        observation_poker_hand(state, hand, &out->poker_hands[hand]);
-
-    // Tokens packing (Phase-First Floors)
-    uint8_t token_idx = 0;
-
-    // 0: Hand
-    out->hand_count = state->hand_count;
-    for (uint8_t i = 0; i < state->hand_count && token_idx < MAX_OBS_TOKENS; ++i)
-        write_card_token(&out->tokens[token_idx++], &state->hand[i], ZONE_HAND, 1);
-
-    // 1: Jokers
-    out->joker_count = state->joker_count;
-    for (uint8_t i = 0; i < state->joker_count && token_idx < MAX_OBS_TOKENS; ++i)
-        write_card_token(&out->tokens[token_idx++], &state->jokers[i], ZONE_JOKER, 0);
-
-    // 2: Consumables
-    out->consumable_count = state->consumable_count;
-    for (uint8_t i = 0; i < state->consumable_count && token_idx < MAX_OBS_TOKENS; ++i)
-        write_card_token(&out->tokens[token_idx++], &state->consumables[i], ZONE_CONSUMABLE, 0);
-
-    // 3: Shop Main
-    out->shop_count = state->shop_main_count;
-    for (uint8_t i = 0; i < state->shop_main_count && token_idx < MAX_OBS_TOKENS; ++i) {
-        uint8_t set = card_set(&state->shop_main[i]);
-        int is_playing = set == SET_DEFAULT || set == SET_ENHANCED;
-        write_card_token(&out->tokens[token_idx++], &state->shop_main[i], ZONE_SHOP_MAIN, is_playing);
-    }
-
-    // 4: Shop Vouchers
-    out->voucher_count = state->shop_voucher_count;
-    for (uint8_t i = 0; i < state->shop_voucher_count && token_idx < MAX_OBS_TOKENS; ++i)
-        write_card_token(&out->tokens[token_idx++], &state->shop_vouchers[i], ZONE_SHOP_VOUCHER, 0);
-
-    // 5: Shop Boosters
-    out->booster_count = state->shop_booster_count;
-    for (uint8_t i = 0; i < state->shop_booster_count && token_idx < MAX_OBS_TOKENS; ++i)
-        write_card_token(&out->tokens[token_idx++], &state->shop_boosters[i], ZONE_SHOP_BOOSTER, 0);
-
-    // 6: Pack Cards
-    out->pack_count = state->pack_count;
-    for (uint8_t i = 0; i < state->pack_count && token_idx < MAX_OBS_TOKENS; ++i) {
-        uint8_t set = card_set(&state->pack_cards[i]);
-        int is_playing = set == SET_PLAYING || set == SET_ENHANCED;
-        write_card_token(&out->tokens[token_idx++], &state->pack_cards[i], ZONE_PACK_CARD, is_playing);
-    }
-
-    out->total_tokens = token_idx;
 
     return legal_masks(state, legal);
 }
@@ -3672,7 +3866,7 @@ static void finish_blind(State *state) {
         if (state->hands_played && state->hand[i].seal == SEAL_BLUE)
             for (uint8_t repetition = 0; repetition < repetitions; ++repetition)
                 if (state->consumable_count < state->consumable_slots)
-                    (void)add_specific_consumable(state, planet_centers[state->last_hand_type]);
+                    (void)add_specific_consumable(state, planet_center((HandType)state->last_hand_type));
     }
     if (state->tag_investment_pending && state->blind_on_deck == 2) {
         tag_eval_bonus = 25 * state->tag_investment_pending;
@@ -3682,7 +3876,8 @@ static void finish_blind(State *state) {
         state->deck[state->deck_count++] = state->discard[--state->discard_count];
     while (state->hand_count && state->deck_count < MAX_DECK) state->deck[state->deck_count++] = state->hand[--state->hand_count];
     end_round_jokers(state);
-    for (uint16_t i = 0; i < state->deck_count; ++i) state->deck[i].flags &= (uint8_t)~(CARD_DEBUFFED | CARD_FORCED);
+    for (uint16_t i = 0; i < state->deck_count; ++i)
+        state->deck[i].flags &= (uint8_t)~(CARD_DEBUFFED | CARD_FORCED | CARD_FACEDOWN);
     for (uint8_t i = 0; i < state->joker_count; ++i) state->jokers[i].flags &= (uint8_t)~CARD_DEBUFFED;
     if (state->blind_on_deck == 2) {
         if (state->config.deck == CENTER_B_ANAGLYPH) state->double_tag = 1;
@@ -3727,6 +3922,20 @@ static void finish_blind(State *state) {
     state->dollars += gold_hand_bonus;
     state->round_earnings = calculate_round_earnings(state) + tag_eval_bonus;
     state->blind_disabled = 1;
+    /* Beating a blind whose requirement is not representable (+Inf) ends the
+       run as a win: there is nothing further that arithmetic can ask for.
+       Scoring naneinf (+Inf chips) is likewise an immediate win, since an
+       infinite score clears any representable blind and matches an
+       infinite one. NOTE: both halves diverge from base Balatro, where
+       ante 39 is an impassable wall (comparisons against the non-finite
+       requirement always fail, so the run dies there). Our engine counts
+       either clear as a win for reward sake instead. This is the naneinf
+       half of the victory condition, whichever comes first versus
+       ante > win_ante at cash-out. */
+    if (!isfinite(state->blind_chips) || isinf(state->chips)) {
+        state->won = state->terminal = 1;
+        state->phase = PHASE_GAME_OVER;
+    }
 }
 
 
@@ -3870,14 +4079,16 @@ static void start_blind(State *state) {
     }
 }
 
-void draw_after_play(State *state) {
+void draw_after_play(State *state, int after_play) {
     uint8_t target = state->hand_size;
     if (!state->blind_disabled && state->blind_id == BLIND_BL_SERPENT) {
         target = state->hand_count + 3;
     }
     uint8_t first = state->hand_count;
-    while (state->hand_count < target && state->deck_count > 0 && state->hand_count < MAX_HAND)
+    while (state->hand_count < target && state->deck_count > 0 && state->hand_count < MAX_HAND) {
         state->hand[state->hand_count++] = state->deck[--state->deck_count];
+        mark_drawn_card(state, &state->hand[state->hand_count - 1], after_play);
+    }
     for (uint8_t i = first; i < state->hand_count; ++i)
         if (blind_debuffs_card(state, &state->hand[i])) state->hand[i].flags |= CARD_DEBUFFED;
     sort_hand(state, state->hand_sort_suit != 0);
@@ -3886,22 +4097,14 @@ void draw_after_play(State *state) {
 static void play_or_discard(State *state, const Action *action) {
     Card cards[MAX_SELECTION] = {0};
     int count = remove_selected(state, action, cards);
-        uint16_t discard_start = state->discard_count;
+    /* Played face-down cards are revealed before they enter the discard zone */
+    if (action->type == ACTION_PLAY_HAND)
+        for (int i = 0; i < count; ++i) cards[i].flags &= (uint8_t)~CARD_FACEDOWN;
+    uint16_t discard_start = state->discard_count;
     memcpy(&state->discard[state->discard_count], cards, sizeof(Card) * (size_t)count);
     state->discard_count += (uint16_t)count;
     if (action->type == ACTION_PLAY_HAND) {
         int first_hand = state->hands_played == 0;
-        if (first_hand && count == 1 && joker_active(state, CENTER_J_DNA) && state->hand_count < MAX_HAND &&
-            can_add_playing_cards(state, 1)) {
-            Card copy = cards[0];
-            copy.sort_id = ++state->next_sort_id;
-            copy.flags &= (uint8_t)~CARD_DEBUFFED;
-            state->hand[state->hand_count++] = copy;
-            if (blind_debuffs_card(state, &state->hand[state->hand_count - 1]))
-                state->hand[state->hand_count - 1].flags |= CARD_DEBUFFED;
-            sort_hand(state, state->hand_sort_suit != 0);
-            playing_card_added(state, 1);
-        }
         int ox_trigger = 0;
         if (!state->blind_disabled && state->blind_id == BLIND_BL_OX) {
             uint8_t mask = 0;
@@ -3913,6 +4116,17 @@ static void play_or_discard(State *state, const Action *action) {
         for (uint8_t i = 0; i < state->hand_count; ++i) state->hand[i].flags &= (uint8_t)~CARD_FORCED;
         state->hands_left--;
         score_hand(state, cards, (size_t)count, state->hand, state->hand_count, &score);
+        if (!score.hand_debuffed && first_hand && count == 1 && joker_active(state, CENTER_J_DNA) &&
+            state->hand_count < MAX_HAND && can_add_playing_cards(state, 1)) {
+            Card copy = cards[0];
+            copy.sort_id = ++state->next_sort_id;
+            copy.flags &= (uint8_t)~CARD_DEBUFFED;
+            state->hand[state->hand_count++] = copy;
+            if (blind_debuffs_card(state, &state->hand[state->hand_count - 1]))
+                state->hand[state->hand_count - 1].flags |= CARD_DEBUFFED;
+            sort_hand(state, state->hand_sort_suit != 0);
+            playing_card_added(state, 1);
+        }
         for (uint8_t j = state->joker_count; j-- > 0;) {
             Card *joker = &state->jokers[j];
             if (joker->center_id == CENTER_J_ICE_CREAM && joker->state[1]) {
@@ -3926,6 +4140,8 @@ static void play_or_discard(State *state, const Action *action) {
             }
         }
         state->last_hand_score = score.total;
+        state->last_hand_chips = score.chips;
+        state->last_hand_mult = score.mult;
         state->last_hand_type = (uint8_t)score.hand_type;
         uint8_t shattered = 0, shattered_faces = 0, has_ace = 0;
         Card destroyed[MAX_SELECTION] = {0};
@@ -3959,22 +4175,27 @@ static void play_or_discard(State *state, const Action *action) {
                 discard_index++;
             }
         }
-        if (first_hand && count == 1 && cards[0].rank == 6 && joker_active(state, CENTER_J_SIXTH_SENSE)) {
+        if (!score.hand_debuffed && first_hand && count == 1 && cards[0].rank == 6 &&
+            joker_active(state, CENTER_J_SIXTH_SENSE)) {
             (void)remove_discard_sort_id(state, cards[0].sort_id);
             (void)add_pooled_consumable(state, SET_SPECTRAL, "sixth", 0);
         }
-        if (score.hand_type == STRAIGHT_FLUSH && joker_active(state, CENTER_J_SEANCE))
+        if (!score.hand_debuffed && score.hand_type == STRAIGHT_FLUSH && joker_active(state, CENTER_J_SEANCE))
             (void)add_pooled_consumable(state, SET_SPECTRAL, "sea", 0);
-        if ((score.hand_type == STRAIGHT || score.hand_type == STRAIGHT_FLUSH) && has_ace &&
+        if (!score.hand_debuffed && (score.hand_type == STRAIGHT || score.hand_type == STRAIGHT_FLUSH) && has_ace &&
             joker_active(state, CENTER_J_SUPERPOSITION))
             (void)add_pooled_consumable(state, SET_TAROT, "sup", 0);
-        if (state->dollars <= 4 && joker_active(state, CENTER_J_VAGABOND)) (void)add_pooled_consumable(state, SET_TAROT, "vag", 0);
+        if (!score.hand_debuffed && state->dollars <= 4 && joker_active(state, CENTER_J_VAGABOND))
+            (void)add_pooled_consumable(state, SET_TAROT, "vag", 0);
         state->dollars += score.dollars;
         if (ox_trigger) state->dollars = 0;
         state->chips += state->last_hand_score;
         state->hands_played++;
         state->run_hands_played++;
-        if (state->chips - state->blind_chips >= 0.0)
+        /* Direct comparison: identical to the subtraction for finite values
+           and additionally true for +Inf chips against a +Inf requirement
+           (where the subtraction yields NaN). NaN never satisfies it. */
+        if (state->chips >= state->blind_chips)
             finish_blind(state);
         else if (state->hands_left == 0) {
             int saved = 0;
@@ -4000,8 +4221,9 @@ static void play_or_discard(State *state, const Action *action) {
         apply_discard_effects(state, cards, (uint8_t)count, first_discard, 0);
     }
     if (!state->terminal && state->phase == PHASE_SELECTING_HAND) {
-        draw_after_play(state);
+        draw_after_play(state, action->type == ACTION_PLAY_HAND);
         apply_drawn_to_hand_boss(state, action->type == ACTION_PLAY_HAND);
+
     }
 }
 
@@ -4016,10 +4238,16 @@ void default_config(Config *config) {
         .win_ante = 8,
         .fast_rng = 0,
         .progress_reward = 0.25f,
-        .blind_bonus = 0.5f,
+        .blind_bonus = 0.2f,
         .ante_bonus = 1.0f,
         .win_bonus = 10.0f,
         .loss_penalty = 0.25f,
+        .money_reward = 0.0f,
+        .ante_escalation = 0.0f,
+        .headroom_reward = 0.0f,
+        .interest_reward = 0.0f,
+        .eff_reward = 0.0f,
+        .power_reward = 0.0f,
     };
 }
 
@@ -4044,6 +4272,13 @@ static void build_starting_deck(State *state) {
 
 int init(State *state, const Config *config, uint64_t seed) {
     if (!state || !config) return ERR_ARGUMENT;
+    for (uint16_t id = 0; id < CENTER_COUNT; ++id) {
+        if (centers[id].set < SET_TAROT || centers[id].set > SET_SPECTRAL) continue;
+        const ConsumableSignature *signature = &consumable_signatures[id];
+        assert(signature->kind != CONS_NONE);
+        assert(signature->target_min <= signature->target_max);
+        if (signature->kind == CONS_PLANET) assert(signature->planet_hand < HAND_COUNT);
+    }
     char text[32];
     KeyBuilder key;
     key_begin(&key, text, sizeof(text));
@@ -4162,8 +4397,10 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
     if (!masks && !action_is_legal(state, action)) return ERR_ACTION;
     double previous_chips = state->chips;
     double previous_blind_chips = state->blind_chips;
-    uint8_t previous_ante = state->ante;
+    int32_t previous_dollars = state->dollars;
     uint8_t previous_phase = state->phase;
+    uint8_t previous_blind_on_deck = state->blind_on_deck;
+    uint8_t previous_blind_skipped_mask = state->blind_skipped_mask;
     state->actions_taken++;
 
     switch (action->type) {
@@ -4204,13 +4441,15 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
     case ACTION_SWAP_HAND_LEFT:
     case ACTION_SWAP_HAND_RIGHT: {
         uint8_t other = action->type == ACTION_SWAP_HAND_LEFT ? action->primary - 1 : action->primary + 1;
-        swap_cards(&state->hand[action->primary], &state->hand[other]);
+        Card card = state->hand[action->primary];
+        state->hand[action->primary] = state->hand[other];
+        state->hand[other] = card;
         break;
     }
     case ACTION_SWAP_JOKERS_LEFT:
     case ACTION_SWAP_JOKERS_RIGHT: {
         uint8_t other = action->type == ACTION_SWAP_JOKERS_LEFT ? action->primary - 1 : action->primary + 1;
-        swap_cards(&state->jokers[action->primary], &state->jokers[other]);
+        swap_jokers(state, action->primary, other);
         break;
     }
     case ACTION_CASH_OUT: {
@@ -4301,6 +4540,30 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
         break;
     }
 
+    // Every transition must settle an empty hand before exposing another
+    // policy decision, including consumable destruction and blind entry.
+    if (!state->terminal && state->phase == PHASE_SELECTING_HAND && !state->hand_count) {
+        draw_to_hand(state);
+        if (state->hand_count) apply_drawn_to_hand_boss(state, 0);
+        if (state->hand_count == 0) {
+            int saved = 0;
+            for (uint8_t j = 0; j < state->joker_count; ++j)
+                if (!(state->jokers[j].flags & CARD_DEBUFFED) && state->jokers[j].center_id == CENTER_J_MR_BONES &&
+                    state->chips / state->blind_chips >= 0.25) {
+                    remove_joker_at(state, j);
+                    saved = 1;
+                    break;
+                }
+            if (saved) {
+                state->blind_reward = 0;
+                finish_blind(state);
+            } else {
+                state->terminal = 1;
+                state->phase = PHASE_GAME_OVER;
+            }
+        }
+    }
+
     out->terminal = state->terminal;
     out->won = state->won;
     out->ante = state->ante;
@@ -4309,7 +4572,8 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
     if (state->config.shaped_reward) {
         out->reward = (float)shaped_transition_reward(
             state, action, previous_chips, previous_blind_chips,
-            previous_ante, previous_phase);
+            previous_phase, previous_blind_on_deck,
+            previous_blind_skipped_mask, previous_dollars);
     }
     return OK;
 }

@@ -13,56 +13,22 @@
     (POLICY_PRIMARY_OFFSET + POLICY_PRIMARY_BYTES * ACTION_TYPE_COUNT)
 #define POLICY_SELECTION_SIZE \
     (POLICY_SELECTION_OFFSET + POLICY_SELECTION_ENTRIES * POLICY_SELECTION_BYTES)
-/* Per-option card attributes for the AR selection heads: one byte per hand
-   slot, (suit << 4) | rank, written by the env from the live hand. Lets the
-   decoder condition selection scores on the set's suit/rank structure
-   (flush / straight / pair completion) instead of only the last card. */
-#define POLICY_CARD_ATTR_OFFSET POLICY_SELECTION_SIZE
-#define POLICY_CARD_ATTR_BYTES 64
-#define POLICY_CARD_ATTR_SUIT_SHIFT 4
-#define POLICY_CARD_ATTR_RANK_MASK 0x0F
+#define POLICY_ORDER_META_OFFSET POLICY_SELECTION_SIZE
+#define POLICY_ORDER_META_BYTES 4
+#define POLICY_ORDER_HAND_COUNT_OFFSET POLICY_ORDER_META_OFFSET
+#define POLICY_ORDER_JOKER_COUNT_OFFSET (POLICY_ORDER_META_OFFSET + 1)
+#define POLICY_ORDER_ENABLED_OFFSET (POLICY_ORDER_META_OFFSET + 2)
 #define POLICY_MASK_SIZE \
-    (POLICY_CARD_ATTR_OFFSET + POLICY_CARD_ATTR_BYTES)
+    (POLICY_ORDER_META_OFFSET + POLICY_ORDER_META_BYTES)
 
-/* Compact learned dependencies layered over the shared state-conditioned
-   logits. This keeps decoding cheap while making later distributions depend
-   on the sampled prefix rather than only on its legality mask. */
-#define AR_TYPE_PRIMARY_OFFSET 0
-#define AR_TYPE_PRIMARY_SIZE (ACTION_TYPE_COUNT * 64)
-#define AR_TYPE_COUNT_OFFSET \
-    (AR_TYPE_PRIMARY_OFFSET + AR_TYPE_PRIMARY_SIZE)
-#define AR_TYPE_COUNT_SIZE (ACTION_TYPE_COUNT * 6)
-#define AR_PRIMARY_COUNT_OFFSET \
-    (AR_TYPE_COUNT_OFFSET + AR_TYPE_COUNT_SIZE)
-#define AR_PRIMARY_COUNT_SIZE (64 * 6)
-#define AR_TYPE_CARD_OFFSET \
-    (AR_PRIMARY_COUNT_OFFSET + AR_PRIMARY_COUNT_SIZE)
-#define AR_TYPE_CARD_SIZE (ACTION_TYPE_COUNT * 5 * 64)
-#define AR_PRIMARY_CARD_OFFSET \
-    (AR_TYPE_CARD_OFFSET + AR_TYPE_CARD_SIZE)
-#define AR_PRIMARY_CARD_SIZE (64 * 5 * 64)
-#define AR_COUNT_CARD_OFFSET \
-    (AR_PRIMARY_CARD_OFFSET + AR_PRIMARY_CARD_SIZE)
-#define AR_COUNT_CARD_SIZE (6 * 5 * 64)
-#define AR_PREVIOUS_CARD_OFFSET \
-    (AR_COUNT_CARD_OFFSET + AR_COUNT_CARD_SIZE)
-#define AR_PREVIOUS_CARD_SIZE (64 * 4 * 64)
-/* Set-synergy tables: context = summary of the already-selected cards relative
-   to the option, per position (0..4) and option (64). 5 contexts each:
-   suit-match count 0..4 (flush), rank-match count 0..4 (pair/full-house),
-   run-length 1..5 through the option's rank (straight, ace dual). */
-#define AR_SUIT_CARD_OFFSET \
-    (AR_PREVIOUS_CARD_OFFSET + AR_PREVIOUS_CARD_SIZE)
-#define AR_SUIT_CARD_SIZE (5 * 5 * 64)
-#define AR_RANK_CARD_OFFSET \
-    (AR_SUIT_CARD_OFFSET + AR_SUIT_CARD_SIZE)
-#define AR_RANK_CARD_SIZE (5 * 5 * 64)
-#define AR_RUN_CARD_OFFSET \
-    (AR_RANK_CARD_OFFSET + AR_RANK_CARD_SIZE)
-#define AR_RUN_CARD_SIZE (5 * 5 * 64)
-#define AR_CONDITION_SIZE \
-    (AR_RUN_CARD_OFFSET + AR_RUN_CARD_SIZE)
-/* Standalone CPU eval (puffercpu.h) aliases the trainer's condition size. */
+/* Cached 32-channel entities and a 64-channel causal decision controller. */
+#define AR_EMBED_DIM 32
+#define DECODER_STATE 64
+#define DECODER_STEPS (8 + OBS_MAX_HAND + OBS_MAX_JOKERS)
+#define DECODER_CATEGORIES (ACTION_TYPE_COUNT + 6)
+#define CATEGORY_OFFSET 0
+#define ROLE_OFFSET (CATEGORY_OFFSET + DECODER_CATEGORIES * AR_EMBED_DIM)
+#define AR_CONDITION_SIZE (ROLE_OFFSET + DECODER_STEPS * AR_EMBED_DIM)
 #define BALATRO_AR_CONDITION_SIZE AR_CONDITION_SIZE
 
 #if defined(__CUDACC__) || defined(__HIPCC__)

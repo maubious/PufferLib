@@ -73,6 +73,12 @@ static void create_custom_encoder(const char* env_name, Encoder* enc) {
 }
 
 static void create_custom_decoder(const char* env_name, Decoder* dec) {
+#ifdef PUFFER_BALATRO
+    if (strcmp(env_name, "balatro") == 0) {
+        create_balatro_decoder(dec);
+        return;
+    }
+#endif
 #ifdef POLICY_MASK_SIZE
     dec->ar = true;
     return;

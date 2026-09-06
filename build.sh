@@ -166,20 +166,11 @@ else
 fi
 
 if [ "$ENV" = "balatro" ]; then
-    SIMULATRO_ROOT=${SIMULATRO_ROOT:-$HOME/simulatro}
-    SIMULATRO_BUILD=${SIMULATRO_BUILD:-$SIMULATRO_ROOT/build-release}
-    if [ ! -f "$SIMULATRO_ROOT/include/balatro.h" ]; then
-        echo "Error: SIMULATRO_ROOT must point to the Simulatro repository"
-        exit 1
-    fi
-    if [ ! -f "$SIMULATRO_BUILD/libbalatro_core.a" ]; then
-        echo "Configuring Simulatro Release library in $SIMULATRO_BUILD..."
-        cmake -S "$SIMULATRO_ROOT" -B "$SIMULATRO_BUILD" \
-            -DCMAKE_BUILD_TYPE=Release -DBALATRO_BUILD_TESTS=OFF
-        cmake --build "$SIMULATRO_BUILD" -j"$(nproc)"
-    fi
-    INCLUDES+=(-I"$SIMULATRO_ROOT/include")
-    LINK_ARCHIVES+=("$SIMULATRO_BUILD/libbalatro_core.a")
+    mkdir -p build/balatro
+    gcc -O3 -fPIC -I. -Iocean/balatro -c ocean/balatro/balatro_core.c -o build/balatro/balatro_core.o
+    ar rcs build/balatro/libbalatro_core.a build/balatro/balatro_core.o
+    INCLUDES+=(-Iocean/balatro)
+    LINK_ARCHIVES+=("$(pwd)/build/balatro/libbalatro_core.a")
 fi
 
 case "$ENV" in
@@ -388,7 +379,7 @@ if [ "$MODE" = "native" ]; then
             "$HIPIFY_DIR/pufferl.hip" \
             -x none "${LINK_ARCHIVES[@]}" \
             "$RAYLIB_A" "${EXTRA_LDFLAGS[@]}" \
-            -lrccl -lhipblas -lrocblas -lhipsolver -lhiprand \
+            -L"$ROCM_HOME/lib" -lrccl -lhipblas -lrocblas -lhipsolver -lhiprand -lrocm_smi64 \
             -lm -lpthread -lomp "${STANDALONE_LDFLAGS[@]}" \
             -o puffer
         echo "Built: ./puffer"

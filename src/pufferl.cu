@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #ifdef USE_ROCM
 #include <rocblas/rocblas.h>
+#include <rocm_smi/rocm_smi.h>
 #endif
 #ifndef USE_ROCM
 #include <cuda_profiler_api.h>
@@ -71,6 +72,13 @@ int grid_size(int N) {
 
 // Exclusive env: -DENV_HEADER=ocean/<env>/<env>.h or .cu (--gpu). Never both.
 #include ENV_HEADER
+
+#ifndef POLICY_NUM_ATNS
+#define POLICY_NUM_ATNS NUM_ATNS
+#endif
+#ifndef ACTION_STORAGE_SIZE
+#define ACTION_STORAGE_SIZE NUM_ATNS
+#endif
 
 typedef struct {
     float* data;
@@ -411,9 +419,10 @@ struct RolloutBuf {
     Prec initial_states;
     Prec actions;       // (horizon, agents, num_atns)
     Prec values;        // (horizon, agents)
-    Prec logprobs;      // ...
+    Float logprobs;     // Joint AR log-probabilities must retain FP32 precision.
     Prec rewards;
-    Prec terminals;
+    Prec rnn_resets;    // reset before processing observations[t]
+    Prec transition_dones; // done after executing actions[t]
     Prec action_mask;   // (horizon, agents, mask_size)
 };
 
@@ -428,12 +437,15 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
     bufs->values       = {.shape = {T, B}};
     bufs->logprobs     = {.shape = {T, B}};
     bufs->rewards      = {.shape = {T, B}};
-    bufs->terminals    = {.shape = {T, B}};
+    bufs->rnn_resets   = {.shape = {T, B}};
+    bufs->transition_dones = {.shape = {T, B}};
     bufs->action_mask  = {.shape = {T, B, mask_size}};
     alloc_register(alloc, &bufs->observations);
+    alloc_register(alloc, &bufs->logprobs);
     Prec* fields[] = {
-        &bufs->actions, &bufs->values, &bufs->logprobs,
-        &bufs->rewards, &bufs->terminals, &bufs->action_mask,
+        &bufs->actions, &bufs->values,
+        &bufs->rewards, &bufs->rnn_resets, &bufs->transition_dones,
+        &bufs->action_mask,
     };
     for (int i = 0; i < (int)(sizeof(fields) / sizeof(fields[0])); i++) {
         alloc_register(alloc, fields[i]);
@@ -442,7 +454,7 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
 
 // Rank-2 or rank-3 time-major tensor. F==0 means rank-2 (zero-terminated shape);
 // stride still multiplies by max(F, 1).
-Prec puf_time_view(Prec p, int start_t, int T) {
+template<class Tensor> Tensor puf_time_view(Tensor p, int start_t, int T) {
     long B = p.shape[1];
     long F = p.shape[2];
     long stride_f = F > 1 ? F : 1;
@@ -469,7 +481,8 @@ RolloutBuf rollout_time_view(RolloutBuf* base, int start_t, int T) {
     view.values       = puf_time_view(base->values,       start_t, T);
     view.logprobs     = puf_time_view(base->logprobs,     start_t, T);
     view.rewards      = puf_time_view(base->rewards,      start_t, T);
-    view.terminals    = puf_time_view(base->terminals,    start_t, T);
+    view.rnn_resets   = puf_time_view(base->rnn_resets,   start_t, T);
+    view.transition_dones = puf_time_view(base->transition_dones, start_t, T);
     view.action_mask  = puf_time_view(base->action_mask,  start_t, T);
     return view;
 }
@@ -527,6 +540,7 @@ typedef struct {
     Prec param;
     Float master_weights;
     Prec* buffer_states;         // [num_buffers]
+    Prec* bootstrap_states;      // [num_buffers]
     Activations* buf_acts;  // [num_buffers]
 } Policy;
 
@@ -601,6 +615,8 @@ typedef struct PuffeRL {
     RolloutBuf rollouts;
     RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
     EnvBuf env;
+    PolicyObs bootstrap_observations; // (1, total_agents, obs_size)
+    Prec bootstrap_values;           // (slots, total_agents)
     TrainGraph train_buf;
     Prec train_state;  // (L, A, H) carry in env order; graph reads with dest_off
     cudaGraphExec_t* rollout_graphs;  // CPU: [slots][horizon][num_buffers]
@@ -609,7 +625,7 @@ typedef struct PuffeRL {
     cudaStream_t* streams;  // per-buffer raw CUDA streams
     cudaStream_t default_stream;  // main-thread stream (captured once at init)
     cudaStream_t train_stream;    // dedicated learner stream (always non-default)
-    int* act_sizes;        // device ACT_SIZES (NUM_ATNS ints)
+    int* act_sizes;        // device ACT_SIZES (POLICY_NUM_ATNS ints)
     float* losses;         // device loss accumulator (NUM_LOSSES)
     PPOBufs ppo_bufs; // Pre-allocated buffers for ppo_loss_fwd_bwd
     Prec actor_param;      // async flat actor params
@@ -659,14 +675,16 @@ __global__ void rng_init(curandStatePhilox4_32_10_t* states, uint64_t seed, int 
 }
 
 // Action logits and value share one row: [logits..., value]. logstd empty ⇒ discrete.
-// Discrete: always-cache logsumexp + inverse-CDF; mask always present (all-ones if env has none).
+// Discrete: core heads use cached logsumexp + inverse-CDF; Balatro order
+// heads use an exact Plackett-Luce exponential race. Mask always present.
 // Continuous: ignores mask.
+#ifndef BALATRO_POINTER_DECODER
 __global__ void sample_logits(
         Prec dec_out,              // (B, logits_dim + 1)
         Prec logstd,           // (1, od) continuous only; .data null if discrete
-        int* act_sizes,            // (NUM_ATNS,)
+        int* act_sizes,            // (POLICY_NUM_ATNS,)
         precision_t* actions,                 // (B, num_atns)
-        precision_t* logprobs,                // (B,)
+        float* logprobs,                // (B,)
         precision_t* value_out,               // (B,)
         curandStatePhilox4_32_10_t* rng_states,
         precision_t* action_mask,             // (B, A_total); always allocated
@@ -676,7 +694,7 @@ __global__ void sample_logits(
         const precision_t* condition) {
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
-    int num_atns = NUM_ATNS;
+    int num_atns = POLICY_NUM_ATNS;
     precision_t* logits = dec_out.data;
     bool is_continuous = logstd.data != NULL && numel(logstd.shape) > 0;
     precision_t* logstd_data = logstd.data;
@@ -702,204 +720,99 @@ __global__ void sample_logits(
             float lp, ent;
             ppo_continuous_head(mean, log_std, to_float(stored_p), &lp, &ent);
             total_log_prob += lp;
-            actions[idx * num_atns + h] = stored_p;
+            actions[idx * ACTION_STORAGE_SIZE + h] = stored_p;
         }
     } else {
         int logits_offset = 0;
         int mask_base = idx * mask_stride;
-        int action_base = idx * num_atns;
-#ifdef POLICY_MASK_SIZE
-        // AR sampling: heads 0-2 (type/primary/count) populate the context
-        // incrementally, then card heads 3-7 sample against the hoisted prefix.
-        // Equivalent to the generic loop below, but each option's legality and
-        // condition index is O(1) instead of re-deriving the whole prefix.
-        {
-            int A0 = act_sizes[0];
-            float cache0[PPO_MAX_HEAD_A];
-            float max_l = -INFINITY, sum = 0.0f;
-            actions[action_base] = from_float(0.0f);
-            for (int a = 0; a < A0; ++a) {
-                float l = mask_byte(action_mask, mask_base, a) != 0
-                    ? to_float(logits[logits_base + logits_offset + a]) : -1e4f;
-                cache0[a] = l;
-                if (l > max_l) { sum *= __expf(max_l - l); max_l = l; }
-                sum += __expf(l - max_l);
-            }
-            float logsumexp = max_l + __logf(sum);
-            float rand_val = curand_uniform(&state);
-            float cumsum = 0.0f;
-            int sampled = A0 - 1;
-            for (int a = 0; a < A0; ++a) {
-                if (mask_byte(action_mask, mask_base, a) == 0) continue;
-                cumsum += expf(cache0[a] - logsumexp);
-                if (rand_val < cumsum) { sampled = a; break; }
-            }
-            if (rand_val >= cumsum) {
-                for (int a = A0 - 1; a >= 0; --a) {
-                    if (mask_byte(action_mask, mask_base, a) != 0) {
-                        sampled = a;
-                        break;
-                    }
-                }
-            }
-            actions[action_base] = from_float((float)sampled);
-            total_log_prob += cache0[sampled] - logsumexp;
-            logits_offset += A0;
-        }
-
-        ARContext ar = ar_ctx_init(action_mask, mask_base, actions, action_base);
-        {
-            int A1 = act_sizes[1];
-            actions[action_base + 1] = from_float(0.0f);
-            if (ar_head_active(&ar, 1)) {
-                float cache1[PPO_MAX_HEAD_A];
-                float max_l = -INFINITY, sum = 0.0f;
-                for (int a = 0; a < A1; ++a) {
-                    float l = ar_option_legal(&ar, action_mask, mask_base, 1, a)
-                        ? to_float(logits[logits_base + logits_offset + a]) +
-                            ar_cond_bias(&ar, condition, 1, a)
-                        : -1e4f;
-                    cache1[a] = l;
-                    if (l > max_l) { sum *= __expf(max_l - l); max_l = l; }
-                    sum += __expf(l - max_l);
-                }
-                float logsumexp = max_l + __logf(sum);
-                float rand_val = curand_uniform(&state);
-                float cumsum = 0.0f;
-                int sampled = A1 - 1;
-                for (int a = 0; a < A1; ++a) {
-                    if (!ar_option_legal(&ar, action_mask, mask_base, 1, a)) continue;
-                    cumsum += expf(cache1[a] - logsumexp);
-                    if (rand_val < cumsum) { sampled = a; break; }
-                }
-                if (rand_val >= cumsum) {
-                    for (int a = A1 - 1; a >= 0; --a) {
-                        if (ar_option_legal(&ar, action_mask, mask_base, 1, a)) {
-                            sampled = a;
-                            break;
-                        }
-                    }
-                }
-                actions[action_base + 1] = from_float((float)sampled);
-                total_log_prob += cache1[sampled] - logsumexp;
-            }
-            logits_offset += A1;
-        }
-
-        ar = ar_ctx_init(action_mask, mask_base, actions, action_base);
-        {
-            int A2 = act_sizes[2];
-            actions[action_base + 2] = from_float(0.0f);
-            if (ar_head_active(&ar, 2)) {
-                float cache2[PPO_MAX_HEAD_A];
-                float max_l = -INFINITY, sum = 0.0f;
-                for (int a = 0; a < A2; ++a) {
-                    float l = ar_option_legal(&ar, action_mask, mask_base, 2, a)
-                        ? to_float(logits[logits_base + logits_offset + a]) +
-                            ar_cond_bias(&ar, condition, 2, a)
-                        : -1e4f;
-                    cache2[a] = l;
-                    if (l > max_l) { sum *= __expf(max_l - l); max_l = l; }
-                    sum += __expf(l - max_l);
-                }
-                float logsumexp = max_l + __logf(sum);
-                float rand_val = curand_uniform(&state);
-                float cumsum = 0.0f;
-                int sampled = A2 - 1;
-                for (int a = 0; a < A2; ++a) {
-                    if (!ar_option_legal(&ar, action_mask, mask_base, 2, a)) continue;
-                    cumsum += expf(cache2[a] - logsumexp);
-                    if (rand_val < cumsum) { sampled = a; break; }
-                }
-                if (rand_val >= cumsum) {
-                    for (int a = A2 - 1; a >= 0; --a) {
-                        if (ar_option_legal(&ar, action_mask, mask_base, 2, a)) {
-                            sampled = a;
-                            break;
-                        }
-                    }
-                }
-                actions[action_base + 2] = from_float((float)sampled);
-                total_log_prob += cache2[sampled] - logsumexp;
-            }
-            logits_offset += A2;
-        }
-        ar_ctx_set_count(&ar, actions, action_base);
-
-        for (int h = 3; h < num_atns; h++) {
-            int A = act_sizes[h];
-            actions[action_base + h] = from_float(0.0f);
-            if (!ar_head_active(&ar, h)) {
-                logits_offset += A;
-                continue;
-            }
-            float cache[PPO_MAX_HEAD_A];
-            float max_l = -INFINITY, sum = 0.0f;
-            for (int a = 0; a < A; ++a) {
-                float l = ar_option_legal(&ar, action_mask, mask_base, h, a)
-                    ? to_float(logits[logits_base + logits_offset + a]) +
-                        ar_cond_bias(&ar, condition, h, a)
-                    : -1e4f;
-                cache[a] = l;
-                if (l > max_l) { sum *= __expf(max_l - l); max_l = l; }
-                sum += __expf(l - max_l);
-            }
-            float logsumexp = max_l + __logf(sum);
-            float rand_val = curand_uniform(&state);
-            float cumsum = 0.0f;
-            int sampled = A - 1;
-            for (int a = 0; a < A; ++a) {
-                if (!ar_option_legal(&ar, action_mask, mask_base, h, a)) continue;
-                cumsum += expf(cache[a] - logsumexp);
-                if (rand_val < cumsum) { sampled = a; break; }
-            }
-            if (rand_val >= cumsum) {
-                for (int a = A - 1; a >= 0; --a) {
-                    if (ar_option_legal(&ar, action_mask, mask_base, h, a)) {
-                        sampled = a;
-                        break;
-                    }
-                }
-            }
-            actions[action_base + h] = from_float((float)sampled);
-            total_log_prob += cache[sampled] - logsumexp;
-            logits_offset += A;
-            ar_ctx_advance(&ar, actions, action_base);
-        }
-#else
-        for (int h = 0; h < num_atns; h++) {
-            int A = act_sizes[h];
-            float cache[PPO_MAX_HEAD_A];
-            float logsumexp = ppo_discrete_logsumexp(
-                logits, logits_base, logits_offset, A, action_mask, mask_base, cache);
-
-            float rand_val = curand_uniform(&state);
-            float cumsum = 0.0f;
-            int sampled = A - 1;
-            for (int a = 0; a < A; a++) {
-                cumsum += expf(cache[a] - logsumexp);
-                if (rand_val < cumsum) {
-                    sampled = a;
-                    break;
-                }
-            }
-            actions[action_base + h] = from_float((float)sampled);
-            // consumed-head gating: only heads the sampled verb uses count
-            int verb = (int)to_float(actions[action_base]);
-            int used = (head_consume == NULL || h == 0)
-                ? 1 : (int)head_consume[verb * hc_stride + h];
-            if (used) {
-                total_log_prob += cache[sampled] - logsumexp;
-            }
-            logits_offset += A;
-        }
-#endif
+        int action_base = idx * ACTION_STORAGE_SIZE;
     }
 
-    logprobs[idx] = from_float(total_log_prob);
+    logprobs[idx] = total_log_prob;
     value_out[idx] = logits[logits_base + fused_cols - 1];
     rng_states[idx] = state;
 }
+
+#endif
+
+#ifdef BALATRO_POINTER_DECODER
+__global__ void sample_logits_balatro(
+        Prec state, precision_t* actions, float* logprobs,
+        precision_t* values, curandStatePhilox4_32_10_t* rng_states,
+        const precision_t* mask, const precision_t* parameters,
+        const precision_t* entities, const int* counts) {
+    constexpr int waves = BLOCK_SIZE / 32;
+    __shared__ Decision decisions[waves];
+    int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    int row = blockIdx.x * waves + warp;
+    if (row >= state.shape[0]) return;
+    precision_t* action = actions + row * ACTION_STORAGE_SIZE;
+    for (int step = lane; step < DECODER_STEPS; step += 32) action[step] = from_float(0.0f);
+    __syncwarp();
+    curandStatePhilox4_32_10_t rng;
+    if (lane == 0) rng = rng_states[row];
+    float logp = 0.0f;
+    Decision* s = decisions + warp;
+    int hand_count = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_HAND_COUNT_OFFSET);
+    int joker_count = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_JOKER_COUNT_OFFSET);
+    bool ordering = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_ENABLED_OFFSET);
+    float sum = 0.0f, last = 0.0f;
+    int length = 0;
+    float global = to_float(state.data[row * DECODER_COLUMNS + lane]);
+    float gate = 2.0f / (1.0f + __expf(-2.0f * to_float(state.data[row * DECODER_COLUMNS + 32 + lane])));
+    for (int step = 0; step < DECODER_STEPS; ++step) {
+        if (step == 8 && !ordering) break;
+        if (step >= 8 && step < 72 && step >= 8 + hand_count) step = 72;
+        if (step >= 72 + joker_count) break;
+        float role = to_float(parameters[ROLE_OFFSET + step * 32 + lane]);
+        float u = global + role + last + (length ? sum * rsqrtf((float)length) : 0.0f);
+        s->query[lane] = u / (1.0f + __expf(-u)) * gate;
+        s->preactivation[lane] = u;
+        __syncwarp();
+        decision_forward(s, entities + (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH,
+            action, mask + row * POLICY_MASK_SIZE, counts + row * BA_POOL_SECTIONS, step, s->query);
+        if (s->active) {
+            int selected = __ffsll((unsigned long long)s->legal) - 1;
+            if (__popcll(s->legal) > 1) {
+                float threshold = lane == 0 ? curand_uniform(&rng) : 0.0f;
+                threshold = __shfl_sync(PUF_WARP_MASK, threshold, 0, 32);
+                bool first_legal = lane < s->options && (s->legal & (UINT64_C(1) << lane));
+                bool second_legal = lane + 32 < s->options && (s->legal & (UINT64_C(1) << (lane + 32)));
+                float first = first_legal ? __expf(s->scores[lane] - s->logsum) : 0.0f;
+                float second = second_legal ? __expf(s->scores[lane + 32] - s->logsum) : 0.0f;
+                #pragma unroll
+                for (int offset = 1; offset < 32; offset <<= 1) {
+                    float a = __shfl_up_sync(PUF_WARP_MASK, first, offset, 32);
+                    float b = __shfl_up_sync(PUF_WARP_MASK, second, offset, 32);
+                    if (lane >= offset) { first += a; second += b; }
+                }
+                second += __shfl_sync(PUF_WARP_MASK, first, 31, 32);
+                uint32_t first_hits = (uint32_t)__ballot_sync(PUF_WARP_MASK, first_legal && threshold <= first);
+                uint32_t second_hits = (uint32_t)__ballot_sync(PUF_WARP_MASK, second_legal && threshold <= second);
+                selected = first_hits ? __ffs(first_hits) - 1 : second_hits ? 31 + __ffs(second_hits)
+                    : 63 - __clzll((unsigned long long)s->legal);
+                if (lane == 0) logp += s->scores[selected] - s->logsum;
+            }
+            if (lane == 0) action[step] = from_float((float)selected);
+        }
+        __syncwarp();
+        if (s->active || step >= 8) {
+            int start = step >= 8 ? token_start(counts + row * BA_POOL_SECTIONS,
+                step < 72 ? ZONE_HAND : ZONE_JOKER) : s->start;
+            int entity = start + (int)to_float(action[step]);
+            last = to_float(entities[((int64_t)row * ENTITY_COUNT + entity) * ENTITY_WIDTH + lane]);
+            sum += role * last;
+            ++length;
+        }
+        __syncwarp();
+    }
+    if (lane == 0) {
+        logprobs[row] = logp;
+        values[row] = state.data[row * DECODER_COLUMNS + DECODER_STATE];
+        rng_states[row] = rng;
+    }
+}
+#endif
 
 // Index into (L, agents, H): element-parallel over L*count*H.
 // state_row is agent index within the state tensor's agent dim.
@@ -959,7 +872,7 @@ __global__ void zero_term_state(Prec state, Float terminals,
 
 // Select time t, then agents [start, start+count). Rank-2 has F==0 (zero-term shape);
 // stride uses max(F, 1). Out shape {count, F} keeps ndim 1 when F==0.
-Prec puf_slice(Prec p, int t, int start, int count) {
+template<class Tensor> Tensor puf_slice(Tensor p, int t, int start, int count) {
     long B = p.shape[1];
     long F = p.shape[2];
     long stride_f = F > 1 ? F : 1;
@@ -985,6 +898,29 @@ PolicyObs puf_obs_slice(PolicyObs p, int t, int start, int count) {
 }
 #endif
 
+static void copy_observation(PolicyObs dst, ObsTensor src, int n,
+        cudaStream_t stream) {
+#ifdef PUFFER_PACKED_OBS
+    static_assert(sizeof(obs_t) == 1,
+        "packed observations require byte env output");
+    cudaMemcpyAsync(dst.data, src.data, n, cudaMemcpyDeviceToDevice, stream);
+#else
+    if (sizeof(obs_t) == sizeof(precision_t)) {
+        cudaMemcpyAsync(dst.data, src.data,
+            n * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
+    } else {
+        cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst.data, src.data, n);
+    }
+#endif
+}
+
+__global__ void store_values(Prec dst, Prec dec, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst.data[idx] = dec.data[idx * dec.shape[1] + dec.shape[1] - 1];
+    }
+}
+
 static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         cudaStream_t stream) {
     Hypers* hypers = &pufferl->hypers;
@@ -1001,7 +937,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
     int start = buf * block_size;
     int* layout = vec->policy_layout;
 
-    // Copy observations, rewards, terminals from GPU env buffers to rollout buffer
+    // Copy the current observation and reset flag before selecting the action.
     ObsTensor* obs_env = &env->obs;
     PolicyObs obs_dst = puf_obs_slice(rollouts.observations, t, start, block_size);
     int n = block_size * obs_env->shape[1];
@@ -1010,32 +946,19 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
     // step); fold it into this horizon's slice 0. Steps t > 0 were already
     // written straight into the slice by cpu_upload.
     if (t == 0) {
-        cudaMemcpyAsync(obs_dst.data,
-            obs_env->data + (long)start * obs_env->shape[1],
-            n, cudaMemcpyDeviceToDevice, stream);
+        copy_observation(obs_dst, {
+            .data = obs_env->data + (long)start * obs_env->shape[1],
+            .shape = {block_size, obs_env->shape[1]}}, n, stream);
     }
-    #elif defined(PUFFER_PACKED_OBS)
-    static_assert(sizeof(obs_t) == 1, "packed observations require byte env output");
-    cudaMemcpyAsync(obs_dst.data,
-        obs_env->data + (long)start * obs_env->shape[1],
-        n, cudaMemcpyDeviceToDevice, stream);
 #else
-    // Env obs → rollout: D2D if same type, else cast (float/uchar → precision_t).
-    if (sizeof(obs_t) == sizeof(precision_t)) {
-        cudaMemcpyAsync(obs_dst.data,
-            obs_env->data + (long)start * obs_env->shape[1],
-            n * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
-    } else {
-        cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-            obs_dst.data, obs_env->data + (long)start * obs_env->shape[1], n);
-    }
+    copy_observation(obs_dst, {
+        .data = obs_env->data + (long)start * obs_env->shape[1],
+        .shape = {block_size, obs_env->shape[1]}}, n, stream);
 #endif
 
-    Prec rew_dst = puf_slice(rollouts.rewards, t, start, block_size);
-    Prec term_dst = puf_slice(rollouts.terminals, t, start, block_size);
-    cast_rew_term<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
-        rew_dst.data, env->rewards.data + start,
-        term_dst.data, env->terminals.data + start, block_size);
+    Prec reset_dst = puf_slice(rollouts.rnn_resets, t, start, block_size);
+    cast<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
+        reset_dst.data, env->terminals.data + start, block_size);
     
     // Mask always allocated (env-written or synthetic all-ones). Continuous ignores it in sample.
     int mask_size = rollouts.action_mask.shape[2];
@@ -1064,7 +987,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         int sub = start + off;
         PolicyObs obs_b = puf_obs_slice(rollouts.observations, t, sub, n);
         Prec act_b  = puf_slice(rollouts.actions,      t, sub, n);
-        Prec lp_b   = puf_slice(rollouts.logprobs,     t, sub, n);
+        Float lp_b  = puf_slice(rollouts.logprobs,     t, sub, n);
         Prec val_b  = puf_slice(rollouts.values,       t, sub, n);
         Prec mask_b = puf_slice(rollouts.action_mask,  t, sub, n);
 
@@ -1091,17 +1014,100 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         // Offset RNG by off so policies don't collide on per-buffer rng slots.
         int hc_stride_s = 0;
         const signed char* hc_dev_s = get_head_consume_dev(&hc_stride_s);
+#ifdef BALATRO_POINTER_DECODER
+        BalatroDecoderActivations* decoder =
+            (BalatroDecoderActivations*)acts->decoder;
+        constexpr int sample_warps = BLOCK_SIZE / 32;
+        int sample_blocks = (n + sample_warps - 1) / sample_warps;
+        sample_logits_balatro<<<sample_blocks, BLOCK_SIZE, 0, stream>>>(
+            dec, act_b.data, lp_b.data, val_b.data,
+            pufferl->rng_states[buf] + off, mask_b.data,
+            dw->condition.data, decoder->entities.data,
+            decoder->enc->counts.data);
+#else
         sample_logits<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
             dec, p_logstd, pufferl->act_sizes,
             act_b.data, lp_b.data, val_b.data,
             pufferl->rng_states[buf] + off,
             mask_b.data, mask_stride, hc_dev_s, hc_stride_s,
             dw->ar ? dw->condition.data : NULL);
+#endif
 
         cast<<<grid_size(numel(act_b.shape)), BLOCK_SIZE, 0, stream>>>(
                 env->actions.data + (long)sub * act_cols,
                 act_b.data, numel(act_b.shape));
     }
+}
+
+static void bootstrap(PuffeRL* pufferl, int buf, cudaStream_t stream) {
+    Hypers* hypers = &pufferl->hypers;
+    int graph_slot = hypers->async ? pufferl->write_slot : 0;
+    int block_size = hypers->total_agents / hypers->num_buffers;
+    int start = buf * block_size;
+    int obs_size = pufferl->env.obs.shape[1];
+    int n = block_size * obs_size;
+
+    PolicyObs observation = puf_obs_slice(
+        pufferl->bootstrap_observations, 0, start, block_size);
+    copy_observation(observation, {
+        .data = pufferl->env.obs.data + (long)start * obs_size,
+        .shape = {block_size, obs_size}}, n, stream);
+
+    Prec values = {
+        .data = pufferl->bootstrap_values.data
+            + (long)graph_slot * hypers->total_agents,
+        .shape = {hypers->total_agents},
+    };
+    int* layout = pufferl->vec->policy_layout;
+    for (int b = 0; b < pufferl->num_policies; b++) {
+        int off = layout[b];
+        int count = layout[b + 1] - off;
+        if (count == 0) {
+            continue;
+        }
+
+        Policy* pol = &pufferl->policies[b];
+        Weights* w = (!pol->frozen && hypers->async)
+            ? &pufferl->actor_weights : &pol->weights;
+        Activations* acts = &pol->buf_acts[buf];
+        Prec* state = &pol->buffer_states[buf];
+        Prec* state_copy = &pol->bootstrap_states[buf];
+        int sub = start + off;
+        cudaMemcpyAsync(state_copy->data, state->data,
+            numel(state->shape) * sizeof(precision_t),
+            cudaMemcpyDeviceToDevice, stream);
+        zero_term_state<<<grid_size((int)state->shape[0] * count
+                * (int)state->shape[2]), BLOCK_SIZE, 0, stream>>>(
+            *state_copy, pufferl->env.terminals, 0, sub, count);
+
+        PolicyObs obs_b = puf_obs_slice(
+            pufferl->bootstrap_observations, 0, sub, count);
+        Prec value_b = {
+            .data = values.data + sub,
+            .shape = {count},
+        };
+        Prec dec = arch_forward(&pol->arch, *w, *acts, obs_b, *state_copy,
+            stream);
+        store_values<<<grid_size(count), BLOCK_SIZE, 0, stream>>>(
+            value_b, dec, count);
+    }
+}
+
+static void store_transition(PuffeRL* pufferl, int t, int start, int count,
+        cudaStream_t stream) {
+    assert(t < pufferl->hypers.horizon);
+    RolloutBuf rollouts = pufferl->rollouts;
+    if (pufferl->hypers.async) {
+        rollouts = rollout_time_view(&pufferl->rollouts,
+            pufferl->write_slot * pufferl->hypers.horizon,
+            pufferl->hypers.horizon);
+    }
+    Prec reward = puf_slice(rollouts.rewards, t, start, count);
+    Prec transition_done = puf_slice(
+        rollouts.transition_dones, t, start, count);
+    cast_rew_term<<<grid_size(count), BLOCK_SIZE, 0, stream>>>(
+        reward.data, pufferl->env.rewards.data + start,
+        transition_done.data, pufferl->env.terminals.data + start, count);
 }
 
 void pufferl_forward(PuffeRL* pufferl, int buf, int t, cudaStream_t stream) {
@@ -1258,7 +1264,7 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     size_t obs_bytes = total_agents * OBS_SIZE * sizeof(obs_t);
     size_t mask_bytes = total_agents * vec->mask_size * sizeof(unsigned char);
     cudaHostAlloc((void**)&vec->observations, obs_bytes, cudaHostAllocPortable);
-    cudaHostAlloc((void**)&vec->actions, total_agents * NUM_ATNS * sizeof(float),
+    cudaHostAlloc((void**)&vec->actions, total_agents * ACTION_STORAGE_SIZE * sizeof(float),
         cudaHostAllocPortable);
     cudaHostAlloc((void**)&vec->rewards, total_agents * sizeof(float),
         cudaHostAllocPortable);
@@ -1312,7 +1318,7 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
                 int phys = cursors[policy]++;
                 Agent* a = &eptr->agents[s];
                 a->observations = vec->observations + (size_t)phys * OBS_SIZE;
-                a->actions = vec->actions + (size_t)phys * NUM_ATNS;
+                a->actions = vec->actions + (size_t)phys * ACTION_STORAGE_SIZE;
                 a->rewards = vec->rewards + phys;
                 a->terminals = vec->terminals + phys;
                 a->action_mask = vec->action_mask + (size_t)phys * vec->mask_size;
@@ -1363,6 +1369,9 @@ static void cpu_upload(PuffeRL* p, int t, int start, int n, cudaStream_t stream)
         n * sizeof(float), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(e->terminals.data + start, v->terminals + start,
         n * sizeof(float), cudaMemcpyHostToDevice, stream);
+    if (t < p->hypers.horizon) {
+        store_transition(p, t, start, n, stream);
+    }
     cudaMemcpyAsync(e->action_mask.data + (size_t)start * mask,
         v->action_mask + (size_t)start * mask,
         n * mask * sizeof(unsigned char), cudaMemcpyHostToDevice, stream);
@@ -1431,16 +1440,18 @@ static void* vec_thread_main(void* arg) {
             pufferl_forward(pufferl, buf, t, stream);
             cudaEventRecord(ev[MODEL_END], stream);
             cudaMemcpyAsync(
-                &vec->actions[agent_start * NUM_ATNS],
-                &pufferl->env.actions.data[agent_start * NUM_ATNS],
-                apb * NUM_ATNS * sizeof(float),
+                &vec->actions[agent_start * ACTION_STORAGE_SIZE],
+                &pufferl->env.actions.data[agent_start * ACTION_STORAGE_SIZE],
+                apb * ACTION_STORAGE_SIZE * sizeof(float),
                 cudaMemcpyDeviceToHost, stream);
             cudaEventRecord(ev[COPY_END], stream);
             // Wait only for this stream's work (forward + action copy), not
             // the whole device. On ROCm a stream sync can serialize against
             // unrelated queues (the other buffer's rollout, the train stream),
             // which turns every per-t wait into a full pipeline drain.
-            cudaEventSynchronize(ev[COPY_END]);
+            cudaError_t status = cudaEventSynchronize(ev[COPY_END]);
+            if (status != cudaSuccess) fprintf(stderr, "Rollout action copy failed: %s\n", cudaGetErrorString(status));
+            assert(status == cudaSuccess);
             cudaEventElapsedTime(&ms, ev[MODEL_START], ev[MODEL_END]);
             my_accum[PROF_MODEL] += ms;
             cudaEventElapsedTime(&ms, ev[MODEL_END], ev[COPY_END]);
@@ -1465,6 +1476,7 @@ static void* vec_thread_main(void* arg) {
             cudaEventRecord(ev[H2D_END], stream);
             h2d_pending = 1;
         }
+        bootstrap(pufferl, buf, stream);
         cudaStreamSynchronize(stream);
         if (h2d_pending) {
             cudaEventElapsedTime(&ms, ev[H2D_START], ev[H2D_END]);
@@ -1534,8 +1546,10 @@ static void rollout_start(PuffeRL* p) {
             pufferl_forward_step(p, 0, t, stream);
             cudaEventRecord(ev[base + MODEL_END], stream);
             puf_step(p->vec->envs);
+            store_transition(p, t, 0, p->hypers.total_agents, stream);
             cudaEventRecord(ev[base + ENV_END], stream);
         }
+        bootstrap(p, 0, stream);
         if (first) {
             cudaGraph_t graph;
             assert(cudaStreamEndCapture(stream, &graph) == cudaSuccess
@@ -1714,47 +1728,56 @@ __global__ void transpose_102(precision_t* dst, const precision_t* src,
     dst[b * A * C + a * C + c] = src[idx];
 }
 
+__global__ void transpose_scalars_fused(
+        float* dst_lp, const float* src_lp,
+        precision_t* dst_rew, const precision_t* src_rew,
+        precision_t* dst_rst, const precision_t* src_rst,
+        precision_t* dst_don, const precision_t* src_don,
+        precision_t* dst_val, const precision_t* src_val,
+        int A, int B) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = A * B;
+    if (idx >= total) return;
+    int a = idx / B;
+    int b = idx % B;
+    int dst_idx = b * A + a;
+    dst_lp[dst_idx] = src_lp[idx];
+    float r = to_float(src_rew[idx]);
+    dst_rew[dst_idx] = from_float(fminf(fmaxf(r, -100.0f), 100.0f));
+    dst_rst[dst_idx] = src_rst[idx];
+    dst_don[dst_idx] = src_don[idx];
+    dst_val[dst_idx] = src_val[idx];
+}
+
 __global__ void transpose_102_bytes(unsigned char* dst,
         const unsigned char* src, int A, int B, int C) {
-    // 2D grid (blockIdx.x = a, blockIdx.y = b): one block streams one
-    // (a, b) row as 8-byte words when C is divisible by 8 (packed obs is
-    // 8120 bytes). No per-element div/mod and full-width coalescing on both
-    // sides. Byte-scalar fallback keeps non-multiple C correct.
-    if ((C & 7) == 0) {
-        int a = blockIdx.x;
-        int b = blockIdx.y;
-        int C8 = C >> 3;
-        const unsigned long long* s =
-            (const unsigned long long*)(src + ((long)a * B + b) * C);
-        unsigned long long* d =
-            (unsigned long long*)(dst + ((long)b * A + a) * C);
-        for (int c8 = threadIdx.x; c8 < C8; c8 += blockDim.x) d[c8] = s[c8];
-        return;
+    int a = blockIdx.x;
+    int b = blockIdx.y;
+    if (a >= A || b >= B) return;
+    const unsigned char* s = src + ((long)a * B + b) * C;
+    unsigned char* d = dst + ((long)b * A + a) * C;
+    int C4 = C >> 2;
+    for (int i = threadIdx.x; i < C4; i += blockDim.x) {
+        uint32_t val;
+        memcpy(&val, s + i * 4, sizeof(val));
+        memcpy(d + i * 4, &val, sizeof(val));
     }
-    long idx = ((long)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x
-        + threadIdx.x;
-    long total = (long)A * B * C;
-    for (; idx < total; idx += (long)gridDim.x * gridDim.y * blockDim.x) {
-        int a = (int)(idx / (B * C));
-        int rem = (int)(idx % (B * C));
-        int b = rem / C;
-        int c = rem % C;
-        dst[b * A * C + a * C + c] = src[idx];
+    int rem = C4 << 2;
+    for (int i = rem + threadIdx.x; i < C; i += blockDim.x) {
+        d[i] = s[i];
     }
 }
 
-// Transpose (A, B, C) → (B, A, C) for float32 rows (actions).
-__global__ void transpose_102(float* dst, const float* src, int A, int B, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = A * B * C;
-    if (idx >= total) {
-        return;
+template <typename T>
+__global__ void transpose_102_2d(T* dst, const T* src, int A, int B, int C) {
+    int a = blockIdx.x;
+    int b = blockIdx.y;
+    if (a >= A || b >= B) return;
+    const T* s = src + ((long)a * B + b) * C;
+    T* d = dst + ((long)b * A + a) * C;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        d[i] = s[i];
     }
-    int a = idx / (B * C);
-    int rem = idx % (B * C);
-    int b = rem / C;
-    int c = rem % C;
-    dst[b * A * C + a * C + c] = src[idx];
 }
 
 // Cosine decay base → min over t in [0, T). Double for t/T (float loses
@@ -1793,20 +1816,14 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
 #endif
     transpose_102<<<grid_size(T * B * num_atns), BLOCK_SIZE, 0, stream>>>(
         rollouts->actions.data, src.actions.data, T, B, num_atns);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->logprobs.data, src.logprobs.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->rewards.data, src.rewards.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->terminals.data, src.terminals.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->values.data, src.values.data, T, B, 1);
-    transpose_102<<<grid_size(T * B * mask_c), BLOCK_SIZE, 0, stream>>>(
+    transpose_scalars_fused<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
+        rollouts->logprobs.data, src.logprobs.data,
+        rollouts->rewards.data, src.rewards.data,
+        rollouts->rnn_resets.data, src.rnn_resets.data,
+        rollouts->transition_dones.data, src.transition_dones.data,
+        rollouts->values.data, src.values.data, T, B);
+    transpose_102_2d<<<dim3(T, B), BLOCK_SIZE, 0, stream>>>(
         rollouts->action_mask.data, src.action_mask.data, T, B, mask_c);
-
-    clamp_precision_kernel<<<grid_size(
-        numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
-        rollouts->rewards.data, -1.0f, 1.0f, numel(rollouts->rewards.shape));
 
     if (hypers->reset_every_horizon || src.initial_states.data == NULL) {
         cudaMemsetAsync(pufferl->train_state.data, 0,
@@ -1835,27 +1852,45 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         graph.mb_obs = slice_rows(rollouts->observations, dest_off, Nmb);
         graph.mb_actions = slice_rows(rollouts->actions, dest_off, Nmb);
         graph.mb_logprobs = slice_rows(rollouts->logprobs, dest_off, Nmb);
-        graph.mb_terminals = slice_rows(rollouts->terminals, dest_off, Nmb);
+        graph.mb_rnn_resets = slice_rows(rollouts->rnn_resets, dest_off, Nmb);
+        graph.mb_transition_dones = slice_rows(
+            rollouts->transition_dones, dest_off, Nmb);
         graph.mb_rewards = slice_rows(rollouts->rewards, dest_off, Nmb);
         graph.mb_values = slice_rows(rollouts->values, dest_off, Nmb);
+        Prec bootstrap_values = {
+            .data = pufferl->bootstrap_values.data
+                + (long)slot * B,
+            .shape = {B},
+        };
+        graph.mb_bootstrap_values = slice_rows(
+            bootstrap_values, dest_off, Nmb);
         graph.mb_action_mask = slice_rows(rollouts->action_mask, dest_off, Nmb);
         graph.mb_state = pufferl->train_state;
         DecoderWeights* dw_train = (DecoderWeights*)primary->weights.decoder;
         DecoderActivations* da_train =
             (DecoderActivations*)pufferl->train_activs.decoder;
+#ifdef BALATRO_POINTER_DECODER
+        BalatroDecoderActivations* decoder_train =
+            (BalatroDecoderActivations*)pufferl->train_activs.decoder;
+#endif
         Prec p_logstd = {};
         if (dw_train->continuous) {
             p_logstd = dw_train->logstd;
         }
+#ifndef BALATRO_POINTER_DECODER
+        cudaMemsetAsync(pufferl->ppo_bufs.grad_logits.data, 0,
+            numel(pufferl->ppo_bufs.grad_logits.shape) * sizeof(float), stream);
+#endif
         Prec dec = arch_forward_train(&primary->arch, primary->weights,
             pufferl->train_activs, graph.mb_obs, graph.mb_state,
-            graph.mb_terminals, dest_off, graph, p_logstd,
+            graph.mb_rnn_resets, dest_off, graph, p_logstd,
             dw_train->condition, pufferl->act_sizes,
             pufferl->ppo_bufs.grad_logits.data,
             pufferl->ppo_bufs.grad_values.data, stream);
         puff_advantage<<<adv_grid, ADV_THREADS, 0, stream>>>(
             graph.mb_gae_v.data, graph.mb_rewards.data,
-            graph.mb_terminals.data,
+            graph.mb_transition_dones.data,
+            graph.mb_bootstrap_values.data,
             hypers->vtrace ? graph.mb_imp.data : NULL,
             graph.mb_advantages.data, graph.mb_gae_v.data,
             hypers->gamma, hypers->gae_lambda,
@@ -1868,7 +1903,15 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             pufferl->ppo_bufs.ent_coef,
             pufferl->ppo_bufs, pufferl->is_continuous,
             dw_train->condition, da_train->condition_accum,
-            da_train->condition_scratch, da_train->cond_accum_parts, stream);
+            da_train->condition_scratch, da_train->cond_accum_parts,
+#ifdef BALATRO_POINTER_DECODER
+            decoder_train->entities, decoder_train->enc->counts,
+            decoder_train->entity_gradient, decoder_train->decisions, decoder_train->coefficients,
+            decoder_train->evaluations,
+#else
+            Prec(), Int(), Float(), Float(), Float(), Float(),
+#endif
+            stream);
 
         Float grad_logits = pufferl->ppo_bufs.grad_logits;
         Float grad_logstd = pufferl->is_continuous
@@ -1883,12 +1926,8 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
                 pufferl->nccl_comm, stream);
         }
         normuon_step(&pufferl->normuon, primary->master_weights,
-            pufferl->grad, hypers->max_grad_norm, stream);
-        if (USE_BF16) {
-            int n = numel(primary->param.shape);
-            cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-                primary->param.data, primary->master_weights.data, n);
-        }
+            pufferl->grad, hypers->max_grad_norm, stream,
+            USE_BF16 ? primary->param.data : NULL);
     }
     cudaEventRecord(ev[TE_FE], stream);
 }
@@ -1896,6 +1935,9 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     Hypers* hypers = &pufferl->hypers;
     RolloutBuf src = src_arg ? *src_arg : pufferl->rollouts;
     cudaStream_t train_stream = pufferl->train_stream;
+#ifdef USE_ROCM
+    double train_start = wall_clock();
+#endif
 
 
     int batch_size = hypers->total_agents * hypers->horizon;
@@ -1967,12 +2009,21 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     cudaStreamSynchronize(train_stream);
 
     if (total_minibatches > 0 && !first) {
+#ifdef USE_ROCM
+        // ROCm does not update elapsed events recorded inside a replayed
+        // training graph reliably. The stream sync above makes this wall
+        // duration include the complete learner step, so report it as model
+        // time instead of displaying a false zero.
+        pufferl->profile.accum[PROF_TRAIN_MODEL] +=
+            (wall_clock() - train_start) * 1000.0f;
+#else
         float ms;
         cudaEvent_t* ev = pufferl->profile.events[slot];
         cudaEventElapsedTime(&ms, ev[TE_S], ev[TE_E]);
         pufferl->profile.accum[PROF_TRAIN_MISC] += ms;
         cudaEventElapsedTime(&ms, ev[TE_MS], ev[TE_FE]);
         pufferl->profile.accum[PROF_TRAIN_MODEL] += ms;
+#endif
     }
     pufferl->epoch += 1;
 }
@@ -2076,8 +2127,9 @@ void puf_load_weights_into(Float dst, Prec params,
     assert(fp && "failed to open weights for reading");
     char* buf = (char*)malloc(nbytes);
     size_t nread = fread(buf, 1, nbytes, fp);
+    assert((int64_t)nread == nbytes && fgetc(fp) == EOF
+        && "checkpoint size does not match the policy architecture");
     fclose(fp);
-    assert((int64_t)nread == nbytes && "failed to read weights");
     cudaMemcpy(dst.data, buf, nbytes, cudaMemcpyHostToDevice);
     free(buf);
     if (USE_BF16) {
@@ -2170,6 +2222,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaSetDevice(hypers.gpu_id);
     cublas_init_handle();
 #ifdef USE_ROCM
+    assert(rsmi_init(0) == RSMI_STATUS_SUCCESS);
     rocblas_init_handle();
 #endif
 
@@ -2205,7 +2258,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         && "GPU env backend does not support selfplay or multi-policy (match)");
 
     // Discrete action layout. Continuous dims are size 1. Mask width is act_n.
-    int num_action_heads = NUM_ATNS;
+    int num_action_heads = POLICY_NUM_ATNS;
     int act_sizes[] = ACT_SIZES;
     int act_n = 0;
     int n_cont = 0;
@@ -2224,16 +2277,17 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     pufferl->is_continuous = is_continuous;
     vec->num_policies = num_policies;
     vec->policy_layout = (int*)calloc(1, (vec->num_policies + 1) * sizeof(int));
+#ifdef POLICY_MASK_SIZE
+    vec->mask_size = POLICY_MASK_SIZE;
+#else
     int mask_size = dict_get(&vec_kwargs, "action_mask_size");
     vec->mask_size = mask_size > 0 ? mask_size : act_n;
-#ifdef POLICY_MASK_SIZE
-    assert(vec->mask_size == POLICY_MASK_SIZE);
 #endif
 
     // Device env IO (EnvBuf).
     pufferl->env = {
         .obs =         {.shape = {total_agents, OBS_SIZE}},
-        .actions =     {.shape = {total_agents, NUM_ATNS}},
+        .actions =     {.shape = {total_agents, ACTION_STORAGE_SIZE}},
         .rewards =     {.shape = {total_agents}},
         .terminals =   {.shape = {total_agents}},
         .action_mask = {.shape = {total_agents, vec->mask_size}},
@@ -2241,25 +2295,20 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     EnvBuf* env = &pufferl->env;
     size_t mask_bytes = total_agents * vec->mask_size * sizeof(unsigned char);
     cudaMalloc((void**)&env->obs.data, total_agents * OBS_SIZE * sizeof(obs_t));
-    cudaMalloc((void**)&env->actions.data, total_agents * NUM_ATNS * sizeof(float));
+    cudaMalloc((void**)&env->actions.data,
+        total_agents * ACTION_STORAGE_SIZE * sizeof(float));
     cudaMalloc((void**)&env->rewards.data, total_agents * sizeof(float));
     cudaMalloc((void**)&env->terminals.data, total_agents * sizeof(float));
     cudaMalloc((void**)&env->action_mask.data, mask_bytes);
     cudaMemset(env->obs.data, 0, total_agents * OBS_SIZE * sizeof(obs_t));
-    cudaMemset(env->actions.data, 0, total_agents * NUM_ATNS * sizeof(float));
+    cudaMemset(env->actions.data, 0,
+        total_agents * ACTION_STORAGE_SIZE * sizeof(float));
     cudaMemset(env->rewards.data, 0, total_agents * sizeof(float));
     cudaMemset(env->terminals.data, 0, total_agents * sizeof(float));
     cudaMemset(env->action_mask.data, 1, mask_bytes);
 
     env_setup(pufferl, vec, &vec_kwargs, env_kwargs);
     pufferl->vec = vec;
-
-#ifdef PUFFER_BALATRO
-    // Max-pooled dominant-entity features in the balatro encoder
-    // (env.max_pool; 0 = sums only). Must be set before any forward.
-    DictItem* max_pool = dict_find(env_kwargs, "max_pool");
-    ba_set_use_max_pool(max_pool ? (max_pool->value != 0.0) : 0);
-#endif
 
     // Best-trajectory state curriculum. Gated on config (num_start_states>0
     // plus a nonzero fresh/CL share) and env support (PUFFER_CURRICULUM).
@@ -2370,11 +2419,14 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         pol->buf_acts = (Activations*)calloc(
             1, num_buffers * sizeof(Activations));
         pol->buffer_states = (Prec*)calloc(1, num_buffers * sizeof(Prec));
+        pol->bootstrap_states = (Prec*)calloc(1, num_buffers * sizeof(Prec));
         for (int i = 0; i < num_buffers; i++) {
             pol->buf_acts[i] = arch_reg_rollout(
                 &pol->arch, pol->weights, aalloc, slice);
             pol->buffer_states[i] = {.shape = {L, slice, h}};
             alloc_register(aalloc, &pol->buffer_states[i]);
+            pol->bootstrap_states[i] = {.shape = {L, slice, h}};
+            alloc_register(aalloc, &pol->bootstrap_states[i]);
         }
     }
 
@@ -2392,8 +2444,14 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     pufferl->async_num_slots = async_slots;
     int rollout_horizon = async_slots * horizon;
     register_rollout_buffers(&pufferl->rollouts,
-        acts, rollout_horizon, total_agents, input_size, num_action_heads,
+        acts, rollout_horizon, total_agents, input_size, ACTION_STORAGE_SIZE,
         vec->mask_size);
+    pufferl->bootstrap_observations = {
+        .shape = {1, total_agents, input_size}};
+    alloc_register(acts, &pufferl->bootstrap_observations);
+    pufferl->bootstrap_values = {
+        .shape = {async_slots, total_agents}};
+    alloc_register(acts, &pufferl->bootstrap_values);
     // Carry path: per-slot initial RNN states. reset_every_horizon zeros train_state.
     if (!hypers.reset_every_horizon) {
         int slots = hypers.async ? 2 : 1;
@@ -2403,7 +2461,8 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     }
     register_train_buffers(pufferl->train_buf, acts, minibatch_segments, horizon);
     register_rollout_buffers(&pufferl->train_rollouts,
-        acts, total_agents, horizon, input_size, num_action_heads, vec->mask_size);
+        acts, total_agents, horizon, input_size, ACTION_STORAGE_SIZE,
+        vec->mask_size);
     register_ppo_buffers(pufferl->ppo_bufs, acts, minibatch_segments,
         hypers.horizon, decoder_output_size, is_continuous);
     pufferl->train_state = {.shape = {num_layers, total_agents, hidden_size}};
@@ -2534,6 +2593,8 @@ void close_pufferl(PuffeRL* p) {
     }
 #ifndef USE_ROCM
     nvmlShutdown();
+#else
+    assert(rsmi_shut_down() == RSMI_STATUS_SUCCESS);
 #endif
     env_close(p->vec);
     cudaDeviceSynchronize();
@@ -2812,10 +2873,10 @@ void log_util(PuffeRL* p, Dict* out) {
     nvmlDeviceGetUtilizationRates(p->nvml_device, &util);
     dict_set(out, "util/gpu_percent", (double)util.gpu);
 #else
-    (void)p;
-    // ROCm SMI is deliberately optional: it is not consistently available
-    // alongside ROCm-enabled PyTorch installs.
-    dict_set(out, "util/gpu_percent", 0.0);
+    uint32_t busy_percent = 0;
+    assert(rsmi_dev_busy_percent_get((uint32_t)p->hypers.gpu_id,
+        &busy_percent) == RSMI_STATUS_SUCCESS);
+    dict_set(out, "util/gpu_percent", (double)busy_percent);
 #endif
 
     size_t cuda_free;
@@ -2994,6 +3055,39 @@ typedef struct {
     char key[64];
 } SweepParam;
 
+typedef struct {
+    SweepSpace *space;
+    int agents_idx, buffers_idx, horizon_idx, minibatch_idx, gpus_idx, steps_idx;
+    long agents, buffers, horizon, minibatch, gpus, steps;
+} SweepValidity;
+
+static int sweep_valid(const float *sample, void *data) {
+    SweepValidity *ctx = (SweepValidity *)data;
+    long agents = ctx->agents_idx >= 0
+        ? (long)space_unnormalize(&ctx->space->spaces[ctx->agents_idx],
+            sample[ctx->agents_idx]) : ctx->agents;
+    long buffers = ctx->buffers_idx >= 0
+        ? (long)space_unnormalize(&ctx->space->spaces[ctx->buffers_idx],
+            sample[ctx->buffers_idx]) : ctx->buffers;
+    long horizon = ctx->horizon_idx >= 0
+        ? (long)space_unnormalize(&ctx->space->spaces[ctx->horizon_idx],
+            sample[ctx->horizon_idx]) : ctx->horizon;
+    long minibatch = ctx->minibatch_idx >= 0
+        ? (long)space_unnormalize(&ctx->space->spaces[ctx->minibatch_idx],
+            sample[ctx->minibatch_idx]) : ctx->minibatch;
+    long gpus = ctx->gpus_idx >= 0
+        ? (long)space_unnormalize(&ctx->space->spaces[ctx->gpus_idx],
+            sample[ctx->gpus_idx]) : ctx->gpus;
+    long steps = ctx->steps_idx >= 0
+        ? (long)space_unnormalize(&ctx->space->spaces[ctx->steps_idx],
+            sample[ctx->steps_idx]) : ctx->steps;
+    long batch = agents * horizon;
+    return agents > 0 && buffers > 0 && agents % buffers == 0
+        && horizon > 0 && horizon % ADV_VEC_WIDTH == 0
+        && minibatch > 0 && minibatch % horizon == 0
+        && minibatch <= batch && gpus >= 1 && steps >= batch * gpus;
+}
+
 extern char** environ;
 
 typedef struct {
@@ -3090,12 +3184,50 @@ void run_sweep(Ini* ini, const char* exe_path) {
     }
     space->num = n_params;
 
+    SweepValidity validity = {
+        .space = space,
+        .agents_idx = -1,
+        .buffers_idx = -1,
+        .horizon_idx = -1,
+        .minibatch_idx = -1,
+        .gpus_idx = -1,
+        .steps_idx = -1,
+        .agents = (long)puf_ini_get(ini, "vec", "total_agents"),
+        .buffers = (long)puf_ini_get(ini, "vec", "num_buffers"),
+        .horizon = (long)puf_ini_get(ini, "train", "horizon"),
+        .minibatch = (long)puf_ini_get(ini, "train", "minibatch_size"),
+        .gpus = (long)puf_ini_get(ini, "train", "gpus"),
+        .steps = (long)puf_ini_get(ini, "train", "total_timesteps"),
+    };
+    for (int i = 0; i < n_params; i++) {
+        if (strcmp(params[i].section, "vec") == 0
+                && strcmp(params[i].key, "total_agents") == 0) {
+            validity.agents_idx = i;
+        } else if (strcmp(params[i].section, "vec") == 0
+                && strcmp(params[i].key, "num_buffers") == 0) {
+            validity.buffers_idx = i;
+        } else if (strcmp(params[i].section, "train") == 0
+                && strcmp(params[i].key, "horizon") == 0) {
+            validity.horizon_idx = i;
+        } else if (strcmp(params[i].section, "train") == 0
+                && strcmp(params[i].key, "minibatch_size") == 0) {
+            validity.minibatch_idx = i;
+        } else if (strcmp(params[i].section, "train") == 0
+                && strcmp(params[i].key, "gpus") == 0) {
+            validity.gpus_idx = i;
+        } else if (strcmp(params[i].section, "train") == 0
+                && strcmp(params[i].key, "total_timesteps") == 0) {
+            validity.steps_idx = i;
+        }
+    }
+
     int max_runs = puf_ini_get(ini, "sweep", "max_runs");
     int downsample = puf_ini_get(ini, "sweep", "downsample");
     int prune_pareto = puf_ini_get(ini, "sweep", "prune_pareto");
     const char* metric_dist = puf_ini_get_str(ini, "sweep", "metric_distribution");
-    assert((strcmp(metric_dist, "linear") == 0 || strcmp(metric_dist, "logit") == 0)
-        && "sweep.metric_distribution must be linear or logit");
+    assert((strcmp(metric_dist, "linear") == 0 || strcmp(metric_dist, "logit") == 0
+            || strcmp(metric_dist, "quantile") == 0)
+        && "sweep.metric_distribution must be linear, logit, or quantile");
     int use_logit = strcmp(metric_dist, "logit") == 0;
     float max_cost = puf_ini_get(ini, "sweep", "max_suggestion_cost");
     float early_stop_quantile = puf_ini_get(ini, "sweep", "early_stop_quantile");
@@ -3137,6 +3269,9 @@ void run_sweep(Ini* ini, const char* exe_path) {
         .success_cap = success_cap,
         .failure_cap = 1024,
         .top_k = 5,
+        .select_k = (int)puf_ini_get(ini, "sweep", "select_k"),
+        .valid = sweep_valid,
+        .valid_data = &validity,
         .rng_seed = (unsigned long long)puf_ini_get(ini, "sweep", "rng_seed"),
     });
 
@@ -3180,6 +3315,8 @@ void run_sweep(Ini* ini, const char* exe_path) {
 
             for (int p = 0; p < space->num; p++) {
                 float val = space_unnormalize(&space->spaces[p], samples[p]);
+                samples[p] = space_normalize(&space->spaces[p], val);
+                job.sample[p] = samples[p];
                 char buf[64];
                 snprintf(buf, sizeof(buf), "%.9g", val);
                 char key[256];
@@ -3187,29 +3324,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
                     params[p].section, params[p].key);
                 puf_ini_put(ini, key, buf);
             }
-            int agents = puf_ini_get(ini, "vec", "total_agents");
-            int buffers = puf_ini_get(ini, "vec", "num_buffers");
-            int horizon = puf_ini_get(ini, "train", "horizon");
-            int minibatch = puf_ini_get(ini, "train", "minibatch_size");
-            int gpus = puf_ini_get(ini, "train", "gpus");
-            long timesteps = (long)puf_ini_get(ini, "train", "total_timesteps");
-            long batch = (long)agents * horizon;
-            int valid = agents > 0 && buffers > 0 && agents % buffers == 0
-                && horizon > 0 && horizon % ADV_VEC_WIDTH == 0
-                && minibatch > 0 && minibatch % horizon == 0
-                && (long)minibatch <= batch && gpus >= 1
-                && timesteps >= batch * gpus;
-            if (!valid) {
-                fprintf(stderr,
-                    "sweep run=%d rejected: agents=%d buffers=%d horizon=%d"
-                    " minibatch=%d timesteps=%ld gpus=%d\n",
-                    job.run, agents, buffers, horizon, minibatch, timesteps, gpus);
-                protein_sweep_observe(
-                    protein, job.sample, NAN, max_cost, 1);
-                assert(++failed_workers <= 1000
-                    && "too many invalid sweep configurations");
-                continue;
-            }
+            assert(sweep_valid(job.sample, &validity));
             snprintf(job.run_id, sizeof(job.run_id), "sweep_%ld_%04d",
                 (long)(1000.0 * wall_clock()), job.run);
             puf_ini_put(ini, "base.run_id", job.run_id);
@@ -3310,39 +3425,53 @@ void run_sweep(Ini* ini, const char* exe_path) {
             if (space->cost_idx >= 0) {
                 Space* budget = &space->spaces[space->cost_idx];
                 float steps = job->result.step_points[pi];
-                if (steps < budget->min || steps > budget->max) {
-                    if (pi + 1 < job->result.points) {
-                        continue;
-                    }
-                    // Completed runs stop on batch boundaries and can land just
-                    // outside the requested boundary. Retain the terminal result.
-                    steps = fmaxf(budget->min, fminf(budget->max, steps));
-                }
                 observed[space->cost_idx] = space_normalize(budget, steps);
             }
             protein_sweep_observe(protein, observed,
                 job->result.scores[pi], job->result.costs[pi], 0);
         }
+        char acquisition_path[4096];
+        snprintf(acquisition_path, sizeof(acquisition_path), "%s/%s/%s.ini",
+            puf_ini_get_str(ini, "base", "log_dir"),
+            puf_ini_get_str(ini, "base", "env_name"), job->run_id);
+        FILE* acquisition = fopen(acquisition_path, "a");
+        assert(acquisition && "failed to append sweep acquisition log");
+        fprintf(acquisition, "\n[acquisition]\n");
+        fprintf(acquisition, "is_random = %d\n", job->info.is_random);
+        fprintf(acquisition, "actual_score = %.9g\n", job->result.score);
+        fprintf(acquisition, "actual_cost = %.9g\n", job->result.cost);
+        fprintf(acquisition, "steps = %.9g\n", job->result.steps);
         if (job->info.n_candidates > 0) {
-            printf("sweep run=%d score=%.4f pred_score=%.4f pred_std=%.4f "
-                   "score_err=%+.4f cost=%.2f pred_cost=%.2f "
-                   "cost_ratio=%.3f steps=%.0f\n",
+            float score_error = job->result.score - job->info.predicted_score;
+            float cost_ratio = job->result.cost / job->info.predicted_cost;
+            fprintf(acquisition, "predicted_score = %.9g\n", job->info.predicted_score);
+            fprintf(acquisition, "predicted_cost = %.9g\n", job->info.predicted_cost);
+            fprintf(acquisition, "score_error = %.9g\n", score_error);
+            fprintf(acquisition, "rating = %.9g\n", job->info.rating);
+            fprintf(acquisition, "cost_ratio = %.9g\n", cost_ratio);
+            fprintf(acquisition, "score_loss = %.9g\n", job->info.score_loss);
+            fprintf(acquisition, "cost_loss = %.9g\n", job->info.cost_loss);
+            fprintf(acquisition, "pareto_size = %d\n", job->info.n_pareto);
+            fprintf(acquisition, "gp_observations = %d\n", job->info.n_gp_obs);
+            fprintf(acquisition, "candidates = %d\n", job->info.n_candidates);
+
+            printf("sweep run=%d score=%.4f pred_score=%.4f score_err=%+.4f "
+                   "cost=%.2f pred_cost=%.2f cost_ratio=%.3f steps=%.0f rating=%.6g\n",
                 job->run, job->result.score, job->info.predicted_score,
-                job->info.predicted_std,
-                job->result.score - job->info.predicted_score,
-                job->result.cost, job->info.predicted_cost,
-                job->result.cost / job->info.predicted_cost, job->result.steps);
+                score_error, job->result.cost, job->info.predicted_cost,
+                cost_ratio, job->result.steps, job->info.rating);
         } else {
             printf("sweep run=%d score=%.4f cost=%.2f steps=%.0f\n",
                 job->run, job->result.score, job->result.cost, job->result.steps);
         }
+        fclose(acquisition);
         completed++;
     }
 }
 
 // board!=NULL: merge env/* into train last_log (uptime + util/* stay frozen).
 static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
-        long eval_episodes, Dict* board, int epoch) {
+        long eval_episodes, const char* metric_key, Dict* board, int epoch) {
     int render = mode == EVAL_RENDER;
     int match = mode == EVAL_MATCH;
     EvalResult result = {0};
@@ -3386,8 +3515,10 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
         if (verbose) {
             puf_dashboard_print(ini, p, show, board ? epoch : 0);
         }
-        result.score = match ? dict_get(&el, "env/policy_0_score")
-            : dict_get(&el, "env/score");
+        const char* result_key = match ? "env/policy_0_score" : metric_key;
+        DictItem* metric = dict_find(&el, result_key);
+        assert(metric && "evaluation did not emit the requested metric");
+        result.score = (float)metric->value;
         if (match) {
             result.draw = dict_get(&el, "env/draw_rate");
         }
@@ -3401,7 +3532,10 @@ static PuffeRL* eval_make(Ini* ini, TrainContext* ctx, int mode) {
     int render = mode == EVAL_RENDER;
     int match = mode == EVAL_MATCH;
     long eval_agents = puf_ini_get(ini, "base", "eval_agents");
-    if (!render && eval_agents != -1) {
+    if (render) {
+        puf_ini_put(ini, "vec.total_agents", "1");
+        puf_ini_put(ini, "vec.num_buffers", "1");
+    } else if (eval_agents != -1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "%ld", eval_agents);
         puf_ini_put(ini, "vec.total_agents", buf);
@@ -3448,7 +3582,7 @@ EvalResult run_eval(Ini* ini, TrainContext* ctx, int mode, int verbose) {
     long n = puf_ini_get(ini, "base", "eval_episodes");
     assert((mode == EVAL_RENDER || n > 0) && "eval requires positive base.eval_episodes");
     PuffeRL* p = eval_make(ini, ctx, mode);
-    EvalResult r = eval_loop(ini, p, mode, verbose, n, NULL, 0);
+    EvalResult r = eval_loop(ini, p, mode, verbose, n, "env/score", NULL, 0);
     close_pufferl(p);
     return r;
 }
@@ -3483,6 +3617,9 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     PuffeRL* pufferl = create_pufferl(ini, ctx);
+    char model_path[4096];
+    const char* model = puf_checkpoint_path_key(ini, "load_model_path", model_path, sizeof(model_path));
+    if (model) pufferl_load_policy(pufferl, 0, model);
     Selfplay selfplay = {0};
     if (use_selfplay) {
         char initial_checkpoint[4096];
@@ -3704,7 +3841,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     long eval_episodes = puf_ini_get(ini, "base", "eval_episodes");
     if (ctx->artifact_owner && !pool_eval && eval_episodes > 0) {
         EvalResult r = eval_loop(ini, pufferl, EVAL_SCORE, 1, eval_episodes,
-            &last_log, (int)pufferl->epoch);
+            target_key, &last_log, (int)pufferl->epoch);
         result.score = result.scores[result.points - 1] = r.score;
     }
     close_pufferl(pufferl);
@@ -3719,7 +3856,8 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             }
             puf_ini_put(ini, "base.load_enemy_model_path", selfplay.pool[i]);
             PuffeRL* ep = eval_make(ini, ctx, EVAL_MATCH);
-            EvalResult r = eval_loop(ini, ep, EVAL_MATCH, 0, pool_games, NULL, 0);
+            EvalResult r = eval_loop(ini, ep, EVAL_MATCH, 0, pool_games,
+                "env/policy_0_score", NULL, 0);
             close_pufferl(ep);
             sum += r.score;
             n_opp++;
@@ -3870,11 +4008,14 @@ int main(int argc, char** argv) {
     } else if (strcmp(mode, "sweep") == 0) {
         run_sweep(&ini, argv[0]);
     } else if (strcmp(mode, "eval") == 0) {
-        run_eval(&ini, &ctx, EVAL_SCORE, 1);
+        long render = puf_ini_get(&ini, "base", "render");
+        run_eval(&ini, &ctx, render ? EVAL_RENDER : EVAL_SCORE, 1);
+    } else if (strcmp(mode, "render") == 0) {
+        run_eval(&ini, &ctx, EVAL_RENDER, 1);
     } else if (strcmp(mode, "match") == 0) {
         run_eval(&ini, &ctx, EVAL_MATCH, 1);
     } else {
-        assert(0 && "unknown mode (train|eval|match|sweep)");
+        assert(0 && "unknown mode (train|eval|match|sweep|render)");
     }
 
     puf_ini_free(&ini);

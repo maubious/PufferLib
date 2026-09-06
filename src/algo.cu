@@ -2,9 +2,19 @@
 #ifndef AR_CONDITION_SIZE
 #define AR_CONDITION_SIZE 0
 #endif
+#ifndef POLICY_NUM_ATNS
+#define POLICY_NUM_ATNS NUM_ATNS
+#endif
+#ifndef ACTION_STORAGE_SIZE
+#define ACTION_STORAGE_SIZE NUM_ATNS
+#endif
 // Row-striped condition-gradient staging: atomics spread across this many
 // copies of the condition tensor to cut per-address contention, then summed.
+#ifdef BALATRO_POINTER_DECODER
+constexpr int COND_STRIPE_COUNT = 1024;
+#else
 constexpr int COND_STRIPE_COUNT = 8;
+#endif
 // Writing custom nets in 4.0+ requires a fair bit of code because you are
 // responsible for defining your own activation and gradient buffers.
 // You usually only ever need a custom Encoder.
@@ -23,7 +33,7 @@ typedef Prec (*decoder_backward_fn)(void* weights, void* activations,
 typedef Prec (*network_forward_fn)(void* weights, Prec x,
     Prec state, void* activations, cudaStream_t stream);
 typedef Prec (*network_forward_train_fn)(void* weights, Prec x,
-    Prec state, Prec terminals, void* activations, int agent_off,
+    Prec state, Prec rnn_resets, void* activations, int agent_off,
     cudaStream_t stream);
 typedef Prec (*network_backward_fn)(void* weights,
     Prec grad, void* activations, cudaStream_t stream);
@@ -129,6 +139,29 @@ void rocblas_init_handle() {
 }
 #endif
 
+// Strided row-major GEMM: C = alpha * op_a(A) @ op_b(B) + beta * C
+static void cublasGemmExStrided(cublasHandle_t handle,
+        cublasOperation_t op_a, cublasOperation_t op_b,
+        int M, int N, int K, int lda, int ldb, int ldc,
+        void* A, void* B, void* C,
+        cudaStream_t stream, float alpha = 1.0f, float beta = 0.0f) {
+    static thread_local cudaStream_t s_last_cublas_stream = (cudaStream_t)-1;
+    static thread_local cublasHandle_t s_last_cublas_handle = (cublasHandle_t)-1;
+    if (handle != s_last_cublas_handle || stream != s_last_cublas_stream) {
+        assert(cublasSetStream(handle, stream) == CUBLAS_STATUS_SUCCESS);
+        s_last_cublas_handle = handle;
+        s_last_cublas_stream = stream;
+    }
+    cublasStatus_t st = cublasGemmEx(handle, op_b, op_a, N, M, K, &alpha,
+        B, CUBLAS_PRECISION, ldb, A, CUBLAS_PRECISION, lda, &beta,
+        C, CUBLAS_PRECISION, ldc, CUBLAS_COMPUTE, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "GEMM failed: %d (%d x %d x %d, ops %d %d, ld %d %d %d)\n",
+            (int)st, M, N, K, (int)op_a, (int)op_b, lda, ldb, ldc);
+        abort();
+    }
+}
+
 // Dense row-major GEMM: C = alpha * op_a(A) @ op_b(B) + beta * C
 static void cublasGemmExDense(cublasHandle_t handle,
         cublasOperation_t op_a, cublasOperation_t op_b,
@@ -136,15 +169,9 @@ static void cublasGemmExDense(cublasHandle_t handle,
         cudaStream_t stream, float alpha = 1.0f, float beta = 0.0f) {
     int lda = (op_a == CUBLAS_OP_N) ? K : M;
     int ldb = (op_b == CUBLAS_OP_N) ? N : K;
-    assert(cublasSetStream(handle, stream) == CUBLAS_STATUS_SUCCESS);
-    cublasStatus_t st = cublasGemmEx(handle, op_b, op_a, N, M, K, &alpha,
-        B, CUBLAS_PRECISION, ldb, A, CUBLAS_PRECISION, lda, &beta,
-        C, CUBLAS_PRECISION, N, CUBLAS_COMPUTE, CUBLAS_GEMM_DEFAULT);
-    if (st != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "GEMM failed: %d (%d x %d x %d, ops %d %d, ld %d %d)\n",
-            (int)st, M, N, K, (int)op_a, (int)op_b, lda, ldb);
-        abort();
-    }
+    int ldc = N;
+    cublasGemmExStrided(handle, op_a, op_b, M, N, K, lda, ldb, ldc,
+        A, B, C, stream, alpha, beta);
 }
 
 // out(...,N) = alpha * a(...,K) @ b(N,K)^T + beta * out  — leading dims folded into M
@@ -178,6 +205,20 @@ void puf_mm_nn(Prec* a, Prec* b, Prec* out, cudaStream_t stream,
         a->data, b->data, out->data, stream, alpha, beta);
 }
 
+// out(..., col_start..col_start+slice_cols) = alpha * a(...,K) @ b(K, col_start..col_start+slice_cols) + beta * out
+void puf_mm_nn_slice(Prec* a, Prec* b, Prec* out,
+        int col_start, int slice_cols, cudaStream_t stream,
+        float alpha = 1.0f, float beta = 0.0f) {
+    int M = batch_size(a->shape) * a->shape[ndim(a->shape)-2];
+    int K = a->shape[ndim(a->shape)-1];
+    int total_N = b->shape[ndim(b->shape)-1];
+    int N = slice_cols;
+    precision_t* b_ptr = b->data + col_start;
+    precision_t* c_ptr = out->data + col_start;
+    cublasGemmExStrided(g_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
+        K, total_N, total_N, a->data, b_ptr, c_ptr, stream, alpha, beta);
+}
+
 #ifdef USE_ROCM
 // ROCm GEMM with distinct residual and output:
 // out = alpha * a @ b + beta * residual.
@@ -191,7 +232,11 @@ void puf_mm_nn_residual(Prec* a, Prec* b, Prec* residual, Prec* out,
 #else
     rocblas_datatype type = rocblas_datatype_bf16_r;
 #endif
-    assert(rocblas_set_stream(g_rocblas_handle, stream) == rocblas_status_success);
+    static thread_local cudaStream_t s_last_rocblas_stream = (cudaStream_t)-1;
+    if (stream != s_last_rocblas_stream) {
+        assert(rocblas_set_stream(g_rocblas_handle, stream) == rocblas_status_success);
+        s_last_rocblas_stream = stream;
+    }
     rocblas_status status = rocblas_gemm_ex(
         g_rocblas_handle, rocblas_operation_none, rocblas_operation_none,
         N, M, K, &alpha, b->data, type, N, a->data, type, K,
@@ -305,7 +350,7 @@ struct PrefixScan {
     precision_t* combined_ptr = NULL;
     precision_t* state_ptr = NULL;
     precision_t* input_ptr = NULL;  // (B, T, H) pre-projection input (highway)
-    precision_t* terminals_ptr = NULL;  // (B, T), reset before step t if terminal[t]
+    precision_t* rnn_resets_ptr = NULL;  // (B, T), reset before observation[t]
     int B = 0, T = 0, H = 0;
     Prec scan_h;  // (B, T, H), recurrent input to each step
     Prec out, next_state;
@@ -322,7 +367,7 @@ __global__ void mingru_scan_forward_seq(PrefixScan scan) {
     const precision_t* __restrict__ combined = scan.combined_ptr;
     const precision_t* __restrict__ state = scan.state_ptr;
     const precision_t* __restrict__ input = scan.input_ptr;
-    const precision_t* __restrict__ terminals = scan.terminals_ptr;
+    const precision_t* __restrict__ rnn_resets = scan.rnn_resets_ptr;
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * H) {
@@ -351,8 +396,8 @@ __global__ void mingru_scan_forward_seq(PrefixScan scan) {
     int t_offset = 0;
 
     for (int t = 0; t < T_seq; t++) {
-        // terminal[t] and observation[t] are emitted together after the prior step.
-        if (terminals != NULL && to_float(terminals[b * T_seq + t]) != 0.0f) {
+        // rnn_resets[t] marks that observation[t] starts a new episode.
+        if (rnn_resets != NULL && to_float(rnn_resets[b * T_seq + t]) != 0.0f) {
             h_t = 0.0f;
         }
         scan_h[h_base + t * H] = from_float(h_t);
@@ -388,7 +433,7 @@ __global__ void mingru_scan_backward(PrefixScan scan,
     precision_t* __restrict__ grad_input = scan.grad_input.data;
     const precision_t* __restrict__ combined = scan.combined_ptr;
     const precision_t* __restrict__ input = scan.input_ptr;
-    const precision_t* __restrict__ terminals = scan.terminals_ptr;
+    const precision_t* __restrict__ rnn_resets = scan.rnn_resets_ptr;
     const precision_t* __restrict__ scan_h = scan.scan_h.data;
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -462,8 +507,8 @@ __global__ void mingru_scan_backward(PrefixScan scan,
         // terminal before this step zeroed h_prev contribution into this step;
         // after bwd through the step, cut gradient flow into pre-reset state.
         dh = d_h_prev;
-        if (terminals != NULL &&
-                to_float(terminals[b * T_seq + t0]) != 0.0f) {
+        if (rnn_resets != NULL &&
+                to_float(rnn_resets[b * T_seq + t0]) != 0.0f) {
             dh = 0.0f;
         }
     }
@@ -583,8 +628,12 @@ void decoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
         .shape = {dw->output_dim + 1, dw->hidden_dim},
     };
     puf_kaiming_init(&wt, 1.0f, (*seed)++, stream);
-    if (dw->ar) cudaMemsetAsync(dw->condition.data, 0,
-        numel(dw->condition.shape) * sizeof(precision_t), stream);
+    if (dw->ar) {
+        // Zero all condition parameters first (ensures projection weights W are zero).
+        cudaMemsetAsync(dw->condition.data, 0,
+            numel(dw->condition.shape) * sizeof(precision_t), stream);
+
+    }
 }
 
 void decoder_reg_params(void* w, Allocator* alloc) {
@@ -795,7 +844,7 @@ Prec mingru_forward(void* w, Prec x, Prec state,
     return x;
 }
 
-Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
+Prec mingru_forward_train(void* w, Prec x, Prec state, Prec rnn_resets,
         void* activations, int agent_off, cudaStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
@@ -808,7 +857,7 @@ Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
         scan.combined_ptr = a->combined_bufs[i].data;
         scan.state_ptr = state_i.data;
         scan.input_ptr = a->saved_inputs[i].data;
-        scan.terminals_ptr = terminals.data;
+        scan.rnn_resets_ptr = rnn_resets.data;
         mingru_scan_forward_seq<<<grid_size(scan.B * scan.H), BLOCK_SIZE, 0, stream>>>(scan);
         x = scan.out;
     }
@@ -1146,13 +1195,16 @@ __global__ void normuon_store_update(precision_t* __restrict__ dst,
 
 // wb = wb * (1 - lr*wd) - lr * update  (update already scaled; one call for all params)
 __global__ void muon_weight_update(float* __restrict__ wb,
+        precision_t* __restrict__ param,
         const precision_t* __restrict__ update,
         const float* __restrict__ lr_ptr, float wd, int n) {
     float lr = *lr_ptr;
     float wd_scale = 1.0f - lr * wd;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        wb[idx] = wb[idx] * wd_scale - lr * to_float(update[idx]);
+        float w = wb[idx] * wd_scale - lr * to_float(update[idx]);
+        wb[idx] = w;
+        if (param) param[idx] = from_float(w);
     }
 }
 
@@ -1197,10 +1249,12 @@ void normuon_init(NorMuon* m, Allocator* param_alloc,
         AllocEntry& e = param_alloc->regs[_i];
         if (ndim(e.shape) >= 2) {
             long R = e.shape[0], C = numel(e.shape) / R;
-            max_M = max(max_M, min(R, C));
-            max_N = max(max_N, max(R, C));
-            max_rows = max(max_rows, R);
-            total_rows += R;
+            if (min(R, C) >= 64) {
+                max_M = max(max_M, min(R, C));
+                max_N = max(max_N, max(R, C));
+                max_rows = max(max_rows, R);
+                total_rows += R;
+            }
         }
     }
     m->second_moment = {.shape = {total_rows}};
@@ -1218,7 +1272,7 @@ void normuon_init(NorMuon* m, Allocator* param_alloc,
 
 
 void normuon_step(NorMuon* m, Float weights, Prec grads,
-        float max_grad_norm, cudaStream_t stream = 0) {
+        float max_grad_norm, cudaStream_t stream = 0, precision_t* param = NULL) {
     int n_grad = (int)numel(grads.shape);
     int sum_blocks = min((int)grid_size(n_grad), 256);
     muon_sum_sq_partials<<<sum_blocks, 256, 0, stream>>>(
@@ -1243,6 +1297,9 @@ void normuon_step(NorMuon* m, Float weights, Prec grads,
         }
 
         long R = e.shape[0], C = ne / R;
+        if (min(R, C) < 64) {
+            continue;
+        }
         float* second_moment = m->second_moment.data + row_offset;
         row_offset += R;
         long M = min(R, C);
@@ -1313,7 +1370,7 @@ void normuon_step(NorMuon* m, Float weights, Prec grads,
             aspect_scale, (int)ne);
     }
     muon_weight_update<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
-        weights.data, grads.data, m->lr, 0.0f, n_grad);
+        weights.data, param, grads.data, m->lr, 0.0f, n_grad);
 }
 
 // Train layout is (B, T). Views are sliced each mb; scratch is allocated.
@@ -1321,9 +1378,11 @@ struct TrainGraph {
     Prec mb_state;       // view into train_state (L, A, H); read with agent_off
     PolicyObs mb_obs;    // view (B, T, packed bytes or precision values)
     Prec mb_actions;     // view (B, T, num_atns)
-    Prec mb_logprobs;    // view (B, T)
-    Prec mb_terminals;   // view (B, T)
+    Float mb_logprobs;    // view (B, T)
+    Prec mb_rnn_resets;  // view (B, T), reset before observation[t]
+    Prec mb_transition_dones; // view (B, T), done after action[t]
     Prec mb_rewards;     // view (B, T)
+    Prec mb_bootstrap_values; // view (B), V(s_H)
     Prec mb_advantages;  // scratch
     Prec mb_values;      // view: frozen rollout V (vf-clip)
     Prec mb_returns;     // view: aliases mb_gae_v after GAE (V+A)
@@ -1417,14 +1476,18 @@ constexpr int PPO_THREADS = 256;
 #endif
 // Exact max head width for this env build — discrete logit cache size.
 constexpr int ppo_max_head_classes() {
+#ifdef BALATRO_POINTER_DECODER
+    return POLICY_PRIMARY_COUNT;
+#else
     constexpr int s[] = ACT_SIZES;
     int m = 0;
-    for (int i = 0; i < NUM_ATNS; i++) {
+    for (int i = 0; i < POLICY_NUM_ATNS; i++) {
         if (s[i] > m) {
             m = s[i];
         }
     }
     return m > 0 ? m : 1;
+#endif
 }
 constexpr int PPO_MAX_HEAD_A = ppo_max_head_classes();
 
@@ -1434,7 +1497,7 @@ constexpr int PPO_MAX_HEAD_A = ppo_max_head_classes();
 struct PPOGraphArgs {
     precision_t* imp;
     const precision_t* actions;
-    const precision_t* old_logprobs;
+    const float* old_logprobs;
     const precision_t* advantages;
     const precision_t* values;
     const precision_t* returns;
@@ -1450,12 +1513,18 @@ struct PPOKernelArgs {
     const int* act_sizes;
     const precision_t* action_mask; // (N, T, mask_size); always present
     const precision_t* condition;
+    const precision_t* keys;
+    const int* counts;
+    float* key_grad;
     float* grad_condition;
+    float* statistics;
+    float* coefficients;
     int mask_stride;
     int num_atns;
     float clip_coef, vf_clip_coef, vf_coef;
     const float* ent_coef;  // device ptr — host by-value bakes into CUDA graphs
     int T_seq, A_total, N;
+    int action_stride;
     bool is_continuous;
 };
 
@@ -1467,7 +1536,12 @@ struct PPOBufs {
 
 void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_total, bool is_continuous) {
     long total = (long)N * T;
+#ifdef BALATRO_POINTER_DECODER
+    A_total = DECODER_STATE;
+    int ppo_grid = ((int)total + PPO_THREADS / 32 - 1) / (PPO_THREADS / 32);
+#else
     int ppo_grid = ((int)total + PPO_THREADS - 1) / PPO_THREADS;
+#endif
     bufs = (PPOBufs){
         .grad_logits = {.shape = {N, T, A_total}},
         .grad_values = {.shape = {N, T, 1}},
@@ -1533,32 +1607,15 @@ __device__ __forceinline__ uint64_t mask_u64(
     return v;
 }
 
-__device__ __forceinline__ bool has_primary(int type) {
-    return type >= ACTION_BUY_CARD &&
-        type <= ACTION_SWAP_HAND_RIGHT;
-}
-
-// Actions are stored in precision_t buffers. A bad/stale action must not be
-// allowed to turn into an unchecked index into the AR condition table.
+// Actions are exact integer indices, including when stored in BF16.
 __device__ __forceinline__ int ar_action_value(
         const precision_t* act, int ab, int rel, int limit) {
     int value = (int)to_float(act[ab + rel]);
-    return (unsigned)value < (unsigned)limit ? value : 0;
+    assert(value >= 0 && value < limit);
+    return value;
 }
 
-__device__ __forceinline__ int selection_base(
-        const precision_t* m, int base, int type, int primary) {
-    int e = policy_selection_entry(type, primary);
-    if (e < 0) return -1;
-    int p = base + POLICY_SELECTION_OFFSET +
-        e * POLICY_SELECTION_BYTES;
-    return mask_byte(m, 0, p + 1) ? p : -1;
-}
-
-// Per-agent autoregressive context. The sampled prefix (type, primary, count,
-// cards) is fixed per thread; hoisting it out of the per-option loops removes
-// the O(prefix) recomputation that dominated the AR heads (heads 3-7 rebuild
-// the selected-card mask for every one of the 64 options).
+// Legality of the canonical count-and-subset grammar.
 typedef struct ARContext {
     int type;
     int primary;
@@ -1573,121 +1630,7 @@ typedef struct ARContext {
     uint64_t selected;       // cards selected before the current position
     int prev;                // last selected card before the current position
     uint64_t required_left;  // required & ~selected
-    int allowed_left;        // popcount(allowed & ~selected)
-    int pos;                 // current card position (head - 3)
-    // Set-synergy stats over `selected` (incremental in ar_ctx_advance):
-    // per-suit and per-rank counts plus a rank bitset (ace at bits 1 and 14).
-    // The AR heads use them to condition scores on flush / pair / straight
-    // completion instead of only the previous card.
-    const precision_t* m;    // mask base (card-attr lookups)
-    int base;                // per-agent mask offset
-    int suit_counts[4];
-    int rank_counts[15];
-    int rmask;
 } ARContext;
-
-// Reads act[0..1] (type, primary) and the selection entry from the mask.
-// Call again once head 1 has sampled so `primary` is the real value.
-__device__ __forceinline__ ARContext ar_ctx_init(
-        const precision_t* m, int base, const precision_t* act, int ab) {
-    ARContext c;
-    c.type = ar_action_value(act, ab, 0, ACTION_TYPE_COUNT);
-    c.has_primary = has_primary(c.type);
-    c.primary = c.has_primary ? ar_action_value(act, ab, 1, 64) : 0;
-    c.primary_bits = c.has_primary ? mask_u64(m, base,
-        POLICY_PRIMARY_OFFSET + c.type * POLICY_PRIMARY_BYTES) : 0;
-    c.sb = selection_base(m, base, c.type, c.primary);
-    if (c.sb >= 0) {
-        c.min_count = mask_byte(m, 0, c.sb);
-        c.max_count = mask_byte(m, 0, c.sb + 1);
-        c.allowed = mask_u64(m, 0, c.sb + 2);
-        c.required = mask_u64(m, 0, c.sb + 10);
-    } else {
-        c.min_count = 0;
-        c.max_count = 0;
-        c.allowed = 0;
-        c.required = 0;
-    }
-    c.count = 0;
-    c.selected = 0;
-    c.prev = -1;
-    c.required_left = c.required;
-    c.allowed_left = __popcll(c.allowed);
-    c.pos = 0;
-    c.m = m;
-    c.base = base;
-    for (int i = 0; i < 4; ++i) c.suit_counts[i] = 0;
-    for (int i = 0; i < 15; ++i) c.rank_counts[i] = 0;
-    c.rmask = 0;
-    return c;
-}
-
-// Read the sampled count from act[2] (after head 2 runs).
-__device__ __forceinline__ void ar_ctx_set_count(
-        ARContext* c, const precision_t* act, int ab) {
-    c->count = ar_action_value(act, ab, 2, 6);
-}
-
-// Per-option card attribute ((suit << 4) | rank) from the env-written mask
-// table. Zero for out-of-range options (masked illegal anyway).
-__device__ __forceinline__ int ar_opt_attr(const ARContext* c, int opt) {
-    if (opt < 0 || opt >= POLICY_CARD_ATTR_BYTES) return 0;
-    return mask_byte(c->m, c->base, POLICY_CARD_ATTR_OFFSET + opt);
-}
-
-// Longest consecutive run of set rank bits containing position p (1..14).
-// Ace dual is handled by the caller trying both p=1 and p=14.
-__device__ __forceinline__ int ar_run_len(int rmask, int p) {
-    int left = 0, right = 0;
-    while (rmask & (1 << (p + right + 1))) right++;
-    while ((p - left - 1) >= 1 && (rmask & (1 << (p - left - 1)))) left++;
-    return left + right + 1;
-}
-
-// Straight-completion signal: longest consecutive run through opt's rank
-// among the selected cards plus opt itself.
-__device__ __forceinline__ int ar_run_through(const ARContext* c, int opt) {
-    int rank = ar_opt_attr(c, opt) & POLICY_CARD_ATTR_RANK_MASK;
-    if (rank < 1 || rank > 14) return 1;
-    int bit = (rank == 14) ? ((1 << 1) | (1 << 14)) : (1 << rank);
-    int rmask = c->rmask | bit;
-    int best = ar_run_len(rmask, rank == 14 ? 1 : rank);
-    if (rank == 14) {
-        int hi = ar_run_len(rmask, 14);
-        if (hi > best) best = hi;
-    }
-    return best;
-}
-
-// Advance the card-selection prefix by one position (call after heads 3..6).
-__device__ __forceinline__ void ar_ctx_advance(
-        ARContext* c, const precision_t* act, int ab) {
-    if (c->pos < MAX_SELECTION) {
-        int card = ar_action_value(act, ab, 3 + c->pos, 64);
-        c->selected |= UINT64_C(1) << card;
-        c->prev = card;
-        c->pos++;
-        c->required_left = c->required & ~c->selected;
-        c->allowed_left = __popcll(c->allowed & ~c->selected);
-        int attr = ar_opt_attr(c, card);
-        int suit = attr >> POLICY_CARD_ATTR_SUIT_SHIFT;
-        int rank = attr & POLICY_CARD_ATTR_RANK_MASK;
-        if (suit >= 0 && suit < 4) c->suit_counts[suit]++;
-        if (rank >= 1 && rank <= 14) {
-            c->rank_counts[rank]++;
-            c->rmask |= (rank == 14) ? (1 << 1) | (1 << 14) : (1 << rank);
-        }
-    }
-}
-
-__device__ __forceinline__ bool ar_head_active(const ARContext* c, int head) {
-    if (head == 0) return true;
-    if (head == 1) return c->has_primary;
-    if (head == 2) return c->sb >= 0;
-    if (head >= 3 && head <= 7)
-        return c->sb >= 0 && head - 3 < c->count;
-    return false;
-}
 
 __device__ __forceinline__ bool ar_option_legal(
         const ARContext* c, const precision_t* m, int base, int head, int opt) {
@@ -1698,7 +1641,12 @@ __device__ __forceinline__ bool ar_option_legal(
     }
     if (head == 2) {
         if (c->sb < 0) return opt == 0;
-        return opt >= c->min_count && opt <= c->max_count;
+        int req_n = __popcll(c->required);
+        int allow_n = __popcll(c->allowed);
+        int min_c = c->min_count > req_n ? c->min_count : req_n;
+        int max_c = c->max_count < allow_n ? c->max_count : allow_n;
+        if (min_c > max_c) return opt == 0;
+        return opt >= min_c && opt <= max_c;
     }
     if (head >= 3 && head <= 7) {
         int pos = head - 3;
@@ -1717,181 +1665,14 @@ __device__ __forceinline__ bool ar_option_legal(
     return opt == 0;
 }
 
-__device__ __forceinline__ int ar_cond_idx(
-        const ARContext* c, int head, int opt, int part) {
-    if (head == 1)
-        return AR_TYPE_PRIMARY_OFFSET + c->type * 64 + opt;
-    if (head == 2)
-        return part == 0
-            ? AR_TYPE_COUNT_OFFSET + c->type * 6 + opt
-            : AR_PRIMARY_COUNT_OFFSET + c->primary * 6 + opt;
-    if (head >= 3 && head <= 7) {
-        int pos = head - 3;
-        if (part == 0) return AR_TYPE_CARD_OFFSET +
-            (c->type * 5 + pos) * 64 + opt;
-        if (part == 1) return AR_PRIMARY_CARD_OFFSET +
-            (c->primary * 5 + pos) * 64 + opt;
-        if (part == 2) return AR_COUNT_CARD_OFFSET +
-            (c->count * 5 + pos) * 64 + opt;
-        if (part == 3 && pos > 0)
-            return AR_PREVIOUS_CARD_OFFSET +
-                (c->prev * 4 + pos - 1) * 64 + opt;
-        if (part == 4) {
-            int suit = ar_opt_attr(c, opt) >> POLICY_CARD_ATTR_SUIT_SHIFT;
-            int cnt = suit >= 0 && suit < 4 ? c->suit_counts[suit] : 0;
-            if (cnt > 4) cnt = 4;
-            return AR_SUIT_CARD_OFFSET + (cnt * 5 + pos) * 64 + opt;
-        }
-        if (part == 5) {
-            int rank = ar_opt_attr(c, opt) & POLICY_CARD_ATTR_RANK_MASK;
-            int cnt = rank >= 1 && rank <= 14 ? c->rank_counts[rank] : 0;
-            if (cnt > 4) cnt = 4;
-            return AR_RANK_CARD_OFFSET + (cnt * 5 + pos) * 64 + opt;
-        }
-        if (part == 6) {
-            int run = ar_run_through(c, opt);
-            if (run > 5) run = 5;
-            return AR_RUN_CARD_OFFSET + ((run - 1) * 5 + pos) * 64 + opt;
-        }
-    }
-    return -1;
-}
+#endif
 
-__device__ __forceinline__ float ar_cond_bias(
-        const ARContext* c, const precision_t* cond, int head, int opt) {
-    if (!cond || head == 0) return 0.0f;
-    int n = head == 1 ? 1 : head == 2 ? 2 : 7;
-    float v = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        int j = ar_cond_idx(c, head, opt, i);
-        if (j >= 0) v += to_float(cond[j]);
-    }
-    return v;
-}
-
-__device__ __forceinline__ void ar_cond_add(
-        float* g, const ARContext* c, int head, int opt, float v) {
-    if (!g || v == 0.0f || head == 0) return;
-    int n = head == 1 ? 1 : head == 2 ? 2 : 7;
-    for (int i = 0; i < n; ++i) {
-        int j = ar_cond_idx(c, head, opt, i);
-        if (j >= 0) atomicAdd(g + j, v);
-    }
-}
-
-// Inline helpers for ppo_loss. The actions are fixed per thread there, so a
-// good compiler hoists the loop-invariant prefix; the sampled-actions variant
-// in sample_logits needs the explicit ARContext (heads write actions between
-// reads, which defeats hoisting).
-__device__ __forceinline__ bool head_active(
-        const precision_t* m, int base, const precision_t* act,
-        int ab, int head) {
-    if (head == 0) return true;
-    int type = ar_action_value(act, ab, 0, ACTION_TYPE_COUNT);
-    if (head == 1) return has_primary(type);
-    int primary = has_primary(type) ? ar_action_value(act, ab, 1, 64) : 0;
-    int sb = selection_base(m, base, type, primary);
-    if (head == 2) return sb >= 0;
-    if (head >= 3 && head <= 7)
-        return sb >= 0 && head - 3 < ar_action_value(act, ab, 2, 6);
-    return false;
-}
-
-__device__ __forceinline__ bool option_legal(
-        const precision_t* m, int base, const precision_t* act,
-        int ab, int head, int opt) {
-    if (head == 0) return mask_byte(m, base, opt) != 0;
-    int type = ar_action_value(act, ab, 0, ACTION_TYPE_COUNT);
-    int primary = has_primary(type) ? ar_action_value(act, ab, 1, 64) : 0;
-    if (head == 1) {
-        if (!has_primary(type)) return opt == 0;
-        uint64_t bits = mask_u64(m, base,
-            POLICY_PRIMARY_OFFSET + type * POLICY_PRIMARY_BYTES);
-        return (bits & (UINT64_C(1) << opt)) != 0;
-    }
-    int sb = selection_base(m, base, type, primary);
-    if (head == 2) {
-        if (sb < 0) return opt == 0;
-        return opt >= mask_byte(m, 0, sb) && opt <= mask_byte(m, 0, sb + 1);
-    }
-    if (head >= 3 && head <= 7) {
-        int count = ar_action_value(act, ab, 2, 6);
-        int pos = head - 3;
-        if (sb < 0 || pos >= count) return opt == 0;
-        uint64_t allowed = mask_u64(m, 0, sb + 2);
-        uint64_t required = mask_u64(m, 0, sb + 10);
-        uint64_t selected = 0;
-        int prev = -1;
-        for (int i = 0; i < pos; ++i) {
-            int card = ar_action_value(act, ab, 3 + i, 64);
-            selected |= UINT64_C(1) << card;
-            prev = card;
-        }
-        if (opt <= prev || !(allowed & (UINT64_C(1) << opt))) return false;
-        int left = count - pos - 1;
-        uint64_t lower = opt ? (UINT64_C(1) << opt) - 1 : 0;
-        uint64_t pending = required & ~selected;
-        if (pending & lower) return false;
-        pending &= ~(UINT64_C(1) << opt);
-        uint64_t greater = opt == 63 ? 0 :
-            ~((UINT64_C(1) << (opt + 1)) - 1);
-        if (__popcll(pending & greater) > left) return false;
-        return __popcll(allowed & ~selected & greater) >= left;
-    }
-    return opt == 0;
-}
-
-__device__ __forceinline__ int cond_idx(
-        const precision_t* act, int ab, int head, int opt, int part) {
-    int type = ar_action_value(act, ab, 0, ACTION_TYPE_COUNT);
-    int primary = has_primary(type) ? ar_action_value(act, ab, 1, 64) : 0;
-    if (head == 1)
-        return AR_TYPE_PRIMARY_OFFSET + type * 64 + opt;
-    if (head == 2)
-        return part == 0
-            ? AR_TYPE_COUNT_OFFSET + type * 6 + opt
-            : AR_PRIMARY_COUNT_OFFSET + primary * 6 + opt;
-    if (head >= 3 && head <= 7) {
-        int pos = head - 3;
-        int count = ar_action_value(act, ab, 2, 6);
-        if (part == 0) return AR_TYPE_CARD_OFFSET +
-            (type * 5 + pos) * 64 + opt;
-        if (part == 1) return AR_PRIMARY_CARD_OFFSET +
-            (primary * 5 + pos) * 64 + opt;
-        if (part == 2) return AR_COUNT_CARD_OFFSET +
-            (count * 5 + pos) * 64 + opt;
-        if (pos > 0) {
-            int prev = ar_action_value(act, ab, 2 + pos, 64);
-            return AR_PREVIOUS_CARD_OFFSET +
-                (prev * 4 + pos - 1) * 64 + opt;
-        }
-    }
-    return -1;
-}
-
-__device__ __forceinline__ float cond_bias(
-        const precision_t* c, const precision_t* act,
-        int ab, int head, int opt) {
-    if (!c || head == 0) return 0.0f;
-    int n = head == 1 ? 1 : head == 2 ? 2 : 7;
-    float v = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        int j = cond_idx(act, ab, head, opt, i);
-        if (j >= 0) v += to_float(c[j]);
-    }
-    return v;
-}
-
-__device__ __forceinline__ void cond_add(
-        float* g, const precision_t* act, int ab,
-        int head, int opt, float v) {
-    if (!g || v == 0.0f || head == 0) return;
-    int n = head == 1 ? 1 : head == 2 ? 2 : 7;
-    for (int i = 0; i < n; ++i) {
-        int j = cond_idx(act, ab, head, opt, i);
-        if (j >= 0) atomicAdd(g + j, v);
-    }
-}
+#ifdef BALATRO_POINTER_DECODER
+#ifdef USE_ROCM
+#include "../ocean/balatro/prefix.hip"
+#else
+#include "../ocean/balatro/prefix.cu"
+#endif
 #endif
 
 __device__ __forceinline__ void ppo_continuous_head(
@@ -1909,10 +1690,11 @@ __device__ __forceinline__ void ppo_continuous_head(
 // logp is written into grad_logits (overwritten with grads after GAE). For
 // POLICY_MASK_SIZE envs the walk applies the AR condition bias and legality
 // mask, matching the sampled distribution.
+#ifndef BALATRO_POINTER_DECODER
 __global__ void cache_imp_and_v(
         Prec dec_out,
         const precision_t* __restrict__ actions,
-        const precision_t* __restrict__ old_logprobs,
+        const float* __restrict__ old_logprobs,
         const precision_t* __restrict__ action_mask,
         Prec logstd,
         const int* __restrict__ act_sizes,
@@ -1932,30 +1714,26 @@ __global__ void cache_imp_and_v(
     int logits_base = idx * fused_cols;
     int at_base = idx * A_total;
     int mask_base = idx * mask_stride;
-    int action_base = idx * NUM_ATNS;
+    int action_base = idx * ACTION_STORAGE_SIZE;
     precision_t* logits = dec_out.data;
     value_out[idx] = logits[logits_base + A_total];
 
     float new_lp = 0.0f;
     if (logstd.data) {
-        for (int h = 0; h < NUM_ATNS; ++h) {
+        for (int h = 0; h < POLICY_NUM_ATNS; ++h) {
             float lp, ent;
             ppo_continuous_head(
                 safe_continuous_mean(logits, logits_base + h),
                 safe_continuous_logstd(logstd.data, h),
-                to_float(actions[idx * NUM_ATNS + h]), &lp, &ent);
+                to_float(actions[idx * ACTION_STORAGE_SIZE + h]), &lp, &ent);
             new_lp += lp;
         }
     } else {
 #ifdef PUFFER_NETHACK
-        int verb = (int)actions[idx * NUM_ATNS];
-#endif
-#ifdef POLICY_MASK_SIZE
-        ARContext c = ar_ctx_init(action_mask, mask_base, actions, action_base);
-        ar_ctx_set_count(&c, actions, action_base);
+        int verb = (int)actions[idx * ACTION_STORAGE_SIZE];
 #endif
         int logits_offset = 0;
-        for (int h = 0; h < NUM_ATNS; ++h) {
+        for (int h = 0; h < POLICY_NUM_ATNS; ++h) {
             int A = act_sizes[h];
 #ifdef PUFFER_NETHACK
             if (!nethack_head_used(verb, h)) {
@@ -1963,49 +1741,6 @@ __global__ void cache_imp_and_v(
                 continue;
             }
 #endif
-#ifdef POLICY_MASK_SIZE
-            if (!ar_head_active(&c, h)) {
-                logits_offset += A;
-                continue;
-            }
-            int act = ar_action_value(actions, action_base, h, A);
-            // Per-option condition bias cached per head: the three passes
-            // below would otherwise recompute the (heavier) set-synergy
-            // parts for every option.
-            float bias_cache[PPO_MAX_HEAD_A];
-            for (int a = 0; a < A; ++a)
-                bias_cache[a] = ar_cond_bias(&c, condition, h, a);
-            float max_l = -INFINITY;
-            for (int a = 0; a < A; ++a) {
-                float l = ar_option_legal(&c, action_mask, mask_base, h, a)
-                    ? to_float(logits[logits_base + logits_offset + a]) +
-                        bias_cache[a]
-                    : -1e4f;
-                if (l > max_l) max_l = l;
-            }
-            float sum = 0.0f, act_l = 0.0f;
-            for (int a = 0; a < A; ++a) {
-                float l = ar_option_legal(&c, action_mask, mask_base, h, a)
-                    ? to_float(logits[logits_base + logits_offset + a]) +
-                        bias_cache[a]
-                    : -1e4f;
-                float e = __expf(l - max_l);
-                sum += e;
-                if (a == act) act_l = l;
-            }
-            float lse = max_l + __logf(sum);
-            for (int a = 0; a < A; ++a) {
-                float l = ar_option_legal(&c, action_mask, mask_base, h, a)
-                    ? to_float(logits[logits_base + logits_offset + a]) +
-                        bias_cache[a]
-                    : -1e4f;
-                logps[at_base + logits_offset + a] = l - lse;
-            }
-            new_lp += act_l - lse;
-            if (h >= 3 && h <= 6) {
-                ar_ctx_advance(&c, actions, action_base);
-            }
-#else
             float cache[PPO_MAX_HEAD_A];
             float lse = ppo_discrete_logsumexp(
                 logits, logits_base, logits_offset, A,
@@ -2016,7 +1751,7 @@ __global__ void cache_imp_and_v(
 #ifdef PUFFER_NETHACK
             int used = nethack_head_used(verb, h);
             if (used) {
-                int act = (int)actions[idx * NUM_ATNS + h];
+                int act = (int)actions[idx * ACTION_STORAGE_SIZE + h];
                 if (h == 0) {
                     float mix = 1.0f;
                     new_lp += nethack_verb_train_logp(
@@ -2027,36 +1762,53 @@ __global__ void cache_imp_and_v(
                 }
             }
 #else
-            new_lp += cache[(int)actions[idx * NUM_ATNS + h]] - lse;
-#endif
+            new_lp += cache[(int)actions[idx * ACTION_STORAGE_SIZE + h]] - lse;
 #endif
             logits_offset += A;
         }
     }
     new_lp_out[idx] = new_lp;
-    imp_out[idx] = from_float(__expf(new_lp - to_float(old_logprobs[idx])));
+    imp_out[idx] = from_float(__expf(new_lp - old_logprobs[idx]));
 }
+#endif
 
 Prec arch_forward_train(Arch* p, Weights& w,
         Activations& activations, PolicyObs x,
-        Prec state, Prec terminals, int agent_off,
+        Prec state, Prec rnn_resets, int agent_off,
         TrainGraph& g, Prec logstd, Prec condition, int* act_sizes,
         float* logps, float* new_lp, cudaStream_t stream) {
     int B = x.shape[0], TT = x.shape[1];
     Prec h = p->encoder.forward(w.encoder,
         activations.encoder, *puf_squeeze(&x, 0), stream);
     h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT),
-        state, terminals, activations.network, agent_off, stream);
+        state, rnn_resets, activations.network, agent_off, stream);
     Prec dec_out = p->decoder.forward(
         w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
     Prec dec = *puf_unsqueeze(&dec_out, 0, B, TT);
+    #ifdef BALATRO_POINTER_DECODER
+    BalatroDecoderActivations* decoder =
+        (BalatroDecoderActivations*)activations.decoder;
+    decoder->actions = g.mb_actions.data;
+    decoder->mask = g.mb_action_mask.data;
+    cache_queries<<<(B * TT + 3) / 4, 128, 0, stream>>>(dec.data, decoder->entities.data,
+        condition.data, g.mb_actions.data, g.mb_action_mask.data, decoder->enc->counts.data,
+        decoder->evaluations.data, B * TT);
+    cache_decisions<<<B * TT, 64, 0, stream>>>(
+        decoder->entities.data, g.mb_actions.data,
+        g.mb_action_mask.data, decoder->enc->counts.data, decoder->decisions.data, decoder->evaluations.data, B * TT);
+    finish_likelihood<<<grid_size(B * TT), BLOCK_SIZE, 0, stream>>>(
+        dec.data, decoder->decisions.data, g.mb_logprobs.data,
+        g.mb_imp.data, g.mb_gae_v.data, new_lp, B * TT);
+    #else
     cache_imp_and_v<<<grid_size(B * TT), BLOCK_SIZE, 0, stream>>>(
         dec, g.mb_actions.data, g.mb_logprobs.data, g.mb_action_mask.data,
         logstd, act_sizes, condition.data, (int)g.mb_action_mask.shape[2],
         g.mb_imp.data, g.mb_gae_v.data, logps, new_lp);
+    #endif
     return dec;
 }
 
+#ifndef BALATRO_POINTER_DECODER
 __global__ void ppo_loss_compute(
         float* __restrict__ ppo_partials,
         PPOKernelArgs a, PPOGraphArgs g) {
@@ -2076,7 +1828,7 @@ __global__ void ppo_loss_compute(
         int logits_base = nt * (a.A_total + 1);
         int at_base = nt * a.A_total;
         int mask_base = nt * a.mask_stride;
-        int action_base = nt * a.num_atns;
+        int action_base = nt * a.action_stride;
 
         float adv_for_pg = to_float(g.advantages[nt]);
         float val = to_float(g.values[nt]);
@@ -2084,7 +1836,7 @@ __global__ void ppo_loss_compute(
         float val_pred = to_float(a.values_pred[logits_base]);
         float ent_coef = *a.ent_coef;
         float d_entropy_term = inv_NT * (-ent_coef);
-        float logratio = a.grad_values_pred[nt] - to_float(g.old_logprobs[nt]);
+        float logratio = a.grad_values_pred[nt] - g.old_logprobs[nt];
         float ratio = __expf(logratio);
 
         // Value loss + gradient: 0.5 * max((v-r)^2, (v_clip-r)^2).
@@ -2115,7 +1867,7 @@ __global__ void ppo_loss_compute(
                 float mean = safe_continuous_mean(a.logits, logits_base + h);
                 float c_logstd = safe_continuous_logstd(a.logstd, h);
                 float c_action = finite_or_clamp(
-                    g.actions[nt * a.num_atns + h], -1.0e6f, 1.0e6f);
+                    g.actions[nt * a.action_stride + h], -1.0e6f, 1.0e6f);
                 float lp, ent;
                 ppo_continuous_head(mean, c_logstd, c_action, &lp, &ent);
                 total_entropy += ent;
@@ -2128,17 +1880,8 @@ __global__ void ppo_loss_compute(
             }
         } else {
 #ifdef PUFFER_NETHACK
-            int verb = (int)g.actions[nt * a.num_atns];
+            int verb = (int)g.actions[nt * a.action_stride];
             float verb_mix_scale = 1.0f;
-#endif
-#ifdef POLICY_MASK_SIZE
-            // Balatro AR heads: context hoisted once per row; heads 0..7 are
-            // active per the sampled prefix, head 8 is dead (never active).
-            // Cached logps already carry the AR condition bias (see
-            // cache_imp_and_v); here we only gate and add the condition grad.
-            ARContext c = ar_ctx_init(
-                a.action_mask, mask_base, g.actions, action_base);
-            ar_ctx_set_count(&c, g.actions, action_base);
 #endif
             int logits_offset = 0;
             for (int h = 0; h < a.num_atns; ++h) {
@@ -2152,19 +1895,7 @@ __global__ void ppo_loss_compute(
                     continue;
                 }
 #endif
-#ifdef POLICY_MASK_SIZE
-                if (!ar_head_active(&c, h)) {
-                    for (int j = 0; j < A; ++j) {
-                        a.grad_logits[at_base + logits_offset + j] = 0.0f;
-                    }
-                    logits_offset += A;
-                    continue;
-                }
-                int raw_act = (int)to_float(g.actions[action_base + h]);
-                int act = (unsigned)raw_act < (unsigned)A ? raw_act : 0;
-#else
-                int act = (int)g.actions[nt * a.num_atns + h];
-#endif
+                int act = (int)g.actions[nt * a.action_stride + h];
                 float ent = 0.0f;
                 for (int j = 0; j < A; ++j) {
                     float logp = a.grad_logits[at_base + logits_offset + j];
@@ -2186,25 +1917,10 @@ __global__ void ppo_loss_compute(
                 for (int j = 0; j < A; ++j) {
                     float logp = a.grad_logits[at_base + logits_offset + j];
                     float p = __expf(logp);
-                    a.grad_logits[at_base + logits_offset + j] =
-                        ((j == act ? 1.0f : 0.0f) - p) * d_logp
+                    float grad_l = ((j == act ? 1.0f : 0.0f) - p) * d_logp
                         + d_entropy_term * p * (-ent - logp);
-#ifdef POLICY_MASK_SIZE
-                    if (ar_option_legal(&c, a.action_mask, mask_base, h, j)) {
-                        ar_cond_add(
-                            a.grad_condition + (nt & (COND_STRIPE_COUNT - 1))
-                                * AR_CONDITION_SIZE,
-                            &c, h, j,
-                            a.grad_logits[at_base + logits_offset + j]);
-                    }
-#endif
+                    a.grad_logits[at_base + logits_offset + j] = grad_l;
                 }
-#ifdef POLICY_MASK_SIZE
-                // Advance the card-selection prefix for the next AR head.
-                if (h >= 3 && h <= 6) {
-                    ar_ctx_advance(&c, g.actions, action_base);
-                }
-#endif
                 logits_offset += A;
             }
         }
@@ -2226,7 +1942,7 @@ __global__ void ppo_loss_compute(
     block_reduce_sum(&block_losses[0][0], &ppo_partials[blockIdx.x * LOSS_N],
         tid, PPO_THREADS, LOSS_N);
 }
-
+#endif
 
 // Deterministic reduction of per-block PPO loss partials + count increment
 __global__ void ppo_loss_reduce(
@@ -2261,7 +1977,6 @@ __global__ void cond_parts_sum(
     dst[idx] = sum;
 }
 
-
 void ppo_loss_fwd_bwd(
         Prec& dec_out,    // (N, T, fused_cols) - fused logits+value from decoder
         Prec& logstd,     // continuous logstd or empty
@@ -2270,11 +1985,17 @@ void ppo_loss_fwd_bwd(
         float clip_coef, float vf_clip_coef, float vf_coef, const float* ent_coef,
         PPOBufs& bufs, bool is_continuous,
         Prec condition, Float condition_accum, Prec condition_grad,
-        Float condition_parts, cudaStream_t stream) {
+        Float condition_parts, Prec keys, Int counts,
+        Float key_grad, Float statistics, Float coefficients, Float evaluations,
+        cudaStream_t stream) {
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
     int A_total = fused_cols - 1;  // last column is value
     int total = N * T;
+#ifdef BALATRO_POINTER_DECODER
+    int ppo_grid = (total + PPO_THREADS / 32 - 1) / (PPO_THREADS / 32);
+#else
     int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
+#endif
     if (condition_accum.data) {
         cudaMemsetAsync(condition_accum.data, 0,
             numel(condition_accum.shape) * sizeof(float), stream);
@@ -2283,37 +2004,60 @@ void ppo_loss_fwd_bwd(
         cudaMemsetAsync(condition_parts.data, 0,
             numel(condition_parts.shape) * sizeof(float), stream);
     }
+#ifndef BALATRO_POINTER_DECODER
+    if (key_grad.data) {
+        cudaMemsetAsync(key_grad.data, 0,
+            numel(key_grad.shape) * sizeof(float), stream);
+    }
+#endif
 
     PPOGraphArgs graph_args = {
         .imp = graph.mb_imp.data,
         .actions = graph.mb_actions.data,
         .old_logprobs = graph.mb_logprobs.data,
         .advantages = graph.mb_advantages.data,
-        .values = graph.mb_values.data,
         .returns = graph.mb_returns.data,
+        .values = graph.mb_values.data,
     };
 
     PPOKernelArgs args = {
-        .grad_logits = bufs.grad_logits.data,
-        .grad_logstd = is_continuous ? bufs.grad_logstd.data : NULL,
-        .grad_values_pred = bufs.grad_values.data,
         .logits = dec_out.data,
-        .logstd = is_continuous ? logstd.data : NULL,
         .values_pred = dec_out.data + A_total,
+        .logstd = is_continuous ? logstd.data : NULL,
         .act_sizes = act_sizes,
+        .grad_logits = bufs.grad_logits.data,
+        .grad_values_pred = bufs.grad_values.data,
+        .grad_logstd = is_continuous ? bufs.grad_logstd.data : NULL,
         .action_mask = graph.mb_action_mask.data,
         .condition = condition.data,
+        .keys = keys.data,
+        .counts = counts.data,
+        .key_grad = key_grad.data,
         .grad_condition = condition_parts.data,
+        .statistics = statistics.data,
+        .coefficients = coefficients.data,
         .mask_stride = (int)graph.mb_action_mask.shape[2],
-        .num_atns = NUM_ATNS,
+        .num_atns = POLICY_NUM_ATNS,
         .clip_coef = clip_coef, .vf_clip_coef = vf_clip_coef,
         .vf_coef = vf_coef,
         .ent_coef = ent_coef,
         .T_seq = T, .A_total = A_total, .N = N,
+        .action_stride = ACTION_STORAGE_SIZE,
         .is_continuous = is_continuous,
     };
+    #ifdef BALATRO_POINTER_DECODER
+    ppo_loss_balatro<<<ppo_grid, PPO_THREADS, 0, stream>>>(
+        bufs.ppo_partials.data, args, graph_args);
+    cudaMemsetAsync(bufs.grad_logits.data, 0, total * DECODER_STATE * sizeof(float), stream);
+    backward_decisions<<<total, 64, 0, stream>>>(
+        dec_out.data, keys.data, condition.data, graph.mb_actions.data,
+        graph.mb_action_mask.data, counts.data, coefficients.data,
+        bufs.grad_logits.data, key_grad.data, condition_parts.data, evaluations.data, total);
+    #else
     ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(
-            bufs.ppo_partials.data, args, graph_args);
+        bufs.ppo_partials.data, args, graph_args);
+    #endif
+#ifndef BALATRO_POINTER_DECODER
     if (condition_parts.data) {
         // Sum the row-striped condition-gradient staging copies (contention
         // reduced by spreading atomics across COND_STRIPE_COUNT tensors).
@@ -2326,6 +2070,7 @@ void ppo_loss_fwd_bwd(
         puf_float_to_precision_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
             condition_grad.data, condition_accum.data, n);
     }
+#endif
     ppo_loss_reduce<<<1, LOSS_N, 0, stream>>>(
         losses_acc, bufs.ppo_partials.data, ppo_grid);
 }
@@ -2359,6 +2104,7 @@ __device__ __forceinline__ void adv_st(precision_t* p, const float* o) {
 
 __global__ void puff_advantage(const precision_t* values,
         const precision_t* rewards, const precision_t* dones,
+        const precision_t* bootstrap_values,
         const precision_t* importance, precision_t* advantages,
         precision_t* returns,
         float gamma, float lambda, float rho_clip, float c_clip,
@@ -2367,9 +2113,7 @@ __global__ void puff_advantage(const precision_t* values,
     if (row >= num_steps) return;
     int off = row * horizon;
     float lastlam = 0.f;
-    float next_v = to_float(values[off + horizon - 1]);
-    float next_d = to_float(dones[off + horizon - 1]);
-    float next_r = to_float(rewards[off + horizon - 1]);
+    float next_v = to_float(bootstrap_values[row]);
 
     for (int seg = horizon / ADV_VEC_WIDTH - 1; seg >= 0; seg--) {
         int base = off + seg * ADV_VEC_WIDTH;
@@ -2387,18 +2131,14 @@ __global__ void puff_advantage(const precision_t* values,
                 imp[i] = 1.f;
             }
         }
-        // Last index H-1 left 0. First seg starts at width-2.
-        int i0 = (seg + 1 == horizon / ADV_VEC_WIDTH) ? ADV_VEC_WIDTH - 2 : ADV_VEC_WIDTH - 1;
-        // This is the simple puffer_advantage function. All the
-        // vec load/stores are minor perf optimizations
         #pragma unroll
-        for (int i = i0; i >= 0; i--) {
-            float nnt = 1.f - next_d;
+        for (int i = ADV_VEC_WIDTH - 1; i >= 0; i--) {
+            float nnt = 1.f - d[i];
             float rho_t = fminf(imp[i], rho_clip), c_t = fminf(imp[i], c_clip);
-            float delta = rho_t * (next_r + gamma * next_v * nnt - v[i]);
+            float delta = rho_t * (r[i] + gamma * next_v * nnt - v[i]);
             lastlam = delta + gamma * lambda * c_t * lastlam * nnt;
             adv[i] = lastlam;
-            next_v = v[i]; next_d = d[i]; next_r = r[i];
+            next_v = v[i];
         }
         #pragma unroll
         for (int i = 0; i < ADV_VEC_WIDTH; i++) {
