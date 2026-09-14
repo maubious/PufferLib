@@ -204,6 +204,10 @@ else
     echo "Error: environment '$ENV' not found" && exit 1
 fi
 
+if [ -f "$SRC_DIR/build.sh" ]; then
+	source "$SRC_DIR/build.sh"
+fi
+
 # src/ocean.cu compiles only this env's custom net (PUFFER_NETHACK, PUFFER_NMMO3, …).
 EXTRA_CFLAGS+=(-DPUFFER_${ENV^^})
 
