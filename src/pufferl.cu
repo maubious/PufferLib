@@ -57,7 +57,7 @@ constexpr cublasComputeType_t CUBLAS_COMPUTE = CUBLAS_COMPUTE_32F;
 
 #define PUF_MAX_DIMS 8
 #define BLOCK_SIZE 256
-int grid_size(int N) {
+long grid_size(long N) {
     return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 }
 
