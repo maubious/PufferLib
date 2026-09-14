@@ -7,6 +7,7 @@ typedef void (*reg_params_fn)(void* weights, Allocator* alloc);
 typedef void (*reg_train_fn)(void* weights, void* buf, Allocator* acts, Allocator* grads, int B_TT);
 typedef void (*reg_rollout_fn)(void* weights, void* buf, Allocator* alloc, int B);
 typedef void* (*create_weights_fn)(void* self);
+typedef Prec (*encoder_forward_fn)(void* weights, void* activations, PolicyObs input, cudaStream_t stream);
 typedef Prec (*forward_fn)(void* weights, void* activations, Prec input, cudaStream_t stream);
 typedef void (*encoder_backward_fn)(void* weights, void* activations,
     Prec grad, cudaStream_t stream);
@@ -20,8 +21,57 @@ typedef Prec (*network_forward_train_fn)(void* weights, Prec x,
 typedef Prec (*network_backward_fn)(void* weights,
     Prec grad, void* activations, cudaStream_t stream);
 
+enum LossIdx {
+	LOSS_PG = 0, LOSS_VF = 1, LOSS_ENT = 2, LOSS_TOTAL = 3,
+    LOSS_OLD_APPROX_KL = 4, LOSS_APPROX_KL = 5, LOSS_CLIPFRAC = 6,
+    LOSS_IMP = 7,
+    LOSS_N = 8, NUM_LOSSES = 9,
+};
+
+struct PPOBufs {
+    Float grad_logits, grad_values, grad_logstd;
+    Float ppo_partials;
+    float* ent_coef;
+};
+
+struct Sampling {
+    Prec output;
+    Float actions;
+    Prec mask;
+    Prec values;
+    Prec logprobs;
+    int* action_sizes;
+    curandStatePhilox4_32_10_t* rng;
+};
+
+struct Evaluation {
+    Prec output;
+    Float actions;
+    Prec mask;
+    Prec old_logprobs;
+    Float logprobs;
+    Prec importance, values;
+    Float scratch;
+    int* action_sizes;
+};
+
+struct LossInput {
+    Prec output;
+    Float actions;
+    Prec mask;
+    Prec importance, advantages, values, returns;
+    Prec old_logprobs;
+    int* action_sizes;
+    float clip_coef, vf_clip_coef, vf_coef;
+    const float* ent_coef;
+};
+
+typedef void (*sample_fn)(void*, void*, const Sampling&, cudaStream_t);
+typedef void (*evaluate_fn)(void*, void*, const Evaluation&, cudaStream_t);
+typedef void (*loss_fn)(void*, void*, const LossInput&, PPOBufs&, float*, cudaStream_t);
+
 struct Encoder {
-    forward_fn forward;
+    encoder_forward_fn forward;
     encoder_backward_fn backward;
     init_weights_fn init_weights;
     reg_params_fn reg_params;
@@ -49,8 +99,12 @@ struct Decoder {
     reg_train_fn reg_train;
     reg_rollout_fn reg_rollout;
     create_weights_fn create_weights;
+	sample_fn sample;
+	evaluate_fn evaluate;
+	loss_fn loss;
     int hidden_dim, output_dim;
     bool continuous;
+    int loss_rows_per_block;
     size_t activation_size;
 };
 
@@ -554,6 +608,12 @@ __global__ void assemble_decoder_grad(
     dst[idx] = from_float((col < od) ? grad_logits[row * od + col] : grad_value[row]);
 }
 
+#ifdef PUFFER_PACKED_OBS
+Prec encoder_forward(void* w, void* activations, PolicyObs input, cudaStream_t stream) {
+	assert(false && "Default encoder does not support packed obs");
+	return Prec{};
+}
+#else
 Prec encoder_forward(void* w, void* activations, Prec input, cudaStream_t stream) {
     EncoderWeights* ew = (EncoderWeights*)w;
     EncoderActivations* a = (EncoderActivations*)activations;
@@ -564,6 +624,7 @@ Prec encoder_forward(void* w, void* activations, Prec input, cudaStream_t stream
     puf_mm(&input, &ew->weight, &a->out, stream);
     return a->out;
 }
+#endif
 
 void encoder_backward(void* w, void* activations, Prec grad, cudaStream_t stream) {
     EncoderActivations* a = (EncoderActivations*)activations;
@@ -909,7 +970,7 @@ struct Weights {
 };
 
 Prec arch_forward(Arch* p, Weights& w, Activations& activations,
-        Prec obs, Prec state, cudaStream_t stream) {
+        PolicyObs obs, Prec state, cudaStream_t stream) {
     Prec enc_out = p->encoder.forward(
         w.encoder, activations.encoder, obs, stream);
     Prec h = p->network.forward(
@@ -978,6 +1039,10 @@ Weights weights_create(Arch* p, Allocator* params) {
 // unsolved research problem.
 #include "ocean.cu"
 
+void sample_distribution(void* weights, void* activations, const Sampling& input, cudaStream_t stream);
+void evaluate_distribution(void* weights, void* activations, const Evaluation& input, cudaStream_t stream);
+void loss_distribution(void* weights, void* activations, const LossInput& input, PPOBufs& bufs, float* losses, cudaStream_t stream);
+
 // Build an Arch (ops + dims) for this env. Encoder/decoder algorithms are
 // fixed at compile time; hidden_size/num_layers/horizon parameterize shape.
 // Arch has no heap state so this returns by value; callers store it wherever.
@@ -1003,9 +1068,13 @@ Arch build_arch(int input_size, int hidden_size,
         .reg_train = decoder_reg_train,
         .reg_rollout = decoder_reg_rollout,
         .create_weights = decoder_create_weights,
+		.sample = sample_distribution,
+		.evaluate = evaluate_distribution,
+		.loss = loss_distribution,
         .hidden_dim = hidden_size,
         .output_dim = decoder_output_size,
         .continuous = is_continuous,
+        .loss_rows_per_block = 256,
         .activation_size = sizeof(DecoderActivations),
     };
     create_custom_decoder(&decoder);
@@ -1213,7 +1282,7 @@ void muon_step(Muon* m, Float weights, Prec grads,
 // Train layout is (B, T). Views are sliced each mb; scratch is allocated.
 struct TrainGraph {
     Prec mb_state;       // view into train_state (L, A, H); read with agent_off
-    Prec mb_obs;         // view (B, T, input_size)
+    PolicyObs mb_obs;    // view (B, T, input_size)
     Float mb_actions;    // view (B, T, num_atns)
     Prec mb_logprobs;    // view (B, T)
     Prec mb_terminals;   // view (B, T)
@@ -1257,13 +1326,6 @@ __device__ __forceinline__ float safe_continuous_logstd(const precision_t* logst
     return finite_or_clamp(to_float(logstd[idx]), -20.0f, 2.0f);
 }
 
-enum LossIdx {
-    LOSS_PG = 0, LOSS_VF = 1, LOSS_ENT = 2, LOSS_TOTAL = 3,
-    LOSS_OLD_APPROX_KL = 4, LOSS_APPROX_KL = 5, LOSS_CLIPFRAC = 6,
-    LOSS_IMP = 7,
-    LOSS_N = 8, NUM_LOSSES = 9,
-};
-
 constexpr int PPO_THREADS = 256;
 
 // Per-env from ENV_HEADER (ocean/<env>/<env>.h).
@@ -1277,7 +1339,8 @@ constexpr int PPO_THREADS = 256;
 constexpr int ppo_max_head_classes() {
     constexpr int s[] = ACT_SIZES;
     int m = 0;
-    for (int i = 0; i < NUM_ATNS; i++) {
+	int n = sizeof(s) / sizeof(s[0]);
+    for (int i = 0; i < n; i++) {
         if (s[i] > m) {
             m = s[i];
         }
@@ -1314,15 +1377,9 @@ struct PPOKernelArgs {
     bool is_continuous;
 };
 
-struct PPOBufs {
-    Float grad_logits, grad_values, grad_logstd;
-    Float ppo_partials;
-    float* ent_coef;     // device scalar (graphs cannot bake host by-value)
-};
-
-void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_total, bool is_continuous) {
+void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_total, bool is_continuous, int rows_per_block = 256) {
     long total = (long)N * T;
-    int ppo_grid = ((int)total + PPO_THREADS - 1) / PPO_THREADS;
+    int ppo_grid = (int)((total + rows_per_block - 1) / rows_per_block);
     bufs = (PPOBufs){
         .grad_logits = {.shape = {N, T, A_total}},
         .grad_values = {.shape = {N, T, 1}},
@@ -1456,8 +1513,20 @@ __global__ void cache_imp_and_v(
     imp_out[idx] = from_float(__expf(new_lp - to_float(old_logprobs[idx])));
 }
 
+void evaluate_distribution(void* weights, void* activations,
+        const Evaluation& input, cudaStream_t stream) {
+    Prec logstd = {};
+    if (((DecoderWeights*)weights)->continuous) logstd = ((DecoderWeights*)weights)->logstd;
+    int batch = input.output.shape[0] * input.output.shape[1];
+    cudaMemsetAsync(input.scratch.data, 0, numel(input.scratch.shape) * sizeof(float), stream);
+    cache_imp_and_v<<<grid_size(batch), BLOCK_SIZE, 0, stream>>>(
+        input.output, input.actions.data, input.old_logprobs.data, input.mask.data,
+        logstd, input.action_sizes, input.importance.data,
+        input.values.data, input.scratch.data, input.logprobs.data);
+}
+
 Prec arch_forward_train(Arch* p, Weights& w,
-        Activations& activations, Prec x,
+        Activations& activations, PolicyObs x,
         Prec state, Prec terminals, int agent_off,
         TrainGraph& g, Prec logstd, int* act_sizes,
         float* logps, float* new_lp, cudaStream_t stream) {
@@ -1469,9 +1538,18 @@ Prec arch_forward_train(Arch* p, Weights& w,
     Prec dec_out = p->decoder.forward(
         w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
     Prec dec = *puf_unsqueeze(&dec_out, 0, B, TT);
-    cache_imp_and_v<<<grid_size(B * TT), BLOCK_SIZE, 0, stream>>>(
-        dec, g.mb_actions.data, g.mb_logprobs.data, g.mb_action_mask.data,
-        logstd, act_sizes, g.mb_imp.data, g.mb_gae_v.data, logps, new_lp);
+	Evaluation eval = {
+        .output = dec,
+        .actions = g.mb_actions,
+        .mask = g.mb_action_mask,
+        .old_logprobs = g.mb_logprobs,
+        .logprobs = {.data = new_lp, .shape = {B, TT}},
+        .importance = g.mb_imp,
+        .values = g.mb_gae_v,
+        .scratch = {.data = logps, .shape = {B, TT, p->decoder.output_dim}},
+        .action_sizes = act_sizes,
+    };
+    p->decoder.evaluate(w.decoder, activations.decoder, eval, stream);
     return dec;
 }
 
@@ -1620,6 +1698,43 @@ __global__ void ppo_loss_reduce(
     if (tid == 0) {
         losses_acc[LOSS_N] += 1.0f;
     }
+}
+
+void loss_distribution(void* weights, void* activations,
+        const LossInput& input, PPOBufs& bufs, float* losses, cudaStream_t stream) {
+    int N = input.output.shape[0], T = input.output.shape[1];
+    int width = input.output.shape[2] - 1;
+    int blocks = (N * T + PPO_THREADS - 1) / PPO_THREADS;
+    bool is_continuous = ((DecoderWeights*)weights)->continuous;
+    Prec logstd = {};
+    if (is_continuous) logstd = ((DecoderWeights*)weights)->logstd;
+    PPOGraphArgs graph = {
+        .imp = input.importance.data,
+        .actions = input.actions.data,
+        .old_logprobs = input.old_logprobs.data,
+        .advantages = input.advantages.data,
+        .values = input.values.data,
+        .returns = input.returns.data,
+    };
+    PPOKernelArgs args = {
+        .grad_logits = bufs.grad_logits.data,
+        .grad_logstd = is_continuous ? bufs.grad_logstd.data : NULL,
+        .grad_values_pred = bufs.grad_values.data,
+        .logits = input.output.data,
+        .logstd = is_continuous ? logstd.data : NULL,
+        .values_pred = input.output.data + width,
+        .act_sizes = input.action_sizes,
+        .action_mask = input.mask.data,
+        .num_atns = NUM_ATNS,
+        .clip_coef = input.clip_coef,
+        .vf_clip_coef = input.vf_clip_coef,
+        .vf_coef = input.vf_coef,
+        .ent_coef = input.ent_coef,
+        .T_seq = T, .A_total = width, .N = N,
+        .is_continuous = is_continuous,
+    };
+    ppo_loss_compute<<<blocks, PPO_THREADS, 0, stream>>>(bufs.ppo_partials.data, args, graph);
+    ppo_loss_reduce<<<1, LOSS_N, 0, stream>>>(losses, bufs.ppo_partials.data, blocks);
 }
 
 void ppo_loss_fwd_bwd(

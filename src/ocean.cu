@@ -51,10 +51,15 @@ __device__ static const float OSRS_ITEM_OBS_TABLE_DEV
 #ifdef PUFFER_CRAFTAX
 #include "../ocean/craftax/craftax.cu"
 #endif
+#ifdef PUFFER_BALATRO
+#include "../ocean/balatro/balatro.cu"
+#endif
 
 // Override encoder vtable when this env has a custom net. No-op otherwise.
 static void create_custom_encoder(Encoder* enc) {
-#ifdef PUFFER_NETHACK
+#ifdef PUFFER_BALATRO
+    create_balatro_encoder(enc);
+#elif defined(PUFFER_NETHACK)
     create_nethack_encoder(enc);
 #elif defined(PUFFER_CRAFTAX)
     create_craftax_encoder(enc);
@@ -84,7 +89,9 @@ static void create_custom_encoder(Encoder* enc) {
 }
 
 static void create_custom_decoder(Decoder* dec) {
-#ifdef PUFFER_NETHACK
+#ifdef PUFFER_BALATRO
+    create_balatro_decoder(dec);
+#elif defined(PUFFER_NETHACK)
     create_nethack_decoder(dec);
 #else
     (void)dec;

@@ -89,7 +89,13 @@ typedef struct {
     int64_t shape[PUF_MAX_DIMS];
 } Prec;
 
-__host__ __device__ int ndim(int64_t* shape) {
+#ifdef PUFFER_PACKED_OBS
+typedef Byte PolicyObs;
+#else
+typedef Prec PolicyObs;
+#endif
+
+__host__ __device__ int ndim(const int64_t* shape) {
     int n = 0;
     while (n < PUF_MAX_DIMS && shape[n] != 0) {
         n++;
@@ -97,7 +103,7 @@ __host__ __device__ int ndim(int64_t* shape) {
     return n;
 }
 
-__host__ __device__ int64_t numel(int64_t* shape) {
+__host__ __device__ int64_t numel(const int64_t* shape) {
     int64_t n = 1;
     for (int i = 0; i < PUF_MAX_DIMS && shape[i] != 0; i++) {
         n *= shape[i];
@@ -105,7 +111,7 @@ __host__ __device__ int64_t numel(int64_t* shape) {
     return n;
 }
 
-int64_t batch_size(int64_t* shape) {
+int64_t batch_size(const int64_t* shape) {
     int n = ndim(shape);
     int64_t b = 1;
     for (int i = 0; i < n - 2; i++) {
@@ -129,6 +135,11 @@ Prec* puf_squeeze(Prec* t, int dim) {
 }
 
 Float* puf_squeeze(Float* t, int dim) {
+    squeeze_shape(t->shape, dim);
+    return t;
+}
+
+Byte* puf_squeeze(Byte* t, int dim) {
     squeeze_shape(t->shape, dim);
     return t;
 }
@@ -253,6 +264,9 @@ void alloc_register(Allocator* a, Long* t) {
 void alloc_register(Allocator* a, Int* t) {
     _alloc_register(a, (void**)&t->data, t->shape, sizeof(int));
 }
+void alloc_register(Allocator* a, Byte* t) {
+    _alloc_register(a, (void**)&t->data, t->shape, sizeof(unsigned char));
+}
 
 void alloc_create(Allocator* alloc) {
     assert(cudaMalloc(&alloc->mem, alloc->total_bytes) == cudaSuccess
@@ -347,7 +361,11 @@ typedef struct ObsTensor {
 // Simulation + inference overlap across buffers
 // Note: experimental async path adds an extra slot dimension.
 struct RolloutBuf {
+#ifdef PUFFER_PACKED_OBS
+	Byte observations;
+#else
     Prec observations;  // (horizon, agents, input_size)
+#endif
     Prec initial_states;
     Float actions;      // (horizon, agents, num_atns) float32: large discrete IDs
     Prec values;        // (horizon, agents)
@@ -371,12 +389,18 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
     bufs->terminals    = {.shape = {T, B}};
     bufs->action_mask  = {.shape = {T, B, mask_size}};
     Prec* prec_fields[] = {
-        &bufs->observations, &bufs->values, &bufs->logprobs,
+#ifndef PUFFER_PACKED_OBS
+        &bufs->observations, 
+#endif
+		&bufs->values, &bufs->logprobs,
         &bufs->rewards, &bufs->terminals, &bufs->action_mask,
     };
     for (int i = 0; i < (int)(sizeof(prec_fields) / sizeof(prec_fields[0])); i++) {
         alloc_register(alloc, prec_fields[i]);
     }
+#ifdef PUFFER_PACKED_OBS
+	alloc_register(alloc, &bufs->observations);
+#endif
     alloc_register(alloc, &bufs->actions);
 }
 
@@ -393,6 +417,16 @@ Prec puf_time_view(Prec p, int start_t, int T) {
 }
 
 Float puf_time_view(Float p, int start_t, int T) {
+    long B = p.shape[1];
+    long F = p.shape[2];
+    long stride_f = F > 1 ? F : 1;
+    return {
+        .data = p.data + (long)start_t * B * stride_f,
+        .shape = {T, B, F},
+    };
+}
+
+Byte puf_time_view(Byte p, int start_t, int T) {
     long B = p.shape[1];
     long F = p.shape[2];
     long stride_f = F > 1 ? F : 1;
@@ -703,6 +737,17 @@ __global__ void sample_logits(
     rng_states[idx] = state;
 }
 
+void sample_distribution(void* weights, void* activations,
+        const Sampling& input, cudaStream_t stream) {
+    Prec logstd = {};
+    if (((DecoderWeights*)weights)->continuous) logstd = ((DecoderWeights*)weights)->logstd;
+    int mask_stride = (int)input.mask.shape[1];
+    sample_logits<<<grid_size(input.output.shape[0]), BLOCK_SIZE, 0, stream>>>(
+        input.output, logstd, input.action_sizes, input.actions.data,
+        input.actions.data, input.logprobs.data, input.values.data, input.rng,
+        input.mask.data, mask_stride);
+}
+
 // Index into (L, agents, H): element-parallel over L*count*H.
 // state_row is agent index within the state tensor's agent dim.
 static __device__ long state_elem_idx(
@@ -781,6 +826,16 @@ Float puf_slice(Float p, int t, int start, int count) {
     };
 }
 
+Byte puf_slice(Byte p, int t, int start, int count) {
+    long B = p.shape[1];
+    long F = p.shape[2];
+    long stride_f = F > 1 ? F : 1;
+    return {
+        .data = p.data + (long)(t * B + start) * stride_f,
+        .shape = {count, F},
+    };
+}
+
 static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         cudaStream_t stream) {
     Hypers* hypers = &pufferl->hypers;
@@ -799,6 +854,12 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
     // Copy observations, rewards, terminals from GPU env buffers to rollout buffer
     ObsTensor* obs_env = &env->obs;
     int n = block_size * obs_env->shape[1];
+#ifdef PUFFER_PACKED_OBS
+    Byte obs_dst = puf_slice(rollouts.observations, t, start, block_size);
+    cudaMemcpyAsync(obs_dst.data,
+        obs_env->data + (long)start * obs_env->shape[1],
+        n * sizeof(obs_t), cudaMemcpyDeviceToDevice, stream);
+#else
     Prec obs_dst = puf_slice(rollouts.observations, t, start, block_size);
     // Env obs -> rollout: D2D if same type, else cast (float/uchar → precision_t).
     if (sizeof(obs_t) == sizeof(precision_t)) {
@@ -809,6 +870,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
             obs_dst.data, obs_env->data + (long)start * obs_env->shape[1], n);
     }
+#endif
 
     Prec rew_dst = puf_slice(rollouts.rewards, t, start, block_size);
     Prec term_dst = puf_slice(rollouts.terminals, t, start, block_size);
@@ -818,7 +880,6 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
 
     // Mask always allocated (env-written or synthetic all-ones). Continuous ignores it in sample.
     int mask_size = rollouts.action_mask.shape[2];
-    int mask_stride = mask_size;
     Prec mask_slice = puf_slice(rollouts.action_mask, t, start, block_size);
     cast<<<grid_size(block_size * mask_size), BLOCK_SIZE, 0, stream>>>(
         mask_slice.data,
@@ -841,7 +902,11 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         Prec* st = &pol->buffer_states[buf];
 
         int sub = start + off;
+#ifdef PUFFER_PACKED_OBS
+		Byte obs_b  = puf_slice(rollouts.observations, t, sub, n);
+#else
         Prec obs_b  = puf_slice(rollouts.observations, t, sub, n);
+#endif
         Float act_b = puf_slice(rollouts.actions,      t, sub, n);
         Prec lp_b   = puf_slice(rollouts.logprobs,     t, sub, n);
         Prec val_b  = puf_slice(rollouts.values,       t, sub, n);
@@ -861,19 +926,17 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
 
         Prec dec = arch_forward(&pol->arch, *w, *acts, obs_b, *st, stream);
 
-        Prec p_logstd = {};
-        DecoderWeights* dw = (DecoderWeights*)w->decoder;
-        if (dw->continuous) {
-            p_logstd = dw->logstd;
-        }
+		Sampling sampling = {
+            .output = dec, .actions = act_b, .mask = mask_b, .values = val_b,
+            .logprobs = lp_b, .action_sizes = pufferl->act_sizes,
+            .rng = pufferl->rng_states[buf] + off,
+        };
+        pol->arch.decoder.sample(w->decoder,
+            acts->decoder, sampling, stream);
 
-        // Offset RNG by off so policies don't collide on per-buffer rng slots.
-        sample_logits<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-            dec, p_logstd, pufferl->act_sizes,
-            act_b.data, env->actions.data + (long)sub * act_cols,
-            lp_b.data, val_b.data,
-            pufferl->rng_states[buf] + off,
-            mask_b.data, mask_stride);
+        cudaMemcpyAsync(env->actions.data + (long)sub * act_cols,
+            act_b.data, numel(act_b.shape) * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream);
     }
 }
 
@@ -1404,33 +1467,58 @@ static Float slice_rows(Float p, int off, int n) {
     return out;
 }
 
+static Byte slice_rows(Byte p, int off, int n) {
+    int row = 1;
+    for (int i = 1; i < PUF_MAX_DIMS && p.shape[i]; i++) {
+        row *= (int)p.shape[i];
+    }
+    Byte out = p;
+    out.data = p.data + (int64_t)off * row;
+    out.shape[0] = n;
+    return out;
+}
+
 // Transpose (A, B, C) → (B, A, C). Sequential, coalesced on dest rows.
 // Two types: actions are float32 (large discrete IDs); everything else is Prec.
 __global__ void transpose_102(precision_t* dst, const precision_t* src,
-        int A, int B, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = A * B * C;
+        long A, long B, long C) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = A * B * C;
     if (idx >= total) {
         return;
     }
-    int a = idx / (B * C);
-    int rem = idx % (B * C);
-    int b = rem / C;
-    int c = rem % C;
+    long a = idx / (B * C);
+    long rem = idx % (B * C);
+    long b = rem / C;
+    long c = rem % C;
+    dst[b * A * C + a * C + c] = src[idx];
+}
+
+__global__ void transpose_102(unsigned char* dst, const unsigned char* src,
+        long A, long B, long C) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = A * B * C;
+    if (idx >= total) {
+        return;
+    }
+    long a = idx / (B * C);
+    long rem = idx % (B * C);
+    long b = rem / C;
+    long c = rem % C;
     dst[b * A * C + a * C + c] = src[idx];
 }
 
 #if !defined(PRECISION_FLOAT)
-__global__ void transpose_102(float* dst, const float* src, int A, int B, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = A * B * C;
+__global__ void transpose_102(float* dst, const float* src, long A, long B, long C) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = A * B * C;
     if (idx >= total) {
         return;
     }
-    int a = idx / (B * C);
-    int rem = idx % (B * C);
-    int b = rem / C;
-    int c = rem % C;
+    long a = idx / (B * C);
+    long rem = idx % (B * C);
+    long b = rem / C;
+    long c = rem % C;
     dst[b * A * C + a * C + c] = src[idx];
 }
 #endif
@@ -1469,19 +1557,19 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     int obs_size = (int)src.observations.shape[2];
     int num_atns = (int)src.actions.shape[2];
     int mask_c = src.action_mask.shape[2];
-    transpose_102<<<grid_size(T * B * obs_size), BLOCK_SIZE, 0, stream>>>(
+    transpose_102<<<grid_size((long)T * B * obs_size), BLOCK_SIZE, 0, stream>>>(
         rollouts->observations.data, src.observations.data, T, B, obs_size);
-    transpose_102<<<grid_size(T * B * num_atns), BLOCK_SIZE, 0, stream>>>(
+    transpose_102<<<grid_size((long)T * B * num_atns), BLOCK_SIZE, 0, stream>>>(
         rollouts->actions.data, src.actions.data, T, B, num_atns);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
+    transpose_102<<<grid_size((long)T * B), BLOCK_SIZE, 0, stream>>>(
         rollouts->logprobs.data, src.logprobs.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
+    transpose_102<<<grid_size((long)T * B), BLOCK_SIZE, 0, stream>>>(
         rollouts->rewards.data, src.rewards.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
+    transpose_102<<<grid_size((long)T * B), BLOCK_SIZE, 0, stream>>>(
         rollouts->terminals.data, src.terminals.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
+    transpose_102<<<grid_size((long)T * B), BLOCK_SIZE, 0, stream>>>(
         rollouts->values.data, src.values.data, T, B, 1);
-    transpose_102<<<grid_size(T * B * mask_c), BLOCK_SIZE, 0, stream>>>(
+    transpose_102<<<grid_size((long)T * B * mask_c), BLOCK_SIZE, 0, stream>>>(
         rollouts->action_mask.data, src.action_mask.data, T, B, mask_c);
 
     clamp_precision_kernel<<<grid_size(
@@ -1538,11 +1626,16 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             hypers->vtrace_rho_clip, hypers->vtrace_c_clip, Nmb, Tmb);
         graph.mb_returns = graph.mb_gae_v;
 
-        ppo_loss_fwd_bwd(dec, p_logstd, graph,
-            pufferl->act_sizes, pufferl->losses,
-            hypers->clip_coef, hypers->vf_clip_coef, hypers->vf_coef,
-            pufferl->ppo_bufs.ent_coef,
-            pufferl->ppo_bufs, pufferl->is_continuous, stream);
+		LossInput loss = {
+            .output = dec, .actions = graph.mb_actions, .mask = graph.mb_action_mask,
+            .importance = graph.mb_imp, .advantages = graph.mb_advantages,
+            .values = graph.mb_values, .returns = graph.mb_returns,
+            .old_logprobs = graph.mb_logprobs, .action_sizes = pufferl->act_sizes,
+            .clip_coef = hypers->clip_coef, .vf_clip_coef = hypers->vf_clip_coef,
+            .vf_coef = hypers->vf_coef, .ent_coef = pufferl->ppo_bufs.ent_coef,
+        };
+        primary->arch.decoder.loss(primary->weights.decoder,
+            pufferl->train_activs.decoder, loss, pufferl->ppo_bufs, pufferl->losses, stream);
 
         Float grad_logits = pufferl->ppo_bufs.grad_logits;
         Float grad_logstd = pufferl->is_continuous
@@ -1850,7 +1943,11 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         && "GPU env backend does not support selfplay or multi-policy (match)");
 
     // Discrete action layout. Continuous dims are size 1. Mask width is act_n.
+#ifdef POLICY_NUM_ATNS
+    int num_action_heads = POLICY_NUM_ATNS;
+#else
     int num_action_heads = NUM_ATNS;
+#endif
     int act_sizes[] = ACT_SIZES;
     int act_n = 0;
     int n_cont = 0;
@@ -1869,7 +1966,13 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     pufferl->is_continuous = is_continuous;
     vec->num_policies = num_policies;
     vec->policy_layout = (int*)calloc(1, (vec->num_policies + 1) * sizeof(int));
-    vec->mask_size = act_n;
+    int mask_size = act_n;
+#ifdef ACTION_MASK_SIZE
+    mask_size = ACTION_MASK_SIZE;
+#elif defined(ACTION_MASK)
+    mask_size = ACTION_MASK;
+#endif
+    vec->mask_size = mask_size;
 
     // Device env IO (EnvBuf).
     pufferl->env = {
@@ -1877,10 +1980,10 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .actions =     {.shape = {total_agents, NUM_ATNS}},
         .rewards =     {.shape = {total_agents}},
         .terminals =   {.shape = {total_agents}},
-        .action_mask = {.shape = {total_agents, act_n}},
+        .action_mask = {.shape = {total_agents, mask_size}},
     };
     EnvBuf* env = &pufferl->env;
-    size_t mask_bytes = total_agents * act_n * sizeof(unsigned char);
+    size_t mask_bytes = total_agents * mask_size * sizeof(unsigned char);
     cudaMalloc((void**)&env->obs.data, total_agents * OBS_SIZE * sizeof(obs_t));
     cudaMalloc((void**)&env->actions.data, total_agents * NUM_ATNS * sizeof(float));
     cudaMalloc((void**)&env->rewards.data, total_agents * sizeof(float));
@@ -1973,7 +2076,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     pufferl->async_num_slots = async_slots;
     int rollout_horizon = async_slots * horizon;
     register_rollout_buffers(&pufferl->rollouts,
-        acts, rollout_horizon, total_agents, input_size, num_action_heads, act_n);
+        acts, rollout_horizon, total_agents, input_size, NUM_ATNS, mask_size);
     // Carry path: per-slot initial RNN states. reset_every_horizon zeros train_state.
     if (!hypers.reset_every_horizon) {
         pufferl->rollouts.initial_states = {
@@ -1982,9 +2085,10 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     }
     register_train_buffers(pufferl->train_buf, acts, minibatch_segments, horizon);
     register_rollout_buffers(&pufferl->train_rollouts,
-        acts, total_agents, horizon, input_size, num_action_heads, act_n);
+        acts, total_agents, horizon, input_size, NUM_ATNS, mask_size);
     register_ppo_buffers(pufferl->ppo_bufs, acts, minibatch_segments,
-        hypers.horizon, decoder_output_size, is_continuous);
+        hypers.horizon, primary->arch.decoder.output_dim, is_continuous,
+        primary->arch.decoder.loss_rows_per_block);
     pufferl->train_state = {.shape = {num_layers, total_agents, hidden_size}};
     alloc_register(acts, &pufferl->train_state);
 
@@ -2099,6 +2203,98 @@ void close_pufferl(PuffeRL* p) {
     }
     nvmlShutdown();
     env_close(p->vec);
+    for (int b = 0; b < p->num_policies; b++) {
+        Policy* pol = &p->policies[b];
+        if (USE_BF16) {
+            cudaFree(pol->master_weights.data);
+            pol->master_weights.data = NULL;
+        }
+        cudaFree(pol->params_alloc.mem);
+        pol->params_alloc.mem = NULL;
+        if (pol->frozen) {
+            cudaFree(pol->activ_alloc.mem);
+            pol->activ_alloc.mem = NULL;
+        }
+    }
+    if (p->hypers.async) {
+        cudaFree(p->weight_alloc.mem);
+        p->weight_alloc.mem = NULL;
+    }
+    cudaFree(p->grads_alloc.mem);
+    cudaFree(p->activ_alloc.mem);
+    p->grads_alloc.mem = NULL;
+    p->activ_alloc.mem = NULL;
+    cudaFree(p->env.obs.data);
+    cudaFree(p->env.actions.data);
+    cudaFree(p->env.rewards.data);
+    cudaFree(p->env.terminals.data);
+    cudaFree(p->env.action_mask.data);
+    p->env.obs.data = NULL;
+    p->env.actions.data = NULL;
+    p->env.rewards.data = NULL;
+    p->env.terminals.data = NULL;
+    p->env.action_mask.data = NULL;
+    if (p->rng_states) {
+        for (int i = 0; i < p->vec->buffers; i++) {
+            cudaFree(p->rng_states[i]);
+        }
+    }
+    cudaFree(p->rng_offset);
+    cudaFree(p->act_sizes);
+    cudaFree(p->losses);
+    p->rng_offset = NULL;
+    p->act_sizes = NULL;
+    p->losses = NULL;
+    cudaFree(p->muon.lr);
+    cudaFree(p->muon.grad_norm);
+    cudaFree(p->muon.ns_norm);
+    cudaFree(p->muon.norm_partials);
+    p->muon.lr = NULL;
+    p->muon.grad_norm = NULL;
+    p->muon.ns_norm = NULL;
+    p->muon.norm_partials = NULL;
+    cudaFree(p->ppo_bufs.ent_coef);
+    p->ppo_bufs.ent_coef = NULL;
+    cudaFree(p->profile.stamps);
+    p->profile.stamps = NULL;
+    if (p->profile.rollout_ev) {
+        for (int i = 0; i < EV_T * p->hypers.horizon; i++) {
+            if (p->profile.rollout_ev[i]) {
+                cudaEventDestroy(p->profile.rollout_ev[i]);
+            }
+        }
+    }
+    if (p->streams) {
+        for (int i = 0; i < p->vec->buffers; i++) {
+            if (p->streams[i]) {
+                cudaStreamDestroy(p->streams[i]);
+                p->streams[i] = NULL;
+            }
+        }
+    }
+    if (p->train_stream) {
+        cudaStreamDestroy(p->train_stream);
+        p->train_stream = NULL;
+    }
+    if (p->rollout_graphs) {
+        int n = p->async_num_slots * p->hypers.horizon * p->vec->buffers;
+        for (int i = 0; i < n; i++) {
+            if (p->rollout_graphs[i]) {
+                cudaGraphExecDestroy(p->rollout_graphs[i]);
+                p->rollout_graphs[i] = NULL;
+            }
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        if (p->gpu_rollout_graph[i]) {
+            cudaGraphExecDestroy(p->gpu_rollout_graph[i]);
+            p->gpu_rollout_graph[i] = NULL;
+        }
+        if (p->train_cudagraph[i]) {
+            cudaGraphExecDestroy(p->train_cudagraph[i]);
+            p->train_cudagraph[i] = NULL;
+        }
+    }
 }
 
 // Dashboard
