@@ -193,6 +193,11 @@ typedef struct Action {
     uint8_t selection[MAX_SELECTION];
 } Action;
 
+/* Reward shaping constants. Per-step reward stays inside [-1, 1]. */
+#define WIN_BONUS 1.0
+#define WEALTH_NORM_DIVISOR 25.0
+#define WEALTH_NORM 2.1972245773362196 /* log1p(200 / 25): wealth potential saturates slowly past $200. */
+
 typedef struct Config {
     uint8_t deck;
     uint8_t stake;
@@ -200,11 +205,16 @@ typedef struct Config {
     uint8_t shaped_reward;
     uint8_t validation;
     uint8_t fast_rng;
-    uint8_t potential_scale;
-    float progress_reward;
-    float blind_bonus;
-    float ante_bonus; /* Maximum clear budget, reached at ante 12. */
+    float progress_reward; /* Close-out k: pays (scored/blind)^2 per scoring hand. */
+    float contact_reward; /* Linear contact: pays scored/blind per scoring hand. Split-neutral
+                             (fixed total per blind) and paid even in failed blinds, so there is
+                             always gradient toward scoring. Kept tiny next to clear bonuses. */
+    float blind_bonus; /* Small/big share of the clear pool; drives skip-neutral boss math. */
+    float ante_bonus; /* Base clear unit B; per-ante pool scales as B * escalation^(ante-1). */
     float ante_escalation; /* Geometric multiplier per ante, at least 1. */
+    float efficiency_hand; /* Bonus per unused hand left on blind clear. */
+    float efficiency_discard; /* Bonus per unused discard left on blind clear. */
+    float wealth_weight; /* Weight of the dollars+invested potential shaping term. */
 } Config;
 
 typedef struct RngStream {
@@ -256,6 +266,7 @@ typedef struct State {
     uint8_t stake_scaling;
     uint32_t actions_taken;
 
+    int32_t invested;
     uint32_t run_hands_played;
 
     Card deck[MAX_DECK];
