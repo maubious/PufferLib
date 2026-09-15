@@ -27,13 +27,13 @@ __global__ void finish_decoder_gradient(
     output[index] = from_float(column == DECODER_STATE ? value[row] : state[row * DECODER_STATE + column]);
 }
 
-__global__ void finish_parameter_gradient(precision_t* output, const float* parts, int size) {
+__global__ void finish_parameter_gradient(precision_t* output, const long* parts, int size) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= size) return;
-    float sum = 0.0f;
+    long sum = 0;
     for (int stripe = 0; stripe < condition_stripes; ++stripe)
         sum += parts[stripe * AR_CONDITION_SIZE + index];
-    output[index] = from_float(sum);
+    output[index] = from_float((float)((double)sum * (1.0 / 16777216.0)));
 }
 
 struct BalatroDecoderWeights {
@@ -43,7 +43,7 @@ struct BalatroDecoderWeights {
 
 struct BalatroDecoderActivations {
     Prec out, saved_input, grad_input, condition_scratch;
-    Float cond_accum_parts;
+    Long cond_accum_parts;
     BalatroEncoderActivations* enc;
     const float* actions;
     const precision_t* mask;
@@ -80,11 +80,11 @@ static void differentiate_actions(void* weights, void* activations,
     int batch = input.output.shape[0] * input.output.shape[1];
     int blocks = (batch + loss_threads / 32 - 1) / (loss_threads / 32);
     cudaMemsetAsync(a->cond_accum_parts.data, 0,
-        numel(a->cond_accum_parts.shape) * sizeof(float), stream);
+        numel(a->cond_accum_parts.shape) * sizeof(long), stream);
     ppo_loss_balatro<<<blocks, loss_threads, 0, stream>>>(buffers.ppo_partials.data,
         input, buffers.grad_values.data, a->decisions.data, a->coefficients.data);
     cudaMemsetAsync(buffers.grad_logits.data, 0, batch * DECODER_STATE * sizeof(float), stream);
-    backward_decisions<<<batch, 64, 0, stream>>>(input.output.data, a->entities.data,
+    backward_decisions<<<batch, 32, 0, stream>>>(input.output.data, a->entities.data,
         w->condition.data, input.actions.data, input.mask.data, a->enc->counts.data,
         a->coefficients.data, buffers.grad_logits.data, a->entity_gradient.data,
         a->cond_accum_parts.data, a->evaluations.data, batch);

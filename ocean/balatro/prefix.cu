@@ -228,7 +228,7 @@ __device__ __forceinline__ void decision_forward(Decision* s, const precision_t*
 
 __device__ __forceinline__ void decision_backward(Decision* s, const precision_t* entities,
         const precision_t* parameters, int selected, float dlogp, float dentropy,
-        float* state_gradient, float* entity_gradient, float* parameter_gradient, float* prefix_gradient) {
+        float* state_gradient, float* entity_gradient, long* parameter_gradient, float* prefix_gradient) {
     if (!s->active || __popcll(s->legal) == 1) return;
     int lane = threadIdx.x & 31;
     float gradient_query = 0.0f;
@@ -251,7 +251,7 @@ __device__ __forceinline__ void decision_backward(Decision* s, const precision_t
     float du = gradient_query * gate * sigmoid * (1.0f + u * (1.0f - sigmoid));
     atomicAdd(state_gradient + lane, du);
     atomicAdd(state_gradient + 32 + lane, gradient_query * u * sigmoid * (gate * (2.0f - gate)));
-    atomicAdd(parameter_gradient + ROLE_OFFSET + s->step * 32 + lane, du);
+    ba_fxp_atomic_add(parameter_gradient + ROLE_OFFSET + s->step * 32 + lane, du);
     if (s->last >= 0) atomicAdd(entity_gradient + s->last * ENTITY_WIDTH + lane, du);
     float normalization = s->prefix_count ? rsqrtf((float)s->prefix_count) : 0.0f;
     prefix_gradient[lane] = du * normalization;
@@ -367,8 +367,8 @@ __global__ void finish_likelihood(const precision_t* state, const float* statist
 __global__ void backward_decisions(const precision_t* state, const precision_t* entities,
         const precision_t* parameters, const float* actions, const precision_t* mask,
         const int* counts, const float* coefficients, float* state_gradient,
-        float* entity_gradient, float* parts, float* evaluations, int batch) {
-    constexpr int waves = 2;
+        float* entity_gradient, long* parts, float* evaluations, int batch) {
+    constexpr int waves = 1;
     __shared__ Decision decisions[waves];
     int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
     int row = blockIdx.x;
@@ -415,7 +415,7 @@ __global__ void backward_decisions(const precision_t* state, const precision_t* 
 // later decisions. A reverse scan replaces the quadratic prefix atomics.
 __global__ void accumulate_prefix(const precision_t* entities, const precision_t* parameters,
         const float* actions, const precision_t* mask, const int* counts,
-        const float* evaluations, float* entity_gradient, float* parts, float* raw_gradient, int batch) {
+        const float* evaluations, float* entity_gradient, long* parts, float* raw_gradient, int batch) {
     int row = blockIdx.x * 4 + threadIdx.x / 32;
     int lane = threadIdx.x & 31;
     if (row >= batch) return;
@@ -448,7 +448,7 @@ __global__ void accumulate_prefix(const precision_t* entities, const precision_t
         if (entity >= 0) {
             entity_gradient[entity * ENTITY_WIDTH + lane] +=
                 sum * to_float(parameters[ROLE_OFFSET + step * 32 + lane]);
-            atomicAdd(parts + ROLE_OFFSET + step * 32 + lane,
+            ba_fxp_atomic_add(parts + ROLE_OFFSET + step * 32 + lane,
                 sum * to_float(entities[entity * ENTITY_WIDTH + lane]));
         }
         sum += evaluations[((int64_t)row * ACTION_STORAGE_SIZE + step) * EVALUATION_WIDTH + lane];
@@ -459,7 +459,7 @@ __global__ void accumulate_prefix(const precision_t* entities, const precision_t
         float value = entity_gradient[slot * ENTITY_WIDTH + lane];
         if (slot < live)
             raw_gradient[((int64_t)row * KEY_CAP + slot) * ENTITY_WIDTH + lane] = value;
-        else atomicAdd(parts + (slot - live) * ENTITY_WIDTH + lane, value);
+        else ba_fxp_atomic_add(parts + (slot - live) * ENTITY_WIDTH + lane, value);
     }
 }
 

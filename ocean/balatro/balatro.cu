@@ -23,6 +23,7 @@ static void ensure_signatures_copied(cudaStream_t stream = 0) {
     if (!g_signatures_copied) {
         cudaMemcpyToSymbolAsync(d_CONSUMABLE_SIGNATURES, CONSUMABLE_SIGNATURES, sizeof(CONSUMABLE_SIGNATURES), 0, cudaMemcpyHostToDevice, stream);
         cudaMemcpyToSymbolAsync(d_JOKER_SIGNATURES, JOKER_SIGNATURES, sizeof(JOKER_SIGNATURES), 0, cudaMemcpyHostToDevice, stream);
+        cudaStreamSynchronize(stream);
         g_signatures_copied = true;
     }
 }
@@ -890,8 +891,8 @@ __global__ void __launch_bounds__(Threads, 4) encode_tokens(
         const unsigned char* __restrict__ obs,
         int B, int obs_size) {
     static_assert(Threads >= 32 && Threads <= 256 && Threads % 32 == 0);
-    __shared__ float s_pool_sum[POOL_SECTIONS][TOKEN_DIM];
-    __shared__ float s_special_sum[TOKEN_DIM];
+    __shared__ float s_pool_sum[Threads / 32][POOL_SECTIONS][TOKEN_DIM];
+    __shared__ float s_special_sum[Threads / 32][TOKEN_DIM];
     __shared__ unsigned long long s_pool_max[MAX_POOL_SECTIONS][TOKEN_DIM];
     __shared__ float s_raw[Threads / 32][RAW_DIM];
     __shared__ int s_counts[POOL_SECTIONS];
@@ -912,12 +913,14 @@ __global__ void __launch_bounds__(Threads, 4) encode_tokens(
     int total = s_total;
     if (threadIdx.x < POOL_SECTIONS)
         counts_out[b * POOL_SECTIONS + threadIdx.x] = s_counts[threadIdx.x];
-    for (int i = threadIdx.x; i < POOL_SECTIONS * TOKEN_DIM; i += blockDim.x) {
-        int s = i >> 5;
+    for (int i = threadIdx.x; i < (Threads / 32) * POOL_SECTIONS * TOKEN_DIM; i += blockDim.x) {
+        int s = (i >> 5) % POOL_SECTIONS;
         int d = i & 31;
-        s_pool_sum[s][d] = 0.0f;
+        int w = i / (POOL_SECTIONS * TOKEN_DIM);
+        s_pool_sum[w][s][d] = 0.0f;
     }
-    if (threadIdx.x < TOKEN_DIM) s_special_sum[threadIdx.x] = 0.0f;
+    for (int i = threadIdx.x; i < (Threads / 32) * TOKEN_DIM; i += blockDim.x)
+        ((float*)s_special_sum)[i] = 0.0f;
     for (int i = threadIdx.x; i < MAX_POOL_FEATURES; i += blockDim.x)
         s_pool_max[i >> 5][i & 31] = 0;
     for (int i = threadIdx.x; i < HAND_STRUCT_FEATURES; i += blockDim.x)
@@ -1024,7 +1027,7 @@ __global__ void __launch_bounds__(Threads, 4) encode_tokens(
         if (lane < KEY_DIM)
             keys[((int64_t)b * KEY_CAP + slot) * KEY_DIM + lane]
                 = from_float(token_value);
-        atomicAdd(&s_pool_sum[sec][lane], token_value);
+        s_pool_sum[warp][sec][lane] += token_value;
         int max_section = sec == ZONE_HAND ? 0
             : sec == ZONE_JOKER ? 1
             : sec == ZONE_CONSUMABLE ? 2
@@ -1106,8 +1109,15 @@ __global__ void __launch_bounds__(Threads, 4) encode_tokens(
         for (int k = 0; k < RAW_DIM; ++k) {
             z += to_float(token_w[lane * RAW_DIM + k]) * s_raw[warp][k];
         }
-        atomicAdd(&s_special_sum[lane], fmaxf(z, 0.0f));
+        s_special_sum[warp][lane] += fmaxf(z, 0.0f);
         __syncwarp();
+    }
+    __syncthreads();
+    for (int w = 1; w < TOKEN_WARPS; ++w) {
+        for (int i = threadIdx.x; i < POOL_SECTIONS * TOKEN_DIM; i += blockDim.x)
+            ((float*)s_pool_sum[0])[i] += ((float*)s_pool_sum[w])[i];
+        for (int i = threadIdx.x; i < TOKEN_DIM; i += blockDim.x)
+            s_special_sum[0][i] += s_special_sum[w][i];
     }
     __syncthreads();
 
@@ -1128,12 +1138,12 @@ __global__ void __launch_bounds__(Threads, 4) encode_tokens(
         int sec = c >> 5;
         int d = c & 31;
         int cnt = s_counts[sec];
-        float mean = cnt > 0 ? s_pool_sum[sec][d] / (float)cnt : 0.0f;
+        float mean = cnt > 0 ? s_pool_sum[0][sec][d] / (float)cnt : 0.0f;
         pooled[b * TOTAL + OFF_POOLED + c] = from_float(mean);
     }
     if (threadIdx.x < SPECIAL_FEATURES) {
         pooled[b * TOTAL + OFF_SPECIAL + threadIdx.x]
-            = from_float(s_special_sum[threadIdx.x] / 16.0f);
+            = from_float(s_special_sum[0][threadIdx.x] / 16.0f);
     }
     for (int i = threadIdx.x; i < HAND_STRUCT_FEATURES; i += blockDim.x) {
         pooled[b * TOTAL + OFF_HAND_STRUCT + i]
@@ -1141,7 +1151,7 @@ __global__ void __launch_bounds__(Threads, 4) encode_tokens(
     }
     for (int d = threadIdx.x; d < HAND_SUM_FEATURES; d += blockDim.x) {
         pooled[b * TOTAL + OFF_HAND_SUM + d]
-            = from_float(s_pool_sum[ZONE_HAND][d] / 8.0f);
+            = from_float(s_pool_sum[0][ZONE_HAND][d] / 8.0f);
     }
 }
 
@@ -1200,8 +1210,8 @@ __global__ void ba_token_backward_kernel(
     __shared__ float raw[TOKEN_WARPS][RAW_DIM];
     __shared__ int s_counts[POOL_SECTIONS];
     __shared__ int s_total;
-    __shared__ float s_token_b[TOKEN_DIM];
-    __shared__ float s_token_w[TOKEN_DIM][RAW_DIM];
+    __shared__ float s_token_b[TOKEN_WARPS][TOKEN_DIM];
+    __shared__ float s_token_w[TOKEN_WARPS][TOKEN_DIM][RAW_DIM];
 
     int b = blockIdx.x;
     if (b >= B) return;
@@ -1215,10 +1225,10 @@ __global__ void ba_token_backward_kernel(
         for (int s = 0; s < POOL_SECTIONS; ++s) tot += counts_data[b * POOL_SECTIONS + s];
         s_total = tot;
     }
-    for (int i = threadIdx.x; i < TOKEN_DIM; i += blockDim.x) {
-        s_token_b[i] = 0.0f;
+    for (int i = threadIdx.x; i < TOKEN_WARPS * TOKEN_DIM; i += blockDim.x) {
+        ((float*)s_token_b)[i] = 0.0f;
     }
-    for (int i = threadIdx.x; i < TOKEN_DIM * RAW_DIM; i += blockDim.x) {
+    for (int i = threadIdx.x; i < TOKEN_WARPS * TOKEN_DIM * RAW_DIM; i += blockDim.x) {
         ((float*)s_token_w)[i] = 0.0f;
     }
     __syncthreads();
@@ -1447,12 +1457,12 @@ __global__ void ba_token_backward_kernel(
             if ((flags >> f) & 1)
                 ba_fxp_atomic_add(&token_embed_acc[(TOKEN_FLAG_ROW + f) * TOKEN_DIM + d], g);
         }
-        atomicAdd(&s_token_b[d], g);
+        s_token_b[warp][d] += g;
         #pragma unroll
         for (int k = 0; k < RAW_DIM; ++k) {
             float vk = raw[warp][k];
             if (vk != 0.0f)
-                atomicAdd(&s_token_w[d][k], g * vk);
+                s_token_w[warp][d][k] += g * vk;
         }
     }
 
@@ -1547,24 +1557,33 @@ __global__ void ba_token_backward_kernel(
             if ((flags >> flag) & 1) ba_fxp_atomic_add(&token_embed_acc[
                 (TOKEN_FLAG_ROW + flag) * TOKEN_DIM + d], g);
         }
-        atomicAdd(&s_token_b[d], g);
+        s_token_b[warp][d] += g;
         #pragma unroll
         for (int k = 0; k < RAW_DIM; ++k) {
             if (raw[warp][k] != 0.0f) {
-                atomicAdd(&s_token_w[d][k], g * raw[warp][k]);
+                s_token_w[warp][d][k] += g * raw[warp][k];
             }
         }
     }
     __syncthreads();
+    for (int w = 1; w < TOKEN_WARPS; ++w) {
+        for (int i = threadIdx.x; i < TOKEN_DIM; i += blockDim.x) {
+            s_token_b[0][i] += s_token_b[w][i];
+        }
+        for (int i = threadIdx.x; i < TOKEN_DIM * RAW_DIM; i += blockDim.x) {
+            ((float*)s_token_w[0])[i] += ((float*)s_token_w[w])[i];
+        }
+    }
+    __syncthreads();
     if (threadIdx.x < TOKEN_DIM) {
-        float gb = s_token_b[threadIdx.x];
+        float gb = s_token_b[0][threadIdx.x];
         if (gb != 0.0f)
             ba_fxp_atomic_add(&token_b_acc[threadIdx.x], gb);
     }
     for (int i = threadIdx.x; i < TOKEN_DIM * RAW_DIM; i += blockDim.x) {
         int d_idx = i / RAW_DIM;
         int k_idx = i % RAW_DIM;
-        float gw = s_token_w[d_idx][k_idx];
+        float gw = s_token_w[0][d_idx][k_idx];
         if (gw != 0.0f)
             ba_fxp_atomic_add(&token_w_acc[i], gw);
     }
