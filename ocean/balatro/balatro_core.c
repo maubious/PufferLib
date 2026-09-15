@@ -4120,11 +4120,14 @@ void default_config(Config *config) {
         .stake = 1,
         .win_ante = 8,
         .fast_rng = 0,
-        .potential_scale = 244,
-        .progress_reward = 0.2f,
-        .blind_bonus = 0.231837213f,
-        .ante_bonus = 0.8f,
-        .ante_escalation = 1.2f,
+        .progress_reward = 0.02f,
+        .contact_reward = 0.01f,
+        .blind_bonus = 0.211766914f,
+        .ante_bonus = 0.09f,
+        .ante_escalation = 1.3f,
+        .efficiency_hand = 0.02f,
+        .efficiency_discard = 0.01f,
+        .wealth_weight = 0.1f,
     };
 }
 
@@ -4274,6 +4277,8 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
     if (!masks && !action_is_legal(state, action)) return ERR_ACTION;
     double previous_chips = state->chips;
     double previous_blind_chips = state->blind_chips;
+    double previous_dollars = (double)state->dollars;
+    double previous_invested = (double)state->invested;
     uint8_t ante = state->ante;
     uint8_t previous_phase = state->phase;
     uint8_t previous_blind_on_deck = state->blind_on_deck;
@@ -4447,51 +4452,71 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
     if (state->config.shaped_reward) {
         double reward = 0.0;
 
+        {
+            double dollar_delta = (double)state->dollars - previous_dollars;
+            switch (action->type) {
+            case ACTION_BUY_CARD:
+            case ACTION_BUY_AND_USE:
+            case ACTION_REDEEM_VOUCHER:
+            case ACTION_REROLL:
+            case ACTION_REROLL_BOSS:
+                if (dollar_delta < 0.0) state->invested -= (int32_t)dollar_delta;
+                break;
+            case ACTION_SELL_JOKER:
+            case ACTION_SELL_CONSUMABLE:
+                if (dollar_delta > 0.0) {
+                    state->invested -= (int32_t)dollar_delta;
+                    if (state->invested < 0) state->invested = 0;
+                }
+                break;
+            default:
+                break;
+            }
+            double prev_wealth = previous_dollars + previous_invested;
+            double cur_wealth = (double)state->dollars + (double)state->invested;
+            if (prev_wealth < 0.0) prev_wealth = 0.0;
+            if (cur_wealth < 0.0) cur_wealth = 0.0;
+            if (state->terminal) cur_wealth = 0.0;
+            reward += (double)state->config.wealth_weight *
+                (log1p(cur_wealth / WEALTH_NORM_DIVISOR) -
+                 log1p(prev_wealth / WEALTH_NORM_DIVISOR)) / WEALTH_NORM;
+        }
+    
         if (action->type == ACTION_PLAY_HAND &&
             isfinite(previous_chips) && previous_chips >= 0.0 &&
             isfinite(previous_blind_chips) && previous_blind_chips > 0.0 &&
             state->last_hand_score > 0.0) {
-            double delta = 0.0;
-            if (state->config.potential_scale) {
-                double scale = state->config.potential_scale;
-                double normalizer = log1p(scale);
-                double previous_ratio = previous_chips / previous_blind_chips;
-                double current_ratio = state->chips / previous_blind_chips;
-                double previous_potential = log1p(scale * previous_ratio) / normalizer;
-                double current_potential = log1p(scale * current_ratio) / normalizer;
-                delta = current_potential - previous_potential;
-                if (delta < 0.0) delta = 0.0;
-                if (delta > 1.0) delta = 1.0;
-            } else {
-                double chips_remaining = previous_blind_chips - previous_chips;
-                if (chips_remaining > 0.0) {
-                    double credited_chips = state->last_hand_score;
-                    if (credited_chips > chips_remaining)
-                        credited_chips = chips_remaining;
-                    delta = credited_chips / previous_blind_chips;
-                }
-            }
-            reward += state->config.progress_reward * delta;
+            double frac = state->last_hand_score / previous_blind_chips;
+            if (frac > 1.0) frac = 1.0;
+            if (frac < 0.0) frac = 0.0;
+            reward += state->config.contact_reward * frac;
+            reward += state->config.progress_reward * frac * frac;
         }
 
         if (action->type == ACTION_PLAY_HAND &&
             previous_phase == PHASE_SELECTING_HAND &&
             (state->phase == PHASE_ROUND_EVAL || state->won)) {
-            double esc_term = pow(state->config.ante_escalation, fmin(ante, 12) - 12.0);
-            double budget = state->config.ante_bonus * (0.7 + 0.3 * esc_term);
+            double pool = state->config.ante_bonus * pow(state->config.ante_escalation, (double)ante - 1.0);
             double per_blind_frac = (double)state->config.blind_bonus;
             double boss_frac = 1.0 - (double)state->config.blind_bonus
                 * (double)(2 - __builtin_popcount(
                     (unsigned)(previous_blind_skipped_mask & 3u)));
             if (boss_frac < 0.0) boss_frac = 0.0;
-            if (previous_blind_on_deck < 2) {
-                reward += budget * per_blind_frac;
+            if (previous_blind_on_deck == 0) {
+                reward += pool * 0.8 * per_blind_frac;
+            } else if (previous_blind_on_deck == 1) {
+                reward += pool * 1.2 * per_blind_frac;
             } else {
-                reward += budget * boss_frac;
+                reward += pool * boss_frac;
             }
-
+            reward += state->config.efficiency_hand * (double)state->hands_left;
+            reward += state->config.efficiency_discard * (double)state->discards_left;
         }
-        if (reward < 0.0) reward = 0.0;
+
+        if (state->won) {
+            reward += WIN_BONUS;
+        }
+        if (reward < -1.0) reward = -1.0;
         if (reward > 1.0) reward = 1.0;
         out->reward = (float)reward;
     }
