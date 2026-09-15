@@ -79,7 +79,7 @@ POLICY_INLINE int policy_selection_entry(int type, int primary) {
 #define ACT_SIZES {23, POLICY_PRIMARY_COUNT, 6, 64, 64, 64, 64, 64, 64, 32}
 #define ACTION_MASK_SIZE POLICY_MASK_SIZE
 #define INVALID_ACTION_REWARD (-0.002f)
-#define TIMEOUT_REWARD (-1.0f)
+#define TIMEOUT_REWARD (0.0f)
 
 typedef struct ScoreAnim {
     bool pending;
@@ -404,28 +404,31 @@ void puf_init(Env *env, Dict *kwargs) {
     DictItem *max_episode_steps = dict_find(kwargs, "max_episode_steps");
     DictItem *invalid_action_reward = dict_find(kwargs, "invalid_action_reward");
     DictItem *fast_rng = dict_find(kwargs, "fast_rng");
-    DictItem *potential_scale = dict_find(kwargs, "potential_scale");
     DictItem *reorder_actions = dict_find(kwargs, "reorder_actions");
 #define FLOAT_REWARD_OPT(name, field, cmp) do { \
     DictItem *item = dict_find(kwargs, name); \
     if (item) { assert(item->value cmp 0.0); env->config.field = (float)item->value; } \
 } while (0)
     FLOAT_REWARD_OPT("progress_reward", progress_reward, >=);
+	FLOAT_REWARD_OPT("contact_reward", contact_reward, >=);
     FLOAT_REWARD_OPT("blind_bonus", blind_bonus, >=);
     FLOAT_REWARD_OPT("ante_bonus", ante_bonus, >=);
     FLOAT_REWARD_OPT("ante_escalation", ante_escalation, >=);
+	FLOAT_REWARD_OPT("efficiency_hand", efficiency_hand, >=);
+	FLOAT_REWARD_OPT("efficiency_discard", efficiency_discard, >=);
+	FLOAT_REWARD_OPT("wealth_weight", wealth_weight, >=);
 #undef FLOAT_REWARD_OPT
     assert(env->config.blind_bonus <= 0.5f);
     assert(env->config.ante_bonus <= 0.8f);
     assert(env->config.ante_escalation >= 1.0f);
+	assert(env->config.ante_escalation <= 2.0f);
     assert(env->config.progress_reward <= 0.2f);
+	assert(env->config.contact_reward <= 0.2f);
+	assert(env->config.efficiency_hand <= 0.5f);
+	assert(env->config.efficiency_discard <= 0.5f);
+	assert(env->config.wealth_weight <= 1.0f);
     env->config.shaped_reward = shaped ? (shaped->value != 0.0) : 1;
     env->reorder_actions = reorder_actions && reorder_actions->value != 0.0;
-    if (potential_scale) {
-        assert(potential_scale->value >= 0.0 && potential_scale->value <= UINT8_MAX);
-        assert(potential_scale->value == (double)(uint8_t)potential_scale->value);
-        env->config.potential_scale = (uint8_t)potential_scale->value;
-    }
     env->config.fast_rng = fast_rng ? (fast_rng->value != 0.0) : 1;
     env->invalid_action_reward = invalid_action_reward
         ? (float)invalid_action_reward->value : INVALID_ACTION_REWARD;
