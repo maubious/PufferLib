@@ -619,7 +619,7 @@ Prec encoder_forward(void* w, void* activations, Prec input, cudaStream_t stream
     EncoderActivations* a = (EncoderActivations*)activations;
     // Train acts register saved_input; rollout acts leave it null.
     if (a->saved_input.data) {
-        puf_copy(&a->saved_input, &input, stream);
+        a->saved_input = input;
     }
     puf_mm(&input, &ew->weight, &a->out, stream);
     return a->out;
@@ -679,7 +679,7 @@ Prec decoder_forward(void* w, void* activations, Prec input, cudaStream_t stream
     DecoderWeights* dw = (DecoderWeights*)w;
     DecoderActivations* a = (DecoderActivations*)activations;
     if (a->saved_input.data) {
-        puf_copy(&a->saved_input, &input, stream);
+        a->saved_input = input;
     }
     puf_mm(&input, &dw->weight, &a->out, stream);
     return a->out;
@@ -881,9 +881,8 @@ Prec mingru_forward(void* w, Prec x, Prec state,
         Prec state_i = mingru_state_layer(state, i, 0, B);
         puf_mm(&x, &m->weights[i], &a->combined[i], stream);
         mingru_gate<<<grid_size(B*H), BLOCK_SIZE, 0, stream>>>(
-            a->out.data, a->next_state.data,
+            a->out.data, state_i.data,
             a->combined[i].data, state_i.data, x.data, H, B);
-        puf_copy(&state_i, &a->next_state, stream);
         x = a->out;
     }
     return x;
@@ -895,7 +894,7 @@ Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
     MinGRUActivations* a = (MinGRUActivations*)activations;
     int B = (int)x.shape[0];
     for (int i = 0; i < m->num_layers; i++) {
-        puf_copy(&a->saved_inputs[i], &x, stream);
+        a->saved_inputs[i] = x;
         Prec state_i = mingru_state_layer(state, i, agent_off, B);
         puf_mm(&x, &m->weights[i], &a->combined_bufs[i], stream);
         PrefixScan& scan = a->scan_bufs[i];

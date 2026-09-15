@@ -1210,8 +1210,8 @@ __global__ void ba_token_backward_kernel(
     __shared__ float raw[TOKEN_WARPS][RAW_DIM];
     __shared__ int s_counts[POOL_SECTIONS];
     __shared__ int s_total;
-    __shared__ float s_token_b[TOKEN_WARPS][TOKEN_DIM];
-    __shared__ float s_token_w[TOKEN_WARPS][TOKEN_DIM][RAW_DIM];
+    __shared__ float s_token_b[TOKEN_DIM];
+    __shared__ float s_token_w[TOKEN_DIM][RAW_DIM];
 
     int b = blockIdx.x;
     if (b >= B) return;
@@ -1225,10 +1225,10 @@ __global__ void ba_token_backward_kernel(
         for (int s = 0; s < POOL_SECTIONS; ++s) tot += counts_data[b * POOL_SECTIONS + s];
         s_total = tot;
     }
-    for (int i = threadIdx.x; i < TOKEN_WARPS * TOKEN_DIM; i += blockDim.x) {
-        ((float*)s_token_b)[i] = 0.0f;
+    for (int i = threadIdx.x; i < TOKEN_DIM; i += blockDim.x) {
+        s_token_b[i] = 0.0f;
     }
-    for (int i = threadIdx.x; i < TOKEN_WARPS * TOKEN_DIM * RAW_DIM; i += blockDim.x) {
+    for (int i = threadIdx.x; i < TOKEN_DIM * RAW_DIM; i += blockDim.x) {
         ((float*)s_token_w)[i] = 0.0f;
     }
     __syncthreads();
@@ -1236,6 +1236,8 @@ __global__ void ba_token_backward_kernel(
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x / 32;
     int d = lane;
+    float part_b = 0.0f;
+    float part_w[RAW_DIM] = {};
     int total = s_total;
     int64_t in = (int64_t)b * obs_size;
     int base = offsetof(Observation, globals);
@@ -1457,12 +1459,12 @@ __global__ void ba_token_backward_kernel(
             if ((flags >> f) & 1)
                 ba_fxp_atomic_add(&token_embed_acc[(TOKEN_FLAG_ROW + f) * TOKEN_DIM + d], g);
         }
-        s_token_b[warp][d] += g;
+        part_b += g;
         #pragma unroll
         for (int k = 0; k < RAW_DIM; ++k) {
             float vk = raw[warp][k];
             if (vk != 0.0f)
-                s_token_w[warp][d][k] += g * vk;
+                part_w[k] += g * vk;
         }
     }
 
@@ -1557,33 +1559,33 @@ __global__ void ba_token_backward_kernel(
             if ((flags >> flag) & 1) ba_fxp_atomic_add(&token_embed_acc[
                 (TOKEN_FLAG_ROW + flag) * TOKEN_DIM + d], g);
         }
-        s_token_b[warp][d] += g;
+        part_b += g;
         #pragma unroll
         for (int k = 0; k < RAW_DIM; ++k) {
             if (raw[warp][k] != 0.0f) {
-                s_token_w[warp][d][k] += g * raw[warp][k];
+                part_w[k] += g * raw[warp][k];
             }
         }
     }
-    __syncthreads();
-    for (int w = 1; w < TOKEN_WARPS; ++w) {
-        for (int i = threadIdx.x; i < TOKEN_DIM; i += blockDim.x) {
-            s_token_b[0][i] += s_token_b[w][i];
+    for (int w = 0; w < TOKEN_WARPS; ++w) {
+        if (warp == w) {
+            s_token_b[d] += part_b;
+            #pragma unroll
+            for (int k = 0; k < RAW_DIM; ++k) {
+                s_token_w[d][k] += part_w[k];
+            }
         }
-        for (int i = threadIdx.x; i < TOKEN_DIM * RAW_DIM; i += blockDim.x) {
-            ((float*)s_token_w[0])[i] += ((float*)s_token_w[w])[i];
-        }
+        __syncthreads();
     }
-    __syncthreads();
     if (threadIdx.x < TOKEN_DIM) {
-        float gb = s_token_b[0][threadIdx.x];
+        float gb = s_token_b[threadIdx.x];
         if (gb != 0.0f)
             ba_fxp_atomic_add(&token_b_acc[threadIdx.x], gb);
     }
     for (int i = threadIdx.x; i < TOKEN_DIM * RAW_DIM; i += blockDim.x) {
         int d_idx = i / RAW_DIM;
         int k_idx = i % RAW_DIM;
-        float gw = s_token_w[0][d_idx][k_idx];
+        float gw = s_token_w[d_idx][k_idx];
         if (gw != 0.0f)
             ba_fxp_atomic_add(&token_w_acc[i], gw);
     }

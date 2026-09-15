@@ -95,7 +95,7 @@ static Prec decode(void* weights, void* activations, Prec input, cudaStream_t st
     auto* w = (BalatroDecoderWeights*)weights;
     auto* a = (BalatroDecoderActivations*)activations;
     int batch = input.shape[0];
-    if (a->saved_input.data) puf_copy(&a->saved_input, &input, stream);
+    if (a->saved_input.data) a->saved_input = input;
     puf_mm(&input, &w->weight, &a->out, stream);
     cache_entities<<<batch, 256, 0, stream>>>(
         a->entities.data, a->enc->keys.data, w->condition.data, a->enc->counts.data, a->entity_gradient.data);
