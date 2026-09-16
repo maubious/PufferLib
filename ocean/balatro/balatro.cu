@@ -1211,7 +1211,9 @@ __global__ void ba_token_backward_kernel(
     __shared__ int s_counts[POOL_SECTIONS];
     __shared__ int s_total;
     __shared__ float s_token_b[TOKEN_DIM];
-    __shared__ float s_token_w[TOKEN_DIM][RAW_DIM];
+    // Consecutive lanes merge different rows at the same k. Padding avoids
+    // shared-memory bank conflicts without changing the serial warp sum order.
+    __shared__ float s_token_w[TOKEN_DIM][RAW_DIM + 1];
 
     int b = blockIdx.x;
     if (b >= B) return;
@@ -1229,7 +1231,7 @@ __global__ void ba_token_backward_kernel(
         s_token_b[i] = 0.0f;
     }
     for (int i = threadIdx.x; i < TOKEN_DIM * RAW_DIM; i += blockDim.x) {
-        ((float*)s_token_w)[i] = 0.0f;
+        s_token_w[i / RAW_DIM][i % RAW_DIM] = 0.0f;
     }
     __syncthreads();
 

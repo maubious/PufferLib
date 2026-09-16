@@ -1098,6 +1098,7 @@ Arch build_arch(int input_size, int hidden_size,
 __global__ void muon_sum_sq_partials(float* __restrict__ partials,
         const precision_t* __restrict__ src, int n) {
     __shared__ float sdata[256];
+    src += (long)blockIdx.y * n;
     int tid = threadIdx.x;
     float sum = 0.0f;
     for (int i = blockIdx.x * blockDim.x + tid; i < n; i += blockDim.x * gridDim.x) {
@@ -1105,15 +1106,17 @@ __global__ void muon_sum_sq_partials(float* __restrict__ partials,
         sum += v * v;
     }
     sdata[tid] = sum;
-    block_reduce_sum(sdata, &partials[blockIdx.x], tid, blockDim.x, 1);
+    block_reduce_sum(sdata, &partials[blockIdx.y * gridDim.x + blockIdx.x],
+        tid, blockDim.x, 1);
 }
 
 __global__ void muon_sum_sq_reduce(float* __restrict__ out,
         const float* __restrict__ partials, int num_blocks) {
     __shared__ float sdata[256];
     int tid = threadIdx.x;
+    partials += blockIdx.y * num_blocks;
     sdata[tid] = (tid < num_blocks) ? partials[tid] : 0.0f;
-    block_reduce_sum(sdata, out, tid, blockDim.x, 1);
+    block_reduce_sum(sdata, out + blockIdx.y, tid, blockDim.x, 1);
 }
 
 // Global grad clip by L2, then Nesterov into f32 momentum buffer.
@@ -1133,7 +1136,8 @@ __global__ void muon_clip_nesterov(float* __restrict__ mb,
 // x *= 1 / max(sqrt(sum_sq), eps)  — NS input normalize
 __global__ void muon_l2_normalize(precision_t* __restrict__ dst,
         const float* __restrict__ sum_sq_ptr, float eps, int n) {
-    float inv_norm = 1.0f / fmaxf(sqrtf(*sum_sq_ptr), eps);
+    dst += (long)blockIdx.y * n;
+    float inv_norm = 1.0f / fmaxf(sqrtf(sum_sq_ptr[blockIdx.y]), eps);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         dst[idx] = from_float(to_float(dst[idx]) * inv_norm);
@@ -1177,33 +1181,67 @@ struct Muon {
     float* lr;
     float* grad_norm;
     float* ns_norm;
-    float* norm_partials;  // 256
+    float* norm_partials;  // 256 per matrix in the largest group
     Float mb;              // flat momentum buffer (param-sized)
     Prec gram, gram_buf, x_buf;
     Allocator* param_alloc;
 };
+
+// Adjacent equal matrices are contiguous in the flat gradient buffer.
+int matrix_count(Allocator* params, int index) {
+    long* shape = params->regs[index].shape;
+    long rows = shape[0], size = numel(shape);
+    int count = 1;
+    while (index + count < params->num_regs) {
+        long* next = params->regs[index + count].shape;
+        if (ndim(next) < 2 || next[0] != rows || numel(next) != size) break;
+        ++count;
+    }
+    return count;
+}
+
+// Row-major independent products; leading dimensions must not fold the batch.
+void matrix_product(precision_t* a, precision_t* b, precision_t* out,
+        cublasOperation_t op_a, cublasOperation_t op_b,
+        int rows, int cols, int inner, int count,
+        float alpha, float beta, cudaStream_t stream) {
+    int lda = op_a == CUBLAS_OP_N ? inner : rows;
+    int ldb = op_b == CUBLAS_OP_N ? cols : inner;
+    cublasSetStream(g_cublas_handle, stream);
+    assert(cublasGemmStridedBatchedEx(g_cublas_handle, op_b, op_a,
+        cols, rows, inner, &alpha,
+        b, CUBLAS_PRECISION, ldb, (long long)inner * cols,
+        a, CUBLAS_PRECISION, lda, (long long)rows * inner, &beta,
+        out, CUBLAS_PRECISION, cols, (long long)rows * cols,
+        count, CUBLAS_COMPUTE, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS);
+}
 
 void muon_init(Muon* m, Allocator* param_alloc, double momentum, Allocator* alloc) {
     m->momentum = momentum;
     m->param_alloc = param_alloc;
     cudaMalloc((void**)&m->lr, sizeof(float));
     cudaMalloc((void**)&m->grad_norm, sizeof(float));
-    cudaMalloc((void**)&m->ns_norm, sizeof(float));
-    cudaMalloc((void**)&m->norm_partials, 256 * sizeof(float));
     m->mb = {.shape = {param_alloc->total_elems}};
     alloc_register(alloc, &m->mb);
-    long max_M = 0, max_N = 0;
-    for (int _i = 0; _i < param_alloc->num_regs; _i++) {
-        AllocEntry& e = param_alloc->regs[_i];
+    long gram_size = 0, x_size = 0;
+    int groups = 1;
+    for (int index = 0; index < param_alloc->num_regs;) {
+        AllocEntry& e = param_alloc->regs[index];
+        int count = 1;
         if (ndim(e.shape) >= 2) {
             long R = e.shape[0], C = numel(e.shape) / R;
-            max_M = max(max_M, min(R, C));
-            max_N = max(max_N, max(R, C));
+            count = matrix_count(param_alloc, index);
+            gram_size = max(gram_size, count * min(R, C) * min(R, C));
+            x_size = max(x_size, count * R * C);
+            groups = max(groups, count);
         }
+        index += count;
     }
-    m->gram =     {.shape = {max_M, max_M}};
-    m->gram_buf = {.shape = {max_M, max_M}};
-    m->x_buf =    {.shape = {max_M, max_N}};
+    cudaMalloc((void**)&m->ns_norm, groups * sizeof(float));
+    cudaMalloc((void**)&m->norm_partials, groups * 256 * sizeof(float));
+    m->gram =     {.shape = {gram_size}};
+    m->gram_buf = {.shape = {gram_size}};
+    m->x_buf =    {.shape = {x_size}};
     alloc_register(alloc, &m->gram);
     alloc_register(alloc, &m->gram_buf);
     alloc_register(alloc, &m->x_buf);
@@ -1224,55 +1262,56 @@ void muon_step(Muon* m, Float weights, Prec grads,
     // Per-param NS into workspace; write scaled update back into flat grads.
     // 1D params already hold their update in-place (scale 1).
     long offset = 0;
-    for (int _i = 0; _i < m->param_alloc->num_regs; _i++) {
-        AllocEntry& e = m->param_alloc->regs[_i];
+    for (int index = 0; index < m->param_alloc->num_regs;) {
+        AllocEntry& e = m->param_alloc->regs[index];
         precision_t* gc_ptr = grads.data + offset;
         long ne = numel(e.shape);
-        offset += ne;
         if (ndim(e.shape) < 2) {
+            offset += ne;
+            ++index;
             continue;
         }
 
+        int count = matrix_count(m->param_alloc, index);
+        index += count;
+        offset += count * ne;
         long R = e.shape[0], C = ne / R;
         long M = min(R, C);
         bool tall = R > C;
-        Prec x = {.data = gc_ptr, .shape = {R, C}};
-        Prec x_buf = {.data = m->x_buf.data, .shape = {R, C}};
-        Prec gram = {.data = m->gram.data, .shape = {M, M}};
-        Prec gram_buf = {.data = m->gram_buf.data, .shape = {M, M}};
+        Prec x = {.data = gc_ptr, .shape = {count, R, C}};
+        Prec x_buf = {.data = m->x_buf.data, .shape = {count, R, C}};
+        Prec gram = {.data = m->gram.data, .shape = {count, M, M}};
+        Prec gram_buf = {.data = m->gram_buf.data, .shape = {count, M, M}};
 
         int nblk = min((int)grid_size(ne), 256);
-        muon_sum_sq_partials<<<nblk, 256, 0, stream>>>(
+        muon_sum_sq_partials<<<dim3(nblk, count), 256, 0, stream>>>(
             m->norm_partials, x.data, (int)ne);
-        muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
+        muon_sum_sq_reduce<<<dim3(1, count), 256, 0, stream>>>(
             m->ns_norm, m->norm_partials, nblk);
-        muon_l2_normalize<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+        muon_l2_normalize<<<dim3(grid_size(ne), count), BLOCK_SIZE, 0, stream>>>(
             x.data, m->ns_norm, 1e-7f, (int)ne);
 
         // 5 steps land in x_buf. 4 = you break it.
         for (int i = 0; i < 5; ++i) {
             Prec& src = (i % 2 == 0) ? x : x_buf;
             Prec& dst = (i % 2 == 0) ? x_buf : x;
-            if (tall) {
-                puf_mm_tn(&src, &src, &gram, stream);
-            } else {
-                puf_mm(&src, &src, &gram, stream);
-            }
+            matrix_product(src.data, src.data, gram.data,
+                tall ? CUBLAS_OP_T : CUBLAS_OP_N,
+                tall ? CUBLAS_OP_N : CUBLAS_OP_T,
+                M, M, max(R, C), count, 1.0f, 0.0f, stream);
             puf_copy(&gram_buf, &gram, stream);
-            puf_mm_nn(&gram, &gram, &gram_buf, stream,
-                (float)ns_coeffs[i][2], (float)ns_coeffs[i][1]);
+            matrix_product(gram.data, gram.data, gram_buf.data,
+                CUBLAS_OP_N, CUBLAS_OP_N, M, M, M, count,
+                (float)ns_coeffs[i][2], (float)ns_coeffs[i][1], stream);
             puf_copy(&dst, &src, stream);
-            if (tall) {
-                puf_mm_nn(&src, &gram_buf, &dst,
-                    stream, 1.0f, (float)ns_coeffs[i][0]);
-            } else {
-                puf_mm_nn(&gram_buf, &src, &dst,
-                    stream, 1.0f, (float)ns_coeffs[i][0]);
-            }
+            matrix_product(tall ? src.data : gram_buf.data,
+                tall ? gram_buf.data : src.data, dst.data,
+                CUBLAS_OP_N, CUBLAS_OP_N, R, C, M, count,
+                1.0f, (float)ns_coeffs[i][0], stream);
         }
         float scale = sqrtf(fmaxf(1.0f, (float)R / (float)C));
-        muon_store_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
-            gc_ptr, x_buf.data, scale, (int)ne);
+        muon_store_update<<<grid_size(count * ne), BLOCK_SIZE, 0, stream>>>(
+            gc_ptr, x_buf.data, scale, (int)(count * ne));
     }
     muon_weight_update<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
         weights.data, grads.data, m->lr, 0.0f, n_grad);
