@@ -3767,6 +3767,7 @@ static void finish_blind(State *state) {
         state->deck[i].flags &= (uint8_t)~(CARD_DEBUFFED | CARD_FORCED | CARD_FACEDOWN);
     for (uint8_t i = 0; i < state->joker_count; ++i) state->jokers[i].flags &= (uint8_t)~CARD_DEBUFFED;
     if (state->blind_on_deck == 2) {
+        if (state->ante == 8) state->cleared_ante_8 = 1;
         if (state->config.deck == CENTER_B_ANAGLYPH) state->double_tag = 1;
         for (uint16_t i = 0; i < state->deck_count; ++i) state->deck[i].state[3] = 0;
         state->ante++;
@@ -4120,14 +4121,14 @@ void default_config(Config *config) {
         .stake = 1,
         .win_ante = 8,
         .fast_rng = 0,
-        .progress_reward = 0.02f,
+        .progress_reward = 0.01f,
         .contact_reward = 0.01f,
-        .blind_bonus = 0.211766914f,
-        .ante_bonus = 0.09f,
-        .ante_escalation = 1.3f,
-        .efficiency_hand = 0.02f,
-        .efficiency_discard = 0.01f,
-        .wealth_weight = 0.1f,
+        .blind_bonus = 0.25f,
+        .ante_bonus = 0.55f,
+        .ante_escalation = 1.1f,
+        .efficiency_hand = 0.0f,
+        .efficiency_discard = 0.0f,
+        .wealth_weight = 0.05f,
     };
 }
 
@@ -4283,6 +4284,7 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
     uint8_t previous_phase = state->phase;
     uint8_t previous_blind_on_deck = state->blind_on_deck;
     uint8_t previous_blind_skipped_mask = state->blind_skipped_mask;
+    uint8_t previous_cleared_ante_8 = state->cleared_ante_8;
     state->actions_taken++;
 
     switch (action->type) {
@@ -4451,6 +4453,12 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
     out->reward = 0.0f;
     if (state->config.shaped_reward) {
         double reward = 0.0;
+        double auxiliary = 0.0;
+        const Config *config = &state->config;
+        double auxiliary_weight = (double)config->progress_reward + config->contact_reward
+            + config->efficiency_hand + config->efficiency_discard + config->wealth_weight;
+        double auxiliary_scale = auxiliary_weight > AUX_REWARD_CAP
+            ? AUX_REWARD_CAP / auxiliary_weight : 1.0;
 
         {
             double dollar_delta = (double)state->dollars - previous_dollars;
@@ -4477,45 +4485,49 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
             if (prev_wealth < 0.0) prev_wealth = 0.0;
             if (cur_wealth < 0.0) cur_wealth = 0.0;
             if (state->terminal) cur_wealth = 0.0;
-            reward += (double)state->config.wealth_weight *
-                (log1p(cur_wealth / WEALTH_NORM_DIVISOR) -
-                 log1p(prev_wealth / WEALTH_NORM_DIVISOR)) / WEALTH_NORM;
+            auxiliary += (double)config->wealth_weight *
+                (cur_wealth / (cur_wealth + WEALTH_NORM_DIVISOR) -
+                 prev_wealth / (prev_wealth + WEALTH_NORM_DIVISOR));
         }
     
         if (action->type == ACTION_PLAY_HAND &&
             isfinite(previous_chips) && previous_chips >= 0.0 &&
             isfinite(previous_blind_chips) && previous_blind_chips > 0.0 &&
             state->last_hand_score > 0.0) {
-            double frac = state->last_hand_score / previous_blind_chips;
-            if (frac > 1.0) frac = 1.0;
-            if (frac < 0.0) frac = 0.0;
-            reward += state->config.contact_reward * frac;
-            reward += state->config.progress_reward * frac * frac;
+            double before = fmin(previous_chips / previous_blind_chips, 1.0);
+            double after = fmin(before + state->last_hand_score / previous_blind_chips, 1.0);
+            auxiliary += config->contact_reward * (after - before);
+            auxiliary += config->progress_reward * (after * after - before * before);
         }
 
-        if (action->type == ACTION_PLAY_HAND &&
-            previous_phase == PHASE_SELECTING_HAND &&
+        if (previous_phase == PHASE_SELECTING_HAND &&
             (state->phase == PHASE_ROUND_EVAL || state->won)) {
-            double pool = state->config.ante_bonus * pow(state->config.ante_escalation, (double)ante - 1.0);
-            double per_blind_frac = (double)state->config.blind_bonus;
-            double boss_frac = 1.0 - (double)state->config.blind_bonus
-                * (double)(2 - __builtin_popcount(
-                    (unsigned)(previous_blind_skipped_mask & 3u)));
-            if (boss_frac < 0.0) boss_frac = 0.0;
+            /* Bound the entire ante pool BEFORE splitting it. Replayed clears earn
+             * the same pool; lowering ante never creates a reward debit. */
+            int exponent = (ante > 0 ? ante - 1 : 0) + (ante > 8 ? ante - 8 : 0);
+            double base = fmin((double)config->ante_bonus, CLEAR_REWARD_CAP);
+            double pool = CLEAR_REWARD_CAP - (CLEAR_REWARD_CAP - base)
+                * pow((double)config->ante_escalation, -(double)exponent);
+            double small_frac = 0.8 * (double)config->blind_bonus;
+            double big_frac = 1.2 * (double)config->blind_bonus;
+            double boss_frac = 1.0 - small_frac - big_frac;
+            if (previous_blind_skipped_mask & 1u) boss_frac += small_frac;
+            if (previous_blind_skipped_mask & 2u) boss_frac += big_frac;
             if (previous_blind_on_deck == 0) {
-                reward += pool * 0.8 * per_blind_frac;
+                reward += pool * small_frac;
             } else if (previous_blind_on_deck == 1) {
-                reward += pool * 1.2 * per_blind_frac;
+                reward += pool * big_frac;
             } else {
                 reward += pool * boss_frac;
             }
-            reward += state->config.efficiency_hand * (double)state->hands_left;
-            reward += state->config.efficiency_discard * (double)state->discards_left;
+            auxiliary += config->efficiency_hand * (double)state->hands_left
+                / fmax(1.0, fmax(state->hands_per_round, state->hands_left));
+            auxiliary += config->efficiency_discard * (double)state->discards_left
+                / fmax(1.0, fmax(state->discards_per_round, state->discards_left));
         }
 
-        if (state->won) {
-            reward += WIN_BONUS;
-        }
+        if (state->cleared_ante_8 && !previous_cleared_ante_8) reward += ANTE_8_BONUS;
+        reward += auxiliary_scale * auxiliary;
         if (reward < -1.0) reward = -1.0;
         if (reward > 1.0) reward = 1.0;
         out->reward = (float)reward;
