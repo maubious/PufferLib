@@ -236,7 +236,7 @@ static inline void log_episode_end(Env *env, int won) {
     env->log.end_deck += (float)(state->deck_count + state->hand_count + state->discard_count);
     env->log.ep_length += (float)env->episode_steps;
 
-    if (state->ante >= 9) {
+    if (state->cleared_ante_8) {
         env->log.cleared_ante_8 += 1.0f;
     }
     int ante_idx = (int)state->ante - 1;
@@ -430,6 +430,7 @@ void puf_init(Env *env, Dict *kwargs) {
     env->config.shaped_reward = shaped ? (shaped->value != 0.0) : 1;
     env->reorder_actions = reorder_actions && reorder_actions->value != 0.0;
     env->config.fast_rng = fast_rng ? (fast_rng->value != 0.0) : 1;
+	assert(env->invalid_action_reward >= -1.0f && env->invalid_action_reward <= 1.0f);
     env->invalid_action_reward = invalid_action_reward
         ? (float)invalid_action_reward->value : INVALID_ACTION_REWARD;
     env->max_episode_steps = 0;
@@ -499,9 +500,6 @@ static float episode_perf(const Env *env) {
 }
 
 static void truncate_episode(Env *env) {
-    /* Truncation transition is exactly TIMEOUT_REWARD (-1). The step's shaped
-     * reward is dropped on this boundary step so the transition stays in
-     * [-1, 1] instead of clipping at -1 and erasing signal. */
     float transition_reward = TIMEOUT_REWARD;
     env->boundary_reached = 1;
     env->agents[0].terminals[0] = 1.0f;
@@ -511,6 +509,7 @@ static void truncate_episode(Env *env) {
     env->episode_reward += TIMEOUT_REWARD;
     env->log.score += env->episode_reward;
     env->log.perf += episode_perf(env);
+	env->log.ante += env->state.ante;
     log_episode_end(env, 0);
     env->log.max_hand_log10 += env->episode_peak_hand_log10;
     puf_reset(env);
