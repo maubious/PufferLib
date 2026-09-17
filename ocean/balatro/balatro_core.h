@@ -193,10 +193,11 @@ typedef struct Action {
     uint8_t selection[MAX_SELECTION];
 } Action;
 
-/* Reward shaping constants. Per-step reward stays inside [-1, 1]. */
-#define WIN_BONUS 1.0
+/* Disjoint budgets keep per-step reward inside [-1, 1] before clipping. */
+#define CLEAR_REWARD_CAP 0.80
+#define AUX_REWARD_CAP 0.15
+#define ANTE_8_BONUS 0.05
 #define WEALTH_NORM_DIVISOR 25.0
-#define WEALTH_NORM 2.1972245773362196 /* log1p(200 / 25): wealth potential saturates slowly past $200. */
 
 typedef struct Config {
     uint8_t deck;
@@ -205,16 +206,15 @@ typedef struct Config {
     uint8_t shaped_reward;
     uint8_t validation;
     uint8_t fast_rng;
-    float progress_reward; /* Close-out k: pays (scored/blind)^2 per scoring hand. */
-    float contact_reward; /* Linear contact: pays scored/blind per scoring hand. Split-neutral
-                             (fixed total per blind) and paid even in failed blinds, so there is
-                             always gradient toward scoring. Kept tiny next to clear bonuses. */
+    /* Auxiliary weights are proportionally scaled if their sum exceeds AUX_REWARD_CAP. */
+    float progress_reward; /* Increment in squared, capped cumulative blind progress. */
+    float contact_reward; /* Increment in capped cumulative blind progress; no overshoot pay. */
     float blind_bonus; /* Small/big share of the clear pool; drives skip-neutral boss math. */
-    float ante_bonus; /* Base clear unit B; per-ante pool scales as B * escalation^(ante-1). */
-    float ante_escalation; /* Geometric multiplier per ante, at least 1. */
-    float efficiency_hand; /* Bonus per unused hand left on blind clear. */
-    float efficiency_discard; /* Bonus per unused discard left on blind clear. */
-    float wealth_weight; /* Weight of the dollars+invested potential shaping term. */
+    float ante_bonus; /* Ante-1 clear pool; approaches CLEAR_REWARD_CAP from below. */
+    float ante_escalation; /* Divides the remaining gap per ante, twice per ante beyond 8. */
+    float efficiency_hand; /* Weight of unused hand fraction on blind clear. */
+    float efficiency_discard; /* Weight of unused discard fraction on blind clear. */
+    float wealth_weight; /* Weight of bounded dollars+invested potential differences. */
 } Config;
 
 typedef struct RngStream {
@@ -237,6 +237,7 @@ typedef struct State {
     uint8_t round;
     uint8_t won;
     uint8_t terminal;
+    uint8_t cleared_ante_8;
     uint8_t hands_left;
     uint8_t discards_left;
     uint8_t hands_played;
