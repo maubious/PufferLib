@@ -18,8 +18,8 @@ __global__ void sample_logits_balatro(
     int hand_count = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_HAND_COUNT_OFFSET);
     int joker_count = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_JOKER_COUNT_OFFSET);
     bool ordering = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_ENABLED_OFFSET);
-    float sum = 0.0f, last = 0.0f;
-    int length = 0;
+    float sum = 0.0f, last = 0.0f, card_sum = 0.0f;
+    int length = 0, selected_count = 0;
     float global = to_float(state.data[row * DECODER_COLUMNS + lane]);
     float gate = 2.0f / (1.0f + __expf(-2.0f * to_float(state.data[row * DECODER_COLUMNS + 32 + lane])));
     for (int step = 0; step < ACTION_STORAGE_SIZE; ++step) {
@@ -27,7 +27,14 @@ __global__ void sample_logits_balatro(
         if (step >= BASE_ACTION_HEADS && step < ORDER_JOKER_OFFSET && step >= BASE_ACTION_HEADS + hand_count) step = ORDER_JOKER_OFFSET;
         if (step >= ORDER_JOKER_OFFSET + joker_count) break;
         float role = to_float(parameters[ROLE_OFFSET + step * 32 + lane]);
-        float u = global + role + last + (length ? sum * rsqrtf((float)length) : 0.0f);
+        float u;
+        if (step >= 4 && step < BASE_ACTION_HEADS && step - 3 < selected_count) {
+            int pos = step - 3;
+            float card_mean = card_sum / (float)pos;
+            u = 0.5f * global + role + 1.5f * card_mean + 0.5f * last;
+        } else {
+            u = global + role + last + (length ? sum * rsqrtf((float)length) : 0.0f);
+        }
         s->query[lane] = u / (1.0f + __expf(-u)) * gate;
         s->preactivation[lane] = u;
         __syncwarp();
@@ -55,6 +62,9 @@ __global__ void sample_logits_balatro(
                     : 63 - __clzll((unsigned long long)s->legal);
                 if (lane == 0) logp += s->scores[selected] - s->logsum;
             }
+            if (step == 2) {
+                selected_count = __shfl_sync(PUF_WARP_MASK, selected, 0, 32);
+            }
             if (lane == 0) action[step] = (float)selected;
         }
         __syncwarp();
@@ -65,6 +75,9 @@ __global__ void sample_logits_balatro(
             last = to_float(entities[((int64_t)row * ENTITY_COUNT + entity) * ENTITY_WIDTH + lane]);
             sum += role * last;
             ++length;
+            if (step >= 3 && step < BASE_ACTION_HEADS && step - 3 < selected_count) {
+                card_sum += last;
+            }
         }
         __syncwarp();
     }

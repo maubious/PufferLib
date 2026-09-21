@@ -177,6 +177,7 @@ typedef struct Log {
 	float cleared_ante_8;
 	float deaths_ante[16];
 	float action_counts[ACTION_TYPE_COUNT];
+	float played_hands[HAND_COUNT];
 } Log;
 
 static const char *const action_log_names[ACTION_TYPE_COUNT] = {
@@ -711,6 +712,8 @@ void puf_step(Env *env) {
         ? apply_step(&env->state, &policy, &env->legal_masks, &result)
         : ERR_ACTION;
     if (error == OK && policy.type == ACTION_PLAY_HAND) {
+        assert(env->state.last_hand_type >= 0 && env->state.last_hand_type < HAND_COUNT);
+        env->log.played_hands[env->state.last_hand_type] += 1.0f;
         double hand_score = env->state.last_hand_score;
         if (isfinite(hand_score) && hand_score > 0.0) {
             double peak = log10(hand_score);
@@ -777,6 +780,23 @@ void puf_log(Log *log, Dict *out) {
     dict_set(out, "perf", log->perf);
     dict_set(out, "cleared_ante_8", log->cleared_ante_8);
     dict_set(out, "ante", log->ante);
+
+    static const char *const hand_type_names[HAND_COUNT] = {
+        "hands/flush_five",
+        "hands/flush_house",
+        "hands/five_of_a_kind",
+        "hands/straight_flush",
+        "hands/four_of_a_kind",
+        "hands/full_house",
+        "hands/flush",
+        "hands/straight",
+        "hands/three_of_a_kind",
+        "hands/two_pair",
+        "hands/pair",
+        "hands/high_card",
+    };
+    for (int i = 0; i < HAND_COUNT; ++i)
+        dict_set(out, hand_type_names[i], log->played_hands[i]);
 
 #if EXTRA_LOGS
     dict_set(out, "max_hand_log10", log->max_hand_log10);

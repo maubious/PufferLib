@@ -33,8 +33,6 @@ typedef struct ARContext {
     uint64_t allowed;
     uint64_t required;
     uint64_t selected;       // cards selected before the current position
-    int prev;                // last selected card before the current position
-    uint64_t required_left;  // required & ~selected
 } ARContext;
 
 __device__ __forceinline__ bool ar_option_legal(
@@ -56,16 +54,13 @@ __device__ __forceinline__ bool ar_option_legal(
     if (head >= 3 && head <= 7) {
         int pos = head - 3;
         if (c->sb < 0 || pos >= c->count) return opt == 0;
-        if (opt <= c->prev || !(c->allowed & (UINT64_C(1) << opt))) return false;
+        assert(opt >= 0 && opt < 64);
+        uint64_t bit = UINT64_C(1) << opt;
+        if (!(c->allowed & bit) || (c->selected & bit)) return false;
         int left = c->count - pos - 1;
-        uint64_t lower = opt ? (UINT64_C(1) << opt) - 1 : 0;
-        uint64_t pending = c->required_left;
-        if (pending & lower) return false;
-        pending &= ~(UINT64_C(1) << opt);
-        uint64_t greater = opt == 63 ? 0 :
-            ~((UINT64_C(1) << (opt + 1)) - 1);
-        if (__popcll(pending & greater) > left) return false;
-        return __popcll(c->allowed & ~c->selected & greater) >= left;
+        uint64_t pending = c->required & ~(c->selected | bit);
+        if (__popcll(pending) > left) return false;
+        return true;
     }
     return opt == 0;
 }
@@ -145,8 +140,6 @@ __device__ __forceinline__ void decision_forward(Decision* s, const precision_t*
                 context.required = mask_u64(mask, 0, context.sb + 10);
             }
             context.count = ar_action_value(actions, 0, 2, 6);
-            context.prev = -1;
-            context.required_left = context.required;
             s->active = (step == 1 && context.has_primary)
                 || (step == 2 && context.sb >= 0)
                 || (step >= 3 && context.sb >= 0 && step - 3 < context.count);
@@ -158,10 +151,9 @@ __device__ __forceinline__ void decision_forward(Decision* s, const precision_t*
             if (step >= 3) {
                 for (int j = 3; j < step; ++j) {
                     int option = (int)actions[j];
+                    assert(option >= 0 && option < 64);
                     context.selected |= UINT64_C(1) << option;
-                    context.prev = option;
                 }
-                context.required_left = context.required & ~context.selected;
             }
             s->legal = step == 1 ? context.primary_bits : 0;
             if (step != 1) {
@@ -226,37 +218,7 @@ __device__ __forceinline__ void decision_forward(Decision* s, const precision_t*
     __syncwarp();
 }
 
-__device__ __forceinline__ void decision_backward(Decision* s, const precision_t* entities,
-        const precision_t* parameters, int selected, float dlogp, float dentropy,
-        float* state_gradient, float* entity_gradient, long* parameter_gradient, float* prefix_gradient) {
-    if (!s->active || __popcll(s->legal) == 1) return;
-    int lane = threadIdx.x & 31;
-    float gradient_query = 0.0f;
-    float query = s->query[lane];
-    for (int option = 0; option < s->options; ++option) {
-        if (!(s->legal & (UINT64_C(1) << option))) continue;
-        float logp = s->scores[option] - s->logsum;
-        float probability = __expf(logp);
-        float gradient = ((option == selected ? 1.0f : 0.0f) - probability) * dlogp
-            - dentropy * probability * (logp + s->entropy);
-        int entity = s->start + option;
-        float k = to_float(entities[entity * ENTITY_WIDTH + lane]);
-        gradient_query += gradient * score_scale * k;
-        atomicAdd(entity_gradient + entity * ENTITY_WIDTH + lane,
-            gradient * score_scale * query);
-    }
-    float u = s->preactivation[lane];
-    float sigmoid = 1.0f / (1.0f + __expf(-u));
-    float gate = s->gate[lane];
-    float du = gradient_query * gate * sigmoid * (1.0f + u * (1.0f - sigmoid));
-    atomicAdd(state_gradient + lane, du);
-    atomicAdd(state_gradient + 32 + lane, gradient_query * u * sigmoid * (gate * (2.0f - gate)));
-    ba_fxp_atomic_add(parameter_gradient + ROLE_OFFSET + s->step * 32 + lane, du);
-    if (s->last >= 0) atomicAdd(entity_gradient + s->last * ENTITY_WIDTH + lane, du);
-    float normalization = s->prefix_count ? rsqrtf((float)s->prefix_count) : 0.0f;
-    prefix_gradient[lane] = du * normalization;
 
-}
 
 // Build all teacher-forced queries with one prefix scan per row.
 __global__ void cache_queries(const precision_t* state, const precision_t* entities,
@@ -279,14 +241,21 @@ __global__ void cache_queries(const precision_t* state, const precision_t* entit
     bool ordering = mask_byte(mask, 0, POLICY_ORDER_ENABLED_OFFSET);
     int hand = ordering ? mask_byte(mask, 0, POLICY_ORDER_HAND_COUNT_OFFSET) : 0;
     int jokers = ordering ? mask_byte(mask, 0, POLICY_ORDER_JOKER_COUNT_OFFSET) : 0;
-    float sum = 0.0f, last = 0.0f;
+    float sum = 0.0f, last = 0.0f, card_sum = 0.0f;
     int length = 0, last_entity = -1;
     float global = to_float(state[lane]);
     float gate = 2.0f / (1.0f + __expf(-2.0f * to_float(state[32 + lane])));
     for (int index = 0; index < BASE_ACTION_HEADS + hand + jokers; ++index) {
         int step = index < BASE_ACTION_HEADS + hand ? index : ORDER_JOKER_OFFSET + index - BASE_ACTION_HEADS - hand;
         float role = to_float(parameters[ROLE_OFFSET + step * 32 + lane]);
-        float u = global + role + last + (length ? sum * rsqrtf((float)length) : 0.0f);
+        float u;
+        if (step >= 4 && step < BASE_ACTION_HEADS && step - 3 < selected) {
+            int pos = step - 3;
+            float card_mean = card_sum / (float)pos;
+            u = 0.5f * global + role + 1.5f * card_mean + 0.5f * last;
+        } else {
+            u = global + role + last + (length ? sum * rsqrtf((float)length) : 0.0f);
+        }
         float* evaluation = evaluations + ((int64_t)row * ACTION_STORAGE_SIZE + step) * EVALUATION_WIDTH;
         evaluation[lane] = u / (1.0f + __expf(-u)) * gate;
         evaluation[32 + lane] = u;
@@ -295,10 +264,12 @@ __global__ void cache_queries(const precision_t* state, const precision_t* entit
         if (step == 0) entity = token_start(counts, POOL_SECTIONS) + type;
         else if (step == 1 && primary) entity = token_start(counts, primary_zone(type)) + choice;
         else if (step == 2 && selection) entity = token_start(counts, POOL_SECTIONS) + ACTION_TYPE_COUNT + selected;
-        else if (step >= 3 && step < BASE_ACTION_HEADS && step - 3 < selected)
+        else if (step >= 3 && step < BASE_ACTION_HEADS && step - 3 < selected) {
             entity = token_start(counts, ZONE_HAND) + (int)actions[step];
-        else if (step >= BASE_ACTION_HEADS)
+            card_sum += to_float(entities[entity * ENTITY_WIDTH + lane]);
+        } else if (step >= BASE_ACTION_HEADS) {
             entity = token_start(counts, step < ORDER_JOKER_OFFSET ? ZONE_HAND : ZONE_JOKER) + (int)actions[step];
+        }
         if (entity >= 0) {
             last_entity = entity;
             last = to_float(entities[entity * ENTITY_WIDTH + lane]);
@@ -375,6 +346,19 @@ __global__ void backward_decisions(const precision_t* state, const precision_t* 
     int hand = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_HAND_COUNT_OFFSET);
     int jokers = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_JOKER_COUNT_OFFSET);
     if (!mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_ENABLED_OFFSET)) hand = jokers = 0;
+
+    int type = (int)actions[row * ACTION_STORAGE_SIZE];
+    bool primary = (type >= ACTION_BUY_CARD && type <= ACTION_SWAP_HAND_RIGHT) || type == ACTION_BUY_AND_USE;
+    int choice = primary ? (int)actions[row * ACTION_STORAGE_SIZE + 1] : 0;
+    int entry = policy_selection_entry(type, choice);
+    bool selection = entry >= 0 && mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_SELECTION_OFFSET + entry * POLICY_SELECTION_BYTES + 1);
+    int selected_count = selection ? (int)actions[row * ACTION_STORAGE_SIZE + 2] : 0;
+
+    float* row_state_grad = state_gradient + row * DECODER_STATE;
+    float* row_entity_grad = entity_gradient + (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH;
+    const precision_t* row_entities = entities + (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH;
+    long* row_parts = parts + (row % condition_stripes) * AR_CONDITION_SIZE;
+
     for (int index = warp; index < BASE_ACTION_HEADS + hand + jokers; index += waves) {
         int step = index < BASE_ACTION_HEADS + hand ? index : ORDER_JOKER_OFFSET + index - BASE_ACTION_HEADS - hand;
         int item = row * ACTION_STORAGE_SIZE + step;
@@ -402,13 +386,53 @@ __global__ void backward_decisions(const precision_t* state, const precision_t* 
         if (lane == 0) { s->logsum = evaluation[128]; s->entropy = evaluation[129]; }
         __syncwarp();
         int selected = (int)actions[row * ACTION_STORAGE_SIZE + step];
-        decision_backward(s, entities + (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH,
-            parameters, selected, coefficients[row * 2], coefficients[row * 2 + 1],
-            state_gradient + row * DECODER_STATE,
-            entity_gradient + (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH,
-            parts + (row % condition_stripes) * AR_CONDITION_SIZE, evaluation);
-    }
 
+        float gradient_query = 0.0f;
+        float query = s->query[lane];
+        float dentropy = (step == 2) ? coefficients[row * 2 + 1] * 50.0f : coefficients[row * 2 + 1];
+        float dlogp = coefficients[row * 2];
+        for (int option = 0; option < s->options; ++option) {
+            if (!(s->legal & (UINT64_C(1) << option))) continue;
+            float logp = s->scores[option] - s->logsum;
+            float probability = __expf(logp);
+            float gradient = ((option == selected ? 1.0f : 0.0f) - probability) * dlogp
+                - dentropy * probability * (logp + s->entropy);
+            int entity = s->start + option;
+            float k = to_float(row_entities[entity * ENTITY_WIDTH + lane]);
+            gradient_query += gradient * score_scale * k;
+            atomicAdd(row_entity_grad + entity * ENTITY_WIDTH + lane,
+                gradient * score_scale * query);
+        }
+        float u = s->preactivation[lane];
+        float sigmoid = 1.0f / (1.0f + __expf(-u));
+        float gate = s->gate[lane];
+        float du = gradient_query * gate * sigmoid * (1.0f + u * (1.0f - sigmoid));
+        atomicAdd(row_state_grad + 32 + lane, gradient_query * u * sigmoid * (gate * (2.0f - gate)));
+        ba_fxp_atomic_add(row_parts + ROLE_OFFSET + step * 32 + lane, du);
+
+        bool is_card_head = (step >= 4 && step < BASE_ACTION_HEADS && step - 3 < selected_count);
+        if (is_card_head) {
+            atomicAdd(row_state_grad + lane, 0.5f * du);
+            int pos = step - 3;
+            int hand_start = token_start(counts + row * POOL_SECTIONS, ZONE_HAND);
+            float card_grad = (1.5f / (float)pos) * du;
+            for (int j = 0; j < pos; ++j) {
+                int card_idx = (int)actions[row * ACTION_STORAGE_SIZE + 3 + j];
+                assert(card_idx >= 0 && card_idx < counts[row * POOL_SECTIONS + ZONE_HAND]);
+                int card_entity = hand_start + card_idx;
+                float g = card_grad + (j == pos - 1 ? 0.5f * du : 0.0f);
+                atomicAdd(row_entity_grad + card_entity * ENTITY_WIDTH + lane, g);
+            }
+            evaluation[lane] = 0.0f;
+        } else {
+            atomicAdd(row_state_grad + lane, du);
+            if (s->last >= 0) {
+                atomicAdd(row_entity_grad + s->last * ENTITY_WIDTH + lane, du);
+            }
+            float normalization = s->prefix_count ? rsqrtf((float)s->prefix_count) : 0.0f;
+            evaluation[lane] = du * normalization;
+        }
+    }
 }
 
 // Each earlier token receives the sum of normalized query gradients from
@@ -487,8 +511,10 @@ __global__ void ppo_loss_balatro(float* partials, LossInput input, float* logpro
             float clipped_square = (clipped - target) * (clipped - target);
             logprobs[row] = clipped_square > square ? 0.0f : input.vf_coef * inv * (predicted - target);
             float entropy = 0.0f;
-            for (int step = 0; step < ACTION_STORAGE_SIZE; ++step)
-                entropy += statistics[(row * ACTION_STORAGE_SIZE + step) * 2 + 1];
+            for (int step = 0; step < ACTION_STORAGE_SIZE; ++step) {
+                float h = statistics[(row * ACTION_STORAGE_SIZE + step) * 2 + 1];
+                entropy += (step == 2 ? 50.0f * h : h);
+            }
             float coefficient = *input.ent_coef;
             coefficients[row * 2] = dlogp;
             coefficients[row * 2 + 1] = -coefficient * inv;
