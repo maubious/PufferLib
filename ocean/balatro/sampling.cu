@@ -15,33 +15,63 @@ __global__ void sample_logits_balatro(
     if (lane == 0) rng = rng_states[row];
     float logp = 0.0f;
     Decision* s = decisions + warp;
+    __shared__ float s_vec[waves][32];
     int hand_count = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_HAND_COUNT_OFFSET);
     int joker_count = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_JOKER_COUNT_OFFSET);
     bool ordering = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_ENABLED_OFFSET);
-    float sum = 0.0f, last = 0.0f, card_sum = 0.0f;
-    int length = 0, selected_count = 0;
+    float last = 0.0f, card_sum = 0.0f, a_val = 0.0f, c_val = 0.0f;
+    int selected_count = 0, sampled_type = 0;
+    bool has_last = false;
     float global = to_float(state.data[row * DECODER_COLUMNS + lane]);
-    float gate = 2.0f / (1.0f + __expf(-2.0f * to_float(state.data[row * DECODER_COLUMNS + 32 + lane])));
+
+    float w_trans[32], w_synergy[32];
+    #pragma unroll
+    for (int a = 0; a < 32; ++a) {
+        w_trans[a] = to_float(parameters[TRANS_OFFSET + a * 32 + lane]);
+        w_synergy[a] = to_float(parameters[SYNERGY_OFFSET + a * 32 + lane]);
+    }
+
     for (int step = 0; step < ACTION_STORAGE_SIZE; ++step) {
         if (step == BASE_ACTION_HEADS && !ordering) break;
         if (step >= BASE_ACTION_HEADS && step < ORDER_JOKER_OFFSET && step >= BASE_ACTION_HEADS + hand_count) step = ORDER_JOKER_OFFSET;
         if (step >= ORDER_JOKER_OFFSET + joker_count) break;
+        if (step == BASE_ACTION_HEADS || step == ORDER_JOKER_OFFSET) {
+            has_last = false;
+        }
         float role = to_float(parameters[ROLE_OFFSET + step * 32 + lane]);
-        float u;
+        float act_val = (step == 1) ? a_val : (step >= 2 && step < BASE_ACTION_HEADS) ? (a_val + c_val) : 0.0f;
+        float t_val = 0.0f;
+        if (has_last) {
+            s_vec[warp][lane] = last;
+            __syncwarp();
+            #pragma unroll
+            for (int a = 0; a < 32; ++a) {
+                t_val += w_trans[a] * s_vec[warp][a];
+            }
+        }
+        float s_val = 0.0f;
         if (step >= 4 && step < BASE_ACTION_HEADS && step - 3 < selected_count) {
             int pos = step - 3;
             float card_mean = card_sum / (float)pos;
-            u = 0.5f * global + role + 1.5f * card_mean + 0.5f * last;
-        } else {
-            u = global + role + last + (length ? sum * rsqrtf((float)length) : 0.0f);
+            s_vec[warp][lane] = card_mean;
+            __syncwarp();
+            #pragma unroll
+            for (int a = 0; a < 32; ++a) {
+                s_val += w_synergy[a] * s_vec[warp][a];
+            }
         }
+        float u = global + role + act_val + t_val + s_val;
+        float gate_role = to_float(parameters[GATE_ROLE_OFFSET + step * 32 + lane]);
+        float g_val = to_float(state.data[row * DECODER_COLUMNS + 32 + lane]) + gate_role;
+        float gate = 2.0f / (1.0f + __expf(-2.0f * g_val));
         s->query[lane] = u / (1.0f + __expf(-u)) * gate;
         s->preactivation[lane] = u;
         __syncwarp();
         decision_forward(s, entities + (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH,
             action, mask + row * POLICY_MASK_SIZE, counts + row * POOL_SECTIONS, step, s->query);
+        int selected = 0;
         if (s->active) {
-            int selected = __ffsll((unsigned long long)s->legal) - 1;
+            selected = __ffsll((unsigned long long)s->legal) - 1;
             if (__popcll(s->legal) > 1) {
                 float threshold = lane == 0 ? curand_uniform(&rng) : 0.0f;
                 threshold = __shfl_sync(PUF_WARP_MASK, threshold, 0, 32);
@@ -62,22 +92,48 @@ __global__ void sample_logits_balatro(
                     : 63 - __clzll((unsigned long long)s->legal);
                 if (lane == 0) logp += s->scores[selected] - s->logsum;
             }
-            if (step == 2) {
-                selected_count = __shfl_sync(PUF_WARP_MASK, selected, 0, 32);
+            if (step == 0) {
+                sampled_type = selected;
+                int type_entity = token_start(counts + row * POOL_SECTIONS, POOL_SECTIONS) + selected;
+                float type_val = to_float(entities[((int64_t)row * ENTITY_COUNT + type_entity) * ENTITY_WIDTH + lane]);
+                s_vec[warp][lane] = type_val;
+                __syncwarp();
+                #pragma unroll
+                for (int a = 0; a < 32; ++a) {
+                    a_val += to_float(parameters[ACTION_OFFSET + a * 32 + lane]) * s_vec[warp][a];
+                }
+            } else if (step == 1) {
+                bool primary = (sampled_type >= ACTION_BUY_CARD && sampled_type <= ACTION_SWAP_HAND_RIGHT) || sampled_type == ACTION_BUY_AND_USE;
+                int choice = selected;
+                int zone = primary ? primary_zone(sampled_type) : -1;
+                const int* row_counts = counts + row * POOL_SECTIONS;
+                if (primary && zone >= 0 && choice >= 0 && choice < row_counts[zone]) {
+                    int choice_entity = token_start(row_counts, zone) + choice;
+                    float choice_val = to_float(entities[((int64_t)row * ENTITY_COUNT + choice_entity) * ENTITY_WIDTH + lane]);
+                    s_vec[warp][lane] = choice_val;
+                    __syncwarp();
+                    #pragma unroll
+                    for (int a = 0; a < 32; ++a) {
+                        c_val += to_float(parameters[ACTION_OFFSET + a * 32 + lane]) * s_vec[warp][a];
+                    }
+                }
+            } else if (step == 2) {
+                selected_count = selected;
             }
             if (lane == 0) action[step] = (float)selected;
         }
         __syncwarp();
-        if (s->active || step >= BASE_ACTION_HEADS) {
-            int start = step >= BASE_ACTION_HEADS ? token_start(counts + row * POOL_SECTIONS,
-                step < ORDER_JOKER_OFFSET ? ZONE_HAND : ZONE_JOKER) : s->start;
-            int entity = start + (int)action[step];
+        if (step >= 3 && step < BASE_ACTION_HEADS && step - 3 < selected_count) {
+            int card_idx = selected;
+            int entity = token_start(counts + row * POOL_SECTIONS, ZONE_HAND) + card_idx;
             last = to_float(entities[((int64_t)row * ENTITY_COUNT + entity) * ENTITY_WIDTH + lane]);
-            sum += role * last;
-            ++length;
-            if (step >= 3 && step < BASE_ACTION_HEADS && step - 3 < selected_count) {
-                card_sum += last;
-            }
+            has_last = true;
+            card_sum += last;
+        } else if (step >= BASE_ACTION_HEADS && s->active) {
+            int start = token_start(counts + row * POOL_SECTIONS, step < ORDER_JOKER_OFFSET ? ZONE_HAND : ZONE_JOKER);
+            int entity = start + selected;
+            last = to_float(entities[((int64_t)row * ENTITY_COUNT + entity) * ENTITY_WIDTH + lane]);
+            has_last = true;
         }
         __syncwarp();
     }

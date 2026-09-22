@@ -15,7 +15,7 @@ typedef unsigned char obs_t;
 #include "pufferenv.h"
 #include "balatro_core.h"
 
-#define EXTRA_LOGS 0
+#define EXTRA_LOGS 1
 
 #define POLICY_PRIMARY_COUNT 64
 #define POLICY_PRIMARY_BYTES 8
@@ -39,7 +39,16 @@ typedef unsigned char obs_t;
 #define DECODER_STATE 64
 #define DECODER_CATEGORIES (ACTION_TYPE_COUNT + 6)
 #define ROLE_OFFSET (DECODER_CATEGORIES * AR_EMBED_DIM)
-#define AR_CONDITION_SIZE (ROLE_OFFSET + ACTION_STORAGE_SIZE * AR_EMBED_DIM)
+#define ROLE_SIZE (ACTION_STORAGE_SIZE * AR_EMBED_DIM)
+#define TRANS_OFFSET (ROLE_OFFSET + ROLE_SIZE)
+#define TRANS_SIZE (AR_EMBED_DIM * AR_EMBED_DIM)
+#define SYNERGY_OFFSET (TRANS_OFFSET + TRANS_SIZE)
+#define SYNERGY_SIZE (AR_EMBED_DIM * AR_EMBED_DIM)
+#define ACTION_OFFSET (SYNERGY_OFFSET + SYNERGY_SIZE)
+#define ACTION_SIZE (AR_EMBED_DIM * AR_EMBED_DIM)
+#define GATE_ROLE_OFFSET (ACTION_OFFSET + ACTION_SIZE)
+#define GATE_ROLE_SIZE (ACTION_STORAGE_SIZE * AR_EMBED_DIM)
+#define AR_CONDITION_SIZE (GATE_ROLE_OFFSET + GATE_ROLE_SIZE)
 
 #ifndef PUF_WARP_MASK
 #define PUF_WARP_MASK 0xffffffff
@@ -50,6 +59,27 @@ typedef unsigned char obs_t;
 #else
 #define POLICY_INLINE static inline
 #endif
+
+static unsigned long long g_used_by_class[4] = {0};
+static unsigned long long g_sold_by_class[4] = {0};
+static unsigned long long g_bought_by_class[4] = {0};
+static unsigned long long g_buy_and_used_by_class[4] = {0};
+static unsigned long long g_emperor_used = 0;
+static unsigned long long g_card_mod_sold_in_shop = 0;
+static unsigned long long g_card_mod_sold_in_blind = 0;
+static unsigned long long g_card_mod_held_to_next_round = 0;
+
+POLICY_INLINE int consumable_class(uint16_t center_id) {
+    if (center_id == CENTER_C_HERMIT || center_id == CENTER_C_TEMPERANCE)
+        return 1;
+    if (center_id == CENTER_C_EMPEROR || center_id == CENTER_C_FOOL ||
+        center_id == CENTER_C_JUDGEMENT || center_id == CENTER_C_HIGH_PRIESTESS ||
+        center_id == CENTER_C_WHEEL_OF_FORTUNE)
+        return 2;
+    if (planet_hand(center_id) < HAND_COUNT || center_id == CENTER_C_BLACK_HOLE)
+        return 3;
+    return 0;
+}
 
 POLICY_INLINE int policy_selection_entry(int type, int primary) {
     if (type == ACTION_PLAY_HAND) return primary == 0 ? 0 : -1;
@@ -579,29 +609,41 @@ void puf_step(Env *env) {
                 if (target > selection->maximum) target = selection->maximum;
                 uint8_t required_count = (uint8_t)__builtin_popcountll(selection->required_hand);
                 if (target < required_count) target = required_count;
-                uint64_t chosen = selection->required_hand;
-                for (uint8_t i = 0; i < policy.selection_count &&
-                                    __builtin_popcountll(chosen) < target; ++i) {
+                uint64_t chosen = 0;
+                uint8_t ordered[MAX_SELECTION];
+                uint8_t count = 0;
+                for (uint8_t i = 0; i < policy.selection_count && count < target; ++i) {
                     uint8_t index = policy.selection[i];
                     if (index >= env->state.hand_count || index >= MAX_HAND) continue;
                     uint64_t bit = UINT64_C(1) << index;
-                    if (selection->allowed_hand & bit) chosen |= bit;
+                    if ((selection->allowed_hand & bit) && !(chosen & bit)) {
+                        uint8_t remaining_required = (uint8_t)__builtin_popcountll(selection->required_hand & ~chosen);
+                        if (count + remaining_required < target || (selection->required_hand & bit)) {
+                            chosen |= bit;
+                            ordered[count++] = index;
+                        }
+                    }
+                }
+                uint64_t missing_required = selection->required_hand & ~chosen;
+                while (count < target && missing_required) {
+                    int index = __builtin_ctzll(missing_required);
+                    chosen |= UINT64_C(1) << index;
+                    missing_required &= missing_required - 1;
+                    ordered[count++] = (uint8_t)index;
                 }
                 uint64_t allowed = selection->allowed_hand & ~chosen;
-                while (__builtin_popcountll(chosen) < target && allowed) {
+                while (count < target && allowed) {
                     int index = __builtin_ctzll(allowed);
                     chosen |= UINT64_C(1) << index;
                     allowed &= allowed - 1;
+                    ordered[count++] = (uint8_t)index;
                 }
-                policy.selection_count = 0;
-                for (int index = 0; index < MAX_HAND &&
-                                    policy.selection_count < target; ++index) {
-                    if (chosen & (UINT64_C(1) << index))
-                        policy.selection[policy.selection_count++] = (uint8_t)index;
-                }
+                policy.selection_count = count;
+                for (int i = 0; i < count; ++i) policy.selection[i] = ordered[i];
                 if (policy.selection_count < selection->minimum ||
                     policy.selection_count > selection->maximum ||
-                    (chosen & ~selection->allowed_hand) != 0)
+                    (chosen & ~selection->allowed_hand) != 0 ||
+                    (chosen & selection->required_hand) != selection->required_hand)
                     action_is_legal = 0;
             }
         }
@@ -649,15 +691,6 @@ void puf_step(Env *env) {
             memcpy(env->state.hand, hand_copy, sizeof(Card) * hand_count);
             for (int i = 0; i < policy.selection_count; ++i)
                 policy.selection[i] = (uint8_t)hand_map[policy.selection[i]];
-            for (int i = 1; i < policy.selection_count; ++i) {
-                uint8_t value = policy.selection[i];
-                int j = i;
-                while (j > 0 && policy.selection[j - 1] > value) {
-                    policy.selection[j] = policy.selection[j - 1];
-                    --j;
-                }
-                policy.selection[j] = value;
-            }
         }
         if (!joker_identity) {
             env->log.reorder_joker += 1.0f;
@@ -679,6 +712,33 @@ void puf_step(Env *env) {
         uint16_t center = env->state.shop_main[policy.primary].center_id;
         if (planet_hand(center) < HAND_COUNT)
             env->log.planets_bought += 1.0f;
+    }
+    if (action_is_legal) {
+        if (policy.type == ACTION_USE_CONSUMABLE) {
+            uint16_t cid = env->state.consumables[policy.primary].center_id;
+            if (cid == CENTER_C_EMPEROR) g_emperor_used++;
+            g_used_by_class[consumable_class(cid)]++;
+        } else if (policy.type == ACTION_SELL_CONSUMABLE) {
+            uint16_t cid = env->state.consumables[policy.primary].center_id;
+            int cls = consumable_class(cid);
+            g_sold_by_class[cls]++;
+            if (cls == 0) {
+                if (env->state.phase == PHASE_SHOP) g_card_mod_sold_in_shop++;
+                else g_card_mod_sold_in_blind++;
+            }
+        } else if (policy.type == ACTION_NEXT_ROUND) {
+            for (uint8_t c = 0; c < env->state.consumable_count; ++c)
+                if (consumable_class(env->state.consumables[c].center_id) == 0)
+                    g_card_mod_held_to_next_round++;
+        } else if (policy.type == ACTION_BUY_CARD) {
+            uint16_t cid = env->state.shop_main[policy.primary].center_id;
+            uint8_t set = card_set(&env->state.shop_main[policy.primary]);
+            if (set >= SET_TAROT && set <= SET_SPECTRAL)
+                g_bought_by_class[consumable_class(cid)]++;
+        } else if (policy.type == ACTION_BUY_AND_USE) {
+            uint16_t cid = env->state.shop_main[policy.primary].center_id;
+            g_buy_and_used_by_class[consumable_class(cid)]++;
+        }
     }
     if (action_is_legal && policy.type == ACTION_USE_CONSUMABLE) {
         uint16_t center = env->state.consumables[policy.primary].center_id;

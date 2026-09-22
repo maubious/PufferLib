@@ -3096,6 +3096,25 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
             result.draw = dict_get(&el, "env/draw_rate");
         }
         result.games = (int)n;
+        for (int i = 0; i < el.size; i++) {
+            if (strncmp(el.items[i].key, "env/actions/", 12) == 0 ||
+                strncmp(el.items[i].key, "env/planets/", 12) == 0) {
+                printf("  %s = %.4f\n", el.items[i].key, el.items[i].value);
+            }
+        }
+#ifdef PUFFER_BALATRO
+        printf("\n=== CONSUMABLE DETAILED STATS (10k games) ===\n");
+        printf("Card Modifying:  bought=%llu, buy_and_use=%llu, used=%llu, sold=%llu (in shop=%llu, in blind=%llu, held to next round=%llu)\n",
+            g_bought_by_class[0], g_buy_and_used_by_class[0], g_used_by_class[0], g_sold_by_class[0],
+            g_card_mod_sold_in_shop, g_card_mod_sold_in_blind, g_card_mod_held_to_next_round);
+        printf("Money Tarots:    bought=%llu, buy_and_use=%llu, used=%llu, sold=%llu\n",
+            g_bought_by_class[1], g_buy_and_used_by_class[1], g_used_by_class[1], g_sold_by_class[1]);
+        printf("Spawners:        bought=%llu, buy_and_use=%llu, used=%llu, sold=%llu (Emperor used=%llu)\n",
+            g_bought_by_class[2], g_buy_and_used_by_class[2], g_used_by_class[2], g_sold_by_class[2], g_emperor_used);
+        printf("Planets:         bought=%llu, buy_and_use=%llu, used=%llu, sold=%llu\n",
+            g_bought_by_class[3], g_buy_and_used_by_class[3], g_used_by_class[3], g_sold_by_class[3]);
+        printf("=============================================\n\n");
+#endif
         dict_clear(&el);
         return result;
     }
@@ -3223,6 +3242,11 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     PuffeRL* pufferl = create_pufferl(ini, ctx);
+    char load_path_buf[4096];
+    const char* load_path = puf_checkpoint_path_key(ini, "load_model_path", load_path_buf, sizeof(load_path_buf));
+    if (load_path) {
+        pufferl_load_policy(pufferl, 0, load_path);
+    }
     Selfplay selfplay = {0};
     if (use_selfplay) {
         char initial_checkpoint[4096];
@@ -3718,7 +3742,7 @@ int main(int argc, char** argv) {
     }
     int argi = 2;
     const char* model = NULL;
-    if (strcmp(mode, "eval") == 0 && argi < argc && argv[argi][0] &&
+    if ((strcmp(mode, "eval") == 0 || strcmp(mode, "train") == 0) && argi < argc && argv[argi][0] &&
             argv[argi][0] != '-' && strchr(argv[argi], '=') == NULL) {
         model = argv[argi++];
     }

@@ -683,10 +683,10 @@ int action_is_legal_masks(const LegalMasks *masks, const Action *action) {
     uint64_t selected = 0;
     for (uint8_t i = 0; i < action->selection_count; ++i) {
         uint8_t index = action->selection[i];
-        if (index >= MAX_HAND || (i && action->selection[i - 1] >= index)) return 0;
+        if (index >= MAX_HAND || (selected & (UINT64_C(1) << index))) return 0;
         selected |= UINT64_C(1) << index;
     }
-    return selected && !(selected & ~selection->allowed_hand) &&
+    return (action->selection_count == 0 || !(selected & ~selection->allowed_hand)) &&
            (selected & selection->required_hand) == selection->required_hand;
 }
 
@@ -1776,18 +1776,25 @@ void apply_consumable(State *state, const Action *action, Card card) {
             for (uint8_t j = 0; j < state->joker_count; ++j)
                 if (!(state->jokers[j].flags & CARD_DEBUFFED) && state->jokers[j].center_id == CENTER_J_GLASS)
                     state->jokers[j].state[0] = (state->jokers[j].state[0] > 100 ? state->jokers[j].state[0] : 100) + glass * 75;
-        for (uint8_t i = action->selection_count; i-- > 0;) {
-            assert(action->selection[i] < state->hand_count);
-            remove_hand_index(state, action->selection[i]);
+        uint8_t idxs[MAX_SELECTION];
+        for (uint8_t i = 0; i < action->selection_count; ++i) idxs[i] = action->selection[i];
+        for (uint8_t i = 0; i < action->selection_count; ++i) {
+            for (uint8_t j = i + 1; j < action->selection_count; ++j) {
+                if (idxs[i] < idxs[j]) { uint8_t t = idxs[i]; idxs[i] = idxs[j]; idxs[j] = t; }
+            }
+        }
+        for (uint8_t i = 0; i < action->selection_count; ++i) {
+            assert(idxs[i] < state->hand_count);
+            remove_hand_index(state, idxs[i]);
         }
         break;
     }
     case CONS_DEATH: {
         assert(action->selection_count == 2);
-        uint8_t left = action->selection[0], right = action->selection[1];
-        assert(left < state->hand_count && right < state->hand_count && left != right);
-        Card source = state->hand[right];
-        Card *target = &state->hand[left];
+        uint8_t target_idx = action->selection[0], source_idx = action->selection[1];
+        assert(target_idx < state->hand_count && source_idx < state->hand_count && target_idx != source_idx);
+        Card source = state->hand[source_idx];
+        Card *target = &state->hand[target_idx];
         target->center_id = source.center_id;
         target->suit = source.suit;
         target->rank = source.rank;
@@ -1917,6 +1924,7 @@ void apply_consumable(State *state, const Action *action, Card card) {
 
 void use_consumable(State *state, const Action *action) {
     Card card = state->consumables[action->primary];
+    state->invested += card.sell_cost;
     apply_consumable(state, action, card);
     consumable_removed(state, &card);
     ZONE_REMOVE(state->consumables, state->consumable_count, action->primary);
@@ -3288,10 +3296,11 @@ static void legal_add_consumable(LegalMasks *masks, const State *state, uint8_t 
     assert(card->center_id < CENTER_COUNT);
     const ConsumableSignature *signature = &CONSUMABLE_SIGNATURES[card->center_id];
     assert(signature->kind != CONS_NONE);
+    if (!can_use_consumable(state, signature)) return;
     if (signature->target_max)
         legal_add_selection(masks, type, primary, signature->target_min,
             signature->target_max, consumable_allowed_mask(state, signature), 0);
-    else if (can_use_consumable(state, signature))
+    else
         masks_add_discrete(masks, (Action){.type = type, .primary = primary});
 }
 
@@ -4280,6 +4289,9 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
     double previous_blind_chips = state->blind_chips;
     double previous_dollars = (double)state->dollars;
     double previous_invested = (double)state->invested;
+    double previous_consumables_sell = 0.0;
+    for (uint8_t i = 0; i < state->consumable_count && i < MAX_CONSUMABLES; ++i)
+        previous_consumables_sell += (double)state->consumables[i].sell_cost;
     uint8_t ante = state->ante;
     uint8_t previous_phase = state->phase;
     uint8_t previous_blind_on_deck = state->blind_on_deck;
@@ -4466,12 +4478,12 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
             case ACTION_BUY_CARD:
             case ACTION_BUY_AND_USE:
             case ACTION_REDEEM_VOUCHER:
+            case ACTION_OPEN_BOOSTER:
             case ACTION_REROLL:
             case ACTION_REROLL_BOSS:
                 if (dollar_delta < 0.0) state->invested -= (int32_t)dollar_delta;
                 break;
             case ACTION_SELL_JOKER:
-            case ACTION_SELL_CONSUMABLE:
                 if (dollar_delta > 0.0) {
                     state->invested -= (int32_t)dollar_delta;
                     if (state->invested < 0) state->invested = 0;
@@ -4480,8 +4492,11 @@ int apply_step(State *state, const Action *action, const LegalMasks *masks, Step
             default:
                 break;
             }
-            double prev_wealth = previous_dollars + previous_invested;
-            double cur_wealth = (double)state->dollars + (double)state->invested;
+            double cur_consumables_sell = 0.0;
+            for (uint8_t i = 0; i < state->consumable_count && i < MAX_CONSUMABLES; ++i)
+                cur_consumables_sell += (double)state->consumables[i].sell_cost;
+            double prev_wealth = previous_dollars + previous_invested + previous_consumables_sell;
+            double cur_wealth = (double)state->dollars + (double)state->invested + cur_consumables_sell;
             if (prev_wealth < 0.0) prev_wealth = 0.0;
             if (cur_wealth < 0.0) cur_wealth = 0.0;
             if (state->terminal) cur_wealth = 0.0;

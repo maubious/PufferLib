@@ -224,8 +224,8 @@ __device__ __forceinline__ void decision_forward(Decision* s, const precision_t*
 __global__ void cache_queries(const precision_t* state, const precision_t* entities,
         const precision_t* parameters, const float* actions, const precision_t* mask,
         const int* counts, float* evaluations, int batch) {
-    int row = blockIdx.x * 4 + threadIdx.x / 32;
-    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    int row = blockIdx.x * 4 + warp;
     if (row >= batch) return;
     actions += row * ACTION_STORAGE_SIZE;
     mask += row * POLICY_MASK_SIZE;
@@ -241,40 +241,94 @@ __global__ void cache_queries(const precision_t* state, const precision_t* entit
     bool ordering = mask_byte(mask, 0, POLICY_ORDER_ENABLED_OFFSET);
     int hand = ordering ? mask_byte(mask, 0, POLICY_ORDER_HAND_COUNT_OFFSET) : 0;
     int jokers = ordering ? mask_byte(mask, 0, POLICY_ORDER_JOKER_COUNT_OFFSET) : 0;
-    float sum = 0.0f, last = 0.0f, card_sum = 0.0f;
-    int length = 0, last_entity = -1;
+
+    __shared__ float s_vec[4][32];
+    float w_trans[32], w_synergy[32];
+    #pragma unroll
+    for (int a = 0; a < 32; ++a) {
+        w_trans[a] = to_float(parameters[TRANS_OFFSET + a * 32 + lane]);
+        w_synergy[a] = to_float(parameters[SYNERGY_OFFSET + a * 32 + lane]);
+    }
+
+    int type_entity = token_start(counts, POOL_SECTIONS) + type;
+    float type_val = to_float(entities[type_entity * ENTITY_WIDTH + lane]);
+    s_vec[warp][lane] = type_val;
+    __syncwarp();
+    float a_val = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < 32; ++a) {
+        a_val += to_float(parameters[ACTION_OFFSET + a * 32 + lane]) * s_vec[warp][a];
+    }
+
+    int zone = primary ? primary_zone(type) : -1;
+    bool valid_choice = primary && zone >= 0 && choice >= 0 && choice < counts[zone];
+    float c_val = 0.0f;
+    if (valid_choice) {
+        int choice_entity = token_start(counts, zone) + choice;
+        float choice_val = to_float(entities[choice_entity * ENTITY_WIDTH + lane]);
+        s_vec[warp][lane] = choice_val;
+        __syncwarp();
+        #pragma unroll
+        for (int a = 0; a < 32; ++a) {
+            c_val += to_float(parameters[ACTION_OFFSET + a * 32 + lane]) * s_vec[warp][a];
+        }
+    }
+
+    float last = 0.0f, card_sum = 0.0f;
+    int last_entity = -1;
     float global = to_float(state[lane]);
-    float gate = 2.0f / (1.0f + __expf(-2.0f * to_float(state[32 + lane])));
     for (int index = 0; index < BASE_ACTION_HEADS + hand + jokers; ++index) {
         int step = index < BASE_ACTION_HEADS + hand ? index : ORDER_JOKER_OFFSET + index - BASE_ACTION_HEADS - hand;
+        if (step == BASE_ACTION_HEADS || step == ORDER_JOKER_OFFSET) {
+            last_entity = -1;
+            last = 0.0f;
+        }
         float role = to_float(parameters[ROLE_OFFSET + step * 32 + lane]);
-        float u;
+        float act_val = 0.0f;
+        if (step == 1) {
+            act_val = a_val;
+        } else if (step >= 2 && step < BASE_ACTION_HEADS) {
+            act_val = a_val + c_val;
+        }
+        float t_val = 0.0f;
+        if (last_entity >= 0) {
+            s_vec[warp][lane] = last;
+            __syncwarp();
+            #pragma unroll
+            for (int a = 0; a < 32; ++a) {
+                t_val += w_trans[a] * s_vec[warp][a];
+            }
+        }
+        float s_val = 0.0f;
         if (step >= 4 && step < BASE_ACTION_HEADS && step - 3 < selected) {
             int pos = step - 3;
             float card_mean = card_sum / (float)pos;
-            u = 0.5f * global + role + 1.5f * card_mean + 0.5f * last;
-        } else {
-            u = global + role + last + (length ? sum * rsqrtf((float)length) : 0.0f);
+            s_vec[warp][lane] = card_mean;
+            __syncwarp();
+            #pragma unroll
+            for (int a = 0; a < 32; ++a) {
+                s_val += w_synergy[a] * s_vec[warp][a];
+            }
         }
+        float u = global + role + act_val + t_val + s_val;
+        float gate_role = to_float(parameters[GATE_ROLE_OFFSET + step * 32 + lane]);
+        float g_val = to_float(state[32 + lane]) + gate_role;
+        float gate = 2.0f / (1.0f + __expf(-2.0f * g_val));
         float* evaluation = evaluations + ((int64_t)row * ACTION_STORAGE_SIZE + step) * EVALUATION_WIDTH;
         evaluation[lane] = u / (1.0f + __expf(-u)) * gate;
         evaluation[32 + lane] = u;
-        if (lane == 0) { evaluation[130] = (float)length; evaluation[131] = (float)last_entity; }
+        if (lane == 0) { evaluation[130] = 0.0f; evaluation[131] = (float)last_entity; }
         int entity = -1;
-        if (step == 0) entity = token_start(counts, POOL_SECTIONS) + type;
-        else if (step == 1 && primary) entity = token_start(counts, primary_zone(type)) + choice;
-        else if (step == 2 && selection) entity = token_start(counts, POOL_SECTIONS) + ACTION_TYPE_COUNT + selected;
-        else if (step >= 3 && step < BASE_ACTION_HEADS && step - 3 < selected) {
+        if (step >= 3 && step < BASE_ACTION_HEADS && step - 3 < selected) {
             entity = token_start(counts, ZONE_HAND) + (int)actions[step];
             card_sum += to_float(entities[entity * ENTITY_WIDTH + lane]);
         } else if (step >= BASE_ACTION_HEADS) {
-            entity = token_start(counts, step < ORDER_JOKER_OFFSET ? ZONE_HAND : ZONE_JOKER) + (int)actions[step];
+            bool active = step < ORDER_JOKER_OFFSET ? (hand > 1) : (jokers > 1);
+            if (active) entity = token_start(counts, step < ORDER_JOKER_OFFSET ? ZONE_HAND : ZONE_JOKER) + (int)actions[step];
         }
         if (entity >= 0) {
             last_entity = entity;
             last = to_float(entities[entity * ENTITY_WIDTH + lane]);
-            sum += role * last;
-            ++length;
         }
     }
 }
@@ -341,6 +395,8 @@ __global__ void backward_decisions(const precision_t* state, const precision_t* 
         float* entity_gradient, long* parts, float* evaluations, int batch) {
     constexpr int waves = 1;
     __shared__ Decision decisions[waves];
+    __shared__ float s_vec[32];
+    __shared__ float s_du[32];
     int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
     int row = blockIdx.x;
     int hand = mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_ORDER_HAND_COUNT_OFFSET);
@@ -350,6 +406,8 @@ __global__ void backward_decisions(const precision_t* state, const precision_t* 
     int type = (int)actions[row * ACTION_STORAGE_SIZE];
     bool primary = (type >= ACTION_BUY_CARD && type <= ACTION_SWAP_HAND_RIGHT) || type == ACTION_BUY_AND_USE;
     int choice = primary ? (int)actions[row * ACTION_STORAGE_SIZE + 1] : 0;
+    int zone = primary ? primary_zone(type) : -1;
+    bool valid_choice = primary && zone >= 0 && choice >= 0 && choice < counts[row * POOL_SECTIONS + zone];
     int entry = policy_selection_entry(type, choice);
     bool selection = entry >= 0 && mask_byte(mask, row * POLICY_MASK_SIZE, POLICY_SELECTION_OFFSET + entry * POLICY_SELECTION_BYTES + 1);
     int selected_count = selection ? (int)actions[row * ACTION_STORAGE_SIZE + 2] : 0;
@@ -358,6 +416,14 @@ __global__ void backward_decisions(const precision_t* state, const precision_t* 
     float* row_entity_grad = entity_gradient + (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH;
     const precision_t* row_entities = entities + (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH;
     long* row_parts = parts + (row % condition_stripes) * AR_CONDITION_SIZE;
+
+    float d_trans[32] = {};
+    float d_synergy[32] = {};
+    float d_action_type = 0.0f, d_action_choice = 0.0f;
+    float d_state_global = 0.0f;
+    float d_state_gate = 0.0f;
+    float card_sum = 0.0f;
+    float d_card[4] = {};
 
     for (int index = warp; index < BASE_ACTION_HEADS + hand + jokers; index += waves) {
         int step = index < BASE_ACTION_HEADS + hand ? index : ORDER_JOKER_OFFSET + index - BASE_ACTION_HEADS - hand;
@@ -380,7 +446,10 @@ __global__ void backward_decisions(const precision_t* state, const precision_t* 
         }
         s->query[lane] = evaluation[lane];
         s->preactivation[lane] = evaluation[32 + lane];
-        s->gate[lane] = 2.0f / (1.0f + __expf(-2.0f * to_float(state[row * DECODER_COLUMNS + 32 + lane])));
+        float gate_role = to_float(parameters[GATE_ROLE_OFFSET + step * 32 + lane]);
+        float g_val = to_float(state[row * DECODER_COLUMNS + 32 + lane]) + gate_role;
+        float gate = 2.0f / (1.0f + __expf(-2.0f * g_val));
+        s->gate[lane] = gate;
         for (int option = lane; option < s->options; option += 32)
             s->scores[option] = evaluation[64 + option];
         if (lane == 0) { s->logsum = evaluation[128]; s->entropy = evaluation[129]; }
@@ -400,38 +469,136 @@ __global__ void backward_decisions(const precision_t* state, const precision_t* 
             int entity = s->start + option;
             float k = to_float(row_entities[entity * ENTITY_WIDTH + lane]);
             gradient_query += gradient * score_scale * k;
-            atomicAdd(row_entity_grad + entity * ENTITY_WIDTH + lane,
-                gradient * score_scale * query);
+            row_entity_grad[entity * ENTITY_WIDTH + lane] +=
+                gradient * score_scale * query;
         }
         float u = s->preactivation[lane];
         float sigmoid = 1.0f / (1.0f + __expf(-u));
-        float gate = s->gate[lane];
         float du = gradient_query * gate * sigmoid * (1.0f + u * (1.0f - sigmoid));
-        atomicAdd(row_state_grad + 32 + lane, gradient_query * u * sigmoid * (gate * (2.0f - gate)));
-        ba_fxp_atomic_add(row_parts + ROLE_OFFSET + step * 32 + lane, du);
+        float dg = gradient_query * u * sigmoid * (gate * (2.0f - gate));
+        d_state_gate += dg;
+        if (dg != 0.0f) ba_fxp_atomic_add(row_parts + GATE_ROLE_OFFSET + step * 32 + lane, dg);
+        d_state_global += du;
+        if (du != 0.0f) ba_fxp_atomic_add(row_parts + ROLE_OFFSET + step * 32 + lane, du);
+        if (step == 1) {
+            d_action_type += du;
+        } else if (step >= 2 && step < BASE_ACTION_HEADS) {
+            d_action_type += du;
+            if (valid_choice) d_action_choice += du;
+        }
+
+        if (s->last >= 0) {
+            float last_val = to_float(row_entities[s->last * ENTITY_WIDTH + lane]);
+            s_vec[lane] = last_val;
+            s_du[lane] = du;
+            __syncwarp();
+            #pragma unroll
+            for (int a = 0; a < 32; ++a) {
+                d_trans[a] += s_vec[a] * du;
+            }
+            float dt = 0.0f;
+            #pragma unroll
+            for (int b = 0; b < 32; ++b) {
+                dt += to_float(parameters[TRANS_OFFSET + lane * 32 + b]) * s_du[b];
+            }
+            row_entity_grad[s->last * ENTITY_WIDTH + lane] += dt;
+        }
 
         bool is_card_head = (step >= 4 && step < BASE_ACTION_HEADS && step - 3 < selected_count);
         if (is_card_head) {
-            atomicAdd(row_state_grad + lane, 0.5f * du);
             int pos = step - 3;
-            int hand_start = token_start(counts + row * POOL_SECTIONS, ZONE_HAND);
-            float card_grad = (1.5f / (float)pos) * du;
+            float card_mean = card_sum / (float)pos;
+            s_vec[lane] = card_mean;
+            s_du[lane] = du;
+            __syncwarp();
+            #pragma unroll
+            for (int a = 0; a < 32; ++a) {
+                d_synergy[a] += s_vec[a] * du;
+            }
+            float dc = 0.0f;
+            #pragma unroll
+            for (int b = 0; b < 32; ++b) {
+                dc += to_float(parameters[SYNERGY_OFFSET + lane * 32 + b]) * s_du[b];
+            }
+            float card_grad = dc / (float)pos;
             for (int j = 0; j < pos; ++j) {
-                int card_idx = (int)actions[row * ACTION_STORAGE_SIZE + 3 + j];
-                assert(card_idx >= 0 && card_idx < counts[row * POOL_SECTIONS + ZONE_HAND]);
-                int card_entity = hand_start + card_idx;
-                float g = card_grad + (j == pos - 1 ? 0.5f * du : 0.0f);
-                atomicAdd(row_entity_grad + card_entity * ENTITY_WIDTH + lane, g);
+                d_card[j] += card_grad;
             }
-            evaluation[lane] = 0.0f;
-        } else {
-            atomicAdd(row_state_grad + lane, du);
-            if (s->last >= 0) {
-                atomicAdd(row_entity_grad + s->last * ENTITY_WIDTH + lane, du);
-            }
-            float normalization = s->prefix_count ? rsqrtf((float)s->prefix_count) : 0.0f;
-            evaluation[lane] = du * normalization;
         }
+        if (step >= 3 && step < BASE_ACTION_HEADS && step - 3 < selected_count) {
+            int hand_start = token_start(counts + row * POOL_SECTIONS, ZONE_HAND);
+            int card_idx = (int)actions[row * ACTION_STORAGE_SIZE + step];
+            int card_entity = hand_start + card_idx;
+            card_sum += to_float(row_entities[card_entity * ENTITY_WIDTH + lane]);
+        }
+        evaluation[lane] = 0.0f;
+    }
+
+    if (selected_count > 1) {
+        int hand_start = token_start(counts + row * POOL_SECTIONS, ZONE_HAND);
+        int cards_to_write = selected_count - 1 < 4 ? selected_count - 1 : 4;
+        for (int j = 0; j < cards_to_write; ++j) {
+            int card_idx = (int)actions[row * ACTION_STORAGE_SIZE + 3 + j];
+            int card_entity = hand_start + card_idx;
+            row_entity_grad[card_entity * ENTITY_WIDTH + lane] += d_card[j];
+        }
+    }
+
+    row_state_grad[32 + lane] = d_state_gate;
+    row_state_grad[lane] = d_state_global;
+
+    if (__any_sync(PUF_WARP_MASK, d_action_type != 0.0f)) {
+        int type_entity = token_start(counts + row * POOL_SECTIONS, POOL_SECTIONS) + type;
+        float type_val = to_float(row_entities[type_entity * ENTITY_WIDTH + lane]);
+        s_vec[lane] = type_val;
+        s_du[lane] = d_action_type;
+        __syncwarp();
+        float da = 0.0f;
+        #pragma unroll
+        for (int b = 0; b < 32; ++b) {
+            da += to_float(parameters[ACTION_OFFSET + lane * 32 + b]) * s_du[b];
+        }
+        row_entity_grad[type_entity * ENTITY_WIDTH + lane] += da;
+
+        if (d_action_type != 0.0f) {
+            #pragma unroll
+            for (int a = 0; a < 32; ++a) {
+                float val = s_vec[a] * d_action_type;
+                if (val != 0.0f)
+                    ba_fxp_atomic_add(row_parts + ACTION_OFFSET + a * 32 + lane, val);
+            }
+        }
+    }
+
+    if (valid_choice && __any_sync(PUF_WARP_MASK, d_action_choice != 0.0f)) {
+        int choice_entity = token_start(counts + row * POOL_SECTIONS, zone) + choice;
+        float choice_val = to_float(row_entities[choice_entity * ENTITY_WIDTH + lane]);
+        s_vec[lane] = choice_val;
+        s_du[lane] = d_action_choice;
+        __syncwarp();
+        float dc = 0.0f;
+        #pragma unroll
+        for (int b = 0; b < 32; ++b) {
+            dc += to_float(parameters[ACTION_OFFSET + lane * 32 + b]) * s_du[b];
+        }
+        row_entity_grad[choice_entity * ENTITY_WIDTH + lane] += dc;
+
+        if (d_action_choice != 0.0f) {
+            #pragma unroll
+            for (int a = 0; a < 32; ++a) {
+                float val = s_vec[a] * d_action_choice;
+                if (val != 0.0f)
+                    ba_fxp_atomic_add(row_parts + ACTION_OFFSET + a * 32 + lane, val);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int a = 0; a < 32; ++a) {
+        if (d_trans[a] != 0.0f)
+            ba_fxp_atomic_add(row_parts + TRANS_OFFSET + a * 32 + lane, d_trans[a]);
+        if (d_synergy[a] != 0.0f)
+            ba_fxp_atomic_add(row_parts + SYNERGY_OFFSET + a * 32 + lane, d_synergy[a]);
     }
 }
 
@@ -443,47 +610,17 @@ __global__ void accumulate_prefix(const precision_t* entities, const precision_t
     int row = blockIdx.x * 4 + threadIdx.x / 32;
     int lane = threadIdx.x & 31;
     if (row >= batch) return;
-    actions += row * ACTION_STORAGE_SIZE;
-    mask += row * POLICY_MASK_SIZE;
     counts += row * POOL_SECTIONS;
-    entities += (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH;
     entity_gradient += (int64_t)row * ENTITY_COUNT * ENTITY_WIDTH;
     parts += (row % condition_stripes) * AR_CONDITION_SIZE;
-    int type = (int)actions[0];
-    bool primary = (type >= ACTION_BUY_CARD && type <= ACTION_SWAP_HAND_RIGHT) || type == ACTION_BUY_AND_USE;
-    int choice = primary ? (int)actions[1] : 0;
-    int entry = policy_selection_entry(type, choice);
-    bool selection = entry >= 0 && mask_byte(mask, 0, POLICY_SELECTION_OFFSET + entry * POLICY_SELECTION_BYTES + 1);
-    int selected = selection ? (int)actions[2] : 0;
-    bool ordering = mask_byte(mask, 0, POLICY_ORDER_ENABLED_OFFSET);
-    int hand = ordering ? mask_byte(mask, 0, POLICY_ORDER_HAND_COUNT_OFFSET) : 0;
-    int jokers = ordering ? mask_byte(mask, 0, POLICY_ORDER_JOKER_COUNT_OFFSET) : 0;
-    float sum = 0.0f;
-    for (int index = BASE_ACTION_HEADS + hand + jokers - 1; index >= 0; --index) {
-        int step = index < BASE_ACTION_HEADS + hand ? index : ORDER_JOKER_OFFSET + index - BASE_ACTION_HEADS - hand;
-        int entity = -1;
-        if (step == 0) entity = token_start(counts, POOL_SECTIONS) + type;
-        else if (step == 1 && primary) entity = token_start(counts, primary_zone(type)) + choice;
-        else if (step == 2 && selection) entity = token_start(counts, POOL_SECTIONS) + ACTION_TYPE_COUNT + selected;
-        else if (step >= 3 && step < BASE_ACTION_HEADS && step - 3 < selected)
-            entity = token_start(counts, ZONE_HAND) + (int)actions[step];
-        else if (step >= BASE_ACTION_HEADS)
-            entity = token_start(counts, step < ORDER_JOKER_OFFSET ? ZONE_HAND : ZONE_JOKER) + (int)actions[step];
-        if (entity >= 0) {
-            entity_gradient[entity * ENTITY_WIDTH + lane] +=
-                sum * to_float(parameters[ROLE_OFFSET + step * 32 + lane]);
-            ba_fxp_atomic_add(parts + ROLE_OFFSET + step * 32 + lane,
-                sum * to_float(entities[entity * ENTITY_WIDTH + lane]));
-        }
-        sum += evaluations[((int64_t)row * ACTION_STORAGE_SIZE + step) * EVALUATION_WIDTH + lane];
-    }
+
     int live = 0;
     for (int zone = 0; zone < POOL_SECTIONS; ++zone) live += counts[zone];
     for (int slot = 0; slot < live + DECODER_CATEGORIES; ++slot) {
         float value = entity_gradient[slot * ENTITY_WIDTH + lane];
         if (slot < live)
             raw_gradient[((int64_t)row * KEY_CAP + slot) * ENTITY_WIDTH + lane] = value;
-        else ba_fxp_atomic_add(parts + (slot - live) * ENTITY_WIDTH + lane, value);
+        else if (value != 0.0f) ba_fxp_atomic_add(parts + (slot - live) * ENTITY_WIDTH + lane, value);
     }
 }
 

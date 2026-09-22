@@ -611,8 +611,12 @@ typedef struct StepResult {
 void default_config(Config *config);
 int init(State *state, const Config *config, uint64_t seed);
 int apply_step(State *state, const Action *action, const LegalMasks *masks, StepResult *out);
+int action_is_legal_masks(const LegalMasks *masks, const Action *action);
+int action_is_legal(const State *state, const Action *action);
 int can_afford(const State *state, int32_t cost);
 HandType planet_hand(uint16_t center_id);
+uint8_t card_set(const Card *card);
+void apply_consumable(State *state, const Action *action, Card card);
 
 int observe(const State *state, Observation *out, LegalMasks *legal);
 uint64_t state_hash(const State *state);

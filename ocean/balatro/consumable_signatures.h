@@ -201,7 +201,6 @@ const ConsumableSignature CONSUMABLE_SIGNATURES[CENTER_COUNT] = {
     },
     [CENTER_C_HANGED_MAN] = {
         .kind = CONS_HANGED_MAN,
-        .use_rule = CONSUMABLE_USE_HAND_GT_ONE,
         .target_min = 1,
         .target_max = 2,
     },

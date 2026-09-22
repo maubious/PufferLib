@@ -1,4 +1,4 @@
-static constexpr int condition_stripes = 1024;
+static constexpr int condition_stripes = 32;
 static constexpr int loss_threads = 256;
 static constexpr int EVALUATION_WIDTH = 136;
 
@@ -83,7 +83,6 @@ static void differentiate_actions(void* weights, void* activations,
         numel(a->cond_accum_parts.shape) * sizeof(long), stream);
     ppo_loss_balatro<<<blocks, loss_threads, 0, stream>>>(buffers.ppo_partials.data,
         input, buffers.grad_values.data, a->decisions.data, a->coefficients.data);
-    cudaMemsetAsync(buffers.grad_logits.data, 0, batch * DECODER_STATE * sizeof(float), stream);
     backward_decisions<<<batch, 32, 0, stream>>>(input.output.data, a->entities.data,
         w->condition.data, input.actions.data, input.mask.data, a->enc->counts.data,
         a->coefficients.data, buffers.grad_logits.data, a->entity_gradient.data,
